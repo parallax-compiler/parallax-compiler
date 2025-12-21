@@ -135,8 +135,10 @@ class SPIRVBuilder {
 public:
     enum class Section {
         Header,
+        Preamble,     // Capabilities, MemoryModel
+        EntryPoints,
         Decorations,
-        Types,
+        Types,        // Types, Constants, Global Variables
         Code
     };
 
@@ -144,12 +146,17 @@ public:
     
     uint32_t get_next_id() { return next_id_++; }
     
-    void set_section(Section section) {
-        current_section_ = section;
-    }
+    void set_section(Section section) { current_section_ = section; }
     
     void emit_word(uint32_t word) {
-        get_current_buffer().push_back(word);
+        switch (current_section_) {
+            case Section::Header: header_.push_back(word); break;
+            case Section::Preamble: preamble_.push_back(word); break;
+            case Section::EntryPoints: entry_points_.push_back(word); break;
+            case Section::Decorations: decorations_.push_back(word); break;
+            case Section::Types: types_.push_back(word); break;
+            case Section::Code: code_.push_back(word); break;
+        }
     }
     
     void emit_op(SPIRVOp op, const std::vector<uint32_t>& operands) {
@@ -175,6 +182,8 @@ public:
     std::vector<uint32_t> get_spirv() const {
         std::vector<uint32_t> combined;
         combined.insert(combined.end(), header_.begin(), header_.end());
+        combined.insert(combined.end(), preamble_.begin(), preamble_.end());
+        combined.insert(combined.end(), entry_points_.begin(), entry_points_.end());
         combined.insert(combined.end(), decorations_.begin(), decorations_.end());
         combined.insert(combined.end(), types_.begin(), types_.end());
         combined.insert(combined.end(), code_.begin(), code_.end());
@@ -185,23 +194,14 @@ public:
     std::vector<uint32_t>& get_header() { return header_; }
     
 private:
-    std::vector<uint32_t>& get_current_buffer() {
-        switch (current_section_) {
-            case Section::Header: return header_;
-            case Section::Decorations: return decorations_;
-            case Section::Types: return types_;
-            case Section::Code: return code_;
-            default: return code_;
-        }
-    }
-
+    uint32_t next_id_;
+    Section current_section_;
     std::vector<uint32_t> header_;
+    std::vector<uint32_t> preamble_;
+    std::vector<uint32_t> entry_points_;
     std::vector<uint32_t> decorations_;
     std::vector<uint32_t> types_;
     std::vector<uint32_t> code_;
-    
-    uint32_t next_id_;
-    Section current_section_;
 };
 
 SPIRVGenerator::SPIRVGenerator()
@@ -538,7 +538,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     emit_header(builder.get_header());
     
     // Caps & MemModel
-    builder.set_section(SPIRVBuilder::Section::Types);
+    builder.set_section(SPIRVBuilder::Section::Preamble);
     builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // GLSL450
     
@@ -680,7 +680,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // OpEntryPoint {Execution Model, Entry Point <id>, Name, Interface <id>, ...}
     
     // Using custom words to handle name string properly
-    builder.set_section(SPIRVBuilder::Section::Decorations);
+    builder.set_section(SPIRVBuilder::Section::EntryPoints);
     
     // Calculate word count:
     // OpEntryPoint Word (1) + Model (1) + FuncID (1) + Name ("main\0\0\0" -> 2 words) + Interface (1)
@@ -692,6 +692,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.emit_word(0x00000000); // "\0..."
     builder.emit_word(gl_id_var_id); // Interface
     
+    // ExecutionMode follows EntryPoints
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
     
     // 2. Define Main Code
