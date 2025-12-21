@@ -31,6 +31,7 @@ target_include_directories(parallax-plugin
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CLANG_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../parallax-runtime/include
 )
 
 # Link against LLVM and Clang libraries
