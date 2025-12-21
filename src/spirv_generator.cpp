@@ -463,17 +463,11 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     } else if (type->isDoubleTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
     } else if (type->isPointerTy()) {
-        // Handle pointer types ... 
-        uint32_t element_type_id;
-        llvm::Type* float_ty = llvm::Type::getFloatTy(type->getContext());
-        // Recursive call (will stay in Types section? No, recursive call resets? No)
-        // Recursive call sets section to Types, returns, then we are still in Types.
-        element_type_id = get_type_id(builder, float_ty);
-        
-        // Ensure we are back in Types section (get_type_id might change it?)
-        // Actually get_type_id sets it to Types but doesn't restore.
-        // So we are safe.
-        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 12 /* StorageBuffer */, element_type_id});
+        llvm::Type* element_type = type->getPointerElementType();
+        if (!element_type) element_type = llvm::Type::getFloatTy(type->getContext());
+        uint32_t el_ty_id = get_type_id(builder, element_type);
+        // Default to StorageBuffer(12) for GPU args, but OpVariable will override for Function(7)
+        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 12 /* StorageBuffer */, el_ty_id});
     } else {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
@@ -831,9 +825,10 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     
     // Let's assume lambda arguments are `float*` pointing to buffer.
     // I'll update `get_type_id` to use `StorageBuffer(12)` for pointers. 
-    // This aligns with AccessChain.
-    
-    builder.emit_op(SPIRVOp::OpFunctionCall, {void_id, element_ptr, lambda_func_id, element_ptr}); // Pass pointer
+    // For lambda taking float& (pointer), we pass element_ptr.
+    // Call Lambda
+    uint32_t call_id = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpFunctionCall, {void_id, call_id, lambda_func_id, element_ptr}); // Pass pointer
     
     builder.emit_op(SPIRVOp::OpBranch, {label_merge});
     

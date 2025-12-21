@@ -68,10 +68,11 @@ std::vector<uint32_t> LambdaCompiler::compile(Lambda&& lambda) {
     // Generate IR for lambda
     auto* func = generate_ir(std::forward<Lambda>(lambda), module);
     
-    // Convert IR to SPIR-V
+    // Convert IR to SPIR-V using the robust lambda path
     SPIRVGenerator spirv_gen;
     spirv_gen.set_target_vulkan_version(1, 3);
-    return spirv_gen.generate(&module);
+    // Note: LambdaCompiler currently assumes float& lambdas for MVP
+    return spirv_gen.generate_from_lambda(func, {"float&"});
 }
 
 template<typename Lambda>
