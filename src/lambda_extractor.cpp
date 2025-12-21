@@ -3,7 +3,12 @@
 #include <clang/AST/ExprCXX.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Tooling/Tooling.h>
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/CodeGen/CodeGenAction.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/IRBuilder.h>
 
 namespace parallax {
 
@@ -11,20 +16,16 @@ LambdaVisitor::LambdaVisitor(clang::ASTContext* context)
     : context_(context) {}
 
 bool LambdaVisitor::VisitLambdaExpr(clang::LambdaExpr* lambda) {
-    // Extract lambda information
     ExtractedLambda extracted = extract_lambda_info(lambda);
     lambdas_.push_back(std::move(extracted));
     return true;
 }
 
 bool LambdaVisitor::VisitCallExpr(clang::CallExpr* call) {
-    // Check if this is a call to std::for_each, std::transform, etc.
     if (auto* callee = call->getDirectCallee()) {
         std::string func_name = callee->getNameAsString();
         
         if (is_parallel_algorithm(func_name)) {
-            // Found a parallel algorithm call
-            // Check if any argument is a lambda
             for (unsigned i = 0; i < call->getNumArgs(); ++i) {
                 if (auto* lambda = clang::dyn_cast<clang::LambdaExpr>(
                         call->getArg(i)->IgnoreImplicit())) {
@@ -48,14 +49,11 @@ bool LambdaVisitor::is_parallel_algorithm(const std::string& func_name) {
 ExtractedLambda LambdaVisitor::extract_lambda_info(clang::LambdaExpr* lambda) {
     ExtractedLambda result;
     
-    // Get source location
     auto loc = lambda->getBeginLoc();
     result.source_location = loc.printToString(context_->getSourceManager());
     
-    // Get lambda class
     auto* lambda_class = lambda->getLambdaClass();
     
-    // Extract captured variables
     for (auto& capture : lambda->captures()) {
         if (capture.capturesVariable()) {
             auto* var = capture.getCapturedVar();
@@ -63,19 +61,19 @@ ExtractedLambda LambdaVisitor::extract_lambda_info(clang::LambdaExpr* lambda) {
         }
     }
     
-    // Get call operator (operator())
     auto* call_op = lambda_class->getLambdaCallOperator();
-    
-    // Extract return type
     result.return_type = call_op->getReturnType().getAsString();
     
-    // Extract parameter types
     for (auto* param : call_op->parameters()) {
         result.parameter_types.push_back(param->getType().getAsString());
     }
     
-    // Generate unique name
     result.name = "lambda_" + std::to_string(reinterpret_cast<uintptr_t>(lambda));
+    
+    // Generate LLVM IR for the lambda
+    // This is where we'd use Clang's CodeGen to generate IR
+    // For now, create a placeholder module
+    result.ir_module = std::make_unique<llvm::Module>(result.name, *llvm_context_);
     
     return result;
 }
@@ -93,30 +91,54 @@ std::unique_ptr<clang::ASTConsumer> LambdaExtractorAction::CreateASTConsumer(
     return std::make_unique<LambdaConsumer>(&compiler.getASTContext());
 }
 
+// Global LLVM context for lambda extraction
+static llvm::LLVMContext g_llvm_context;
+
 LambdaExtractor::LambdaExtractor()
-    : llvm_context_(std::make_unique<llvm::LLVMContext>()) {}
+    : llvm_context_(&g_llvm_context) {}
 
 LambdaExtractor::~LambdaExtractor() = default;
 
 std::vector<ExtractedLambda> LambdaExtractor::extract_from_file(
     const std::string& filename) {
-    // Use Clang tooling to parse the file
+    
+    // Create a simple compilation database
+    std::vector<std::string> args = {
+        "clang++",
+        "-std=c++20",
+        "-I/usr/include",
+        filename
+    };
+    
+    // Use Clang tooling to parse and extract
     auto action = std::make_unique<LambdaExtractorAction>();
     
-    // Run the action
-    if (clang::tooling::runToolOnCode(std::move(action), filename)) {
-        // Return extracted lambdas
-        // Note: In real implementation, we'd need to get the results from the action
-        return {};
-    }
+    // For a complete implementation, we would:
+    // 1. Set up proper CompilerInstance
+    // 2. Run the action on the file
+    // 3. Extract the results
     
-    return {};
+    // Simplified version that works with the framework
+    std::vector<ExtractedLambda> results;
+    
+    // In production, this would use clang::tooling::runToolOnCodeWithArgs
+    // and properly extract the lambda information
+    
+    return results;
 }
 
 std::vector<ExtractedLambda> LambdaExtractor::extract_from_source(
     const std::string& source) {
-    // Similar to extract_from_file but with source code
-    return {};
+    
+    // Parse source code and extract lambdas
+    auto action = std::make_unique<LambdaExtractorAction>();
+    
+    // Use Clang's tooling API to parse the source
+    // This would create a CompilerInstance, parse the code,
+    // and run our visitor to extract lambda information
+    
+    std::vector<ExtractedLambda> results;
+    return results;
 }
 
 } // namespace parallax
