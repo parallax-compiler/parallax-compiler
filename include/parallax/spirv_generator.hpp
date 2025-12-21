@@ -46,10 +46,19 @@ private:
     void emit_function(std::vector<uint32_t>& spirv, llvm::Function* func);
     
     // IR translation helpers
+    // IR translation helpers
     void translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id);
     void translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
                                std::unordered_map<llvm::Value*, uint32_t>& value_map);
     uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
+    uint32_t get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class);
+    
+    // Kernel generation helpers
+    void generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, uint32_t lambda_func_id, llvm::Function* lambda_func);
+    
+private:
+    std::unordered_map<llvm::Type*, uint32_t> type_cache_;
+    std::unordered_map<std::string, uint32_t> builtin_types_; // For manual types
 };
 
 } // namespace parallax

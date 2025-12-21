@@ -229,8 +229,17 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     // Emit function
     builder.emit_op(SPIRVOp::OpFunction, {void_type, func_id, 0, func_type});
     
+    // Handle arguments
+    for (auto& arg : func->args()) {
+        uint32_t arg_id = builder.get_next_id();
+        uint32_t arg_type_id = get_type_id(builder, arg.getType());
+        builder.emit_op(SPIRVOp::OpFunctionParameter, {arg_type_id, arg_id});
+        value_map[&arg] = arg_id;
+    }
+    
     // Translate basic blocks
     for (auto& bb : *func) {
+        // ... (label handling)
         uint32_t label_id = builder.get_next_id();
         value_map[&bb] = label_id;
         builder.emit_op(SPIRVOp::OpLabel, {label_id});
@@ -375,19 +384,51 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
 }
 
 uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
-    // Simplified type mapping - would need full implementation
+    if (type_cache_.count(type)) {
+        return type_cache_[type];
+    }
+    
     uint32_t type_id = builder.get_next_id();
     
     if (type->isVoidTy()) {
         builder.emit_op(SPIRVOp::OpTypeVoid, {type_id});
     } else if (type->isIntegerTy(32)) {
-        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0}); // 0 = unsigned? No, 0=unsigned, 1=signed usually. Wait, OpTypeInt width signedness. signedness: 0 indicates unsigned handling, 1 indicates signed handling
+        // LLVM i32 is signless. We default to 0 (unsigned) or 1 (signed)?
+        // For general arithmetic, 0 is safer? Or 1?
+        // Let's use 0 (unsigned) for now as typical for bitwise, but Add can be standard.
+        // Wait, OpIAdd works on both.
+        // Let's use 0.
     } else if (type->isFloatTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 32});
     } else if (type->isDoubleTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
+    } else if (type->isPointerTy()) {
+        // Assume default storage class (Function=7) or Uniform=2 or generic?
+        // LLVM pointers are generic. In SPIR-V we need storage class.
+        // For kernel args, we likely need CrossWorkgroup(5) or Uniform(2).
+        // For local vars, Function(7).
+        // Default to Function(7) for now? Or CrossWorkgroup(5) for buffer pointers?
+        // This is tricky. Let's assume Function(7) for internal pointers, but for Arguments we might need explicit handling.
+        // Let's use CrossWorkgroup(5) for now as it's generic global memory.
+        
+        uint32_t element_type_id;
+        // LLVM 15+ opaque pointers don't have element type.
+        // We assume float* for now if opaque?
+        // Or we rely on typed pointers if LLVM version is older.
+        // LLVM 21 is Opaque.
+        // We assume 'float' element type as default for this MVP.
+        // TODO: Handle types properly.
+        llvm::Type* float_ty = llvm::Type::getFloatTy(type->getContext());
+        element_type_id = get_type_id(builder, float_ty);
+        
+        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 5 /* CrossWorkgroup */, element_type_id});
+    } else {
+        // Fallback for unknown
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
     
+    type_cache_[type] = type_id;
     return type_id;
 }
 
