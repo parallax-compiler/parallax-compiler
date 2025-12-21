@@ -472,7 +472,7 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         // Ensure we are back in Types section (get_type_id might change it?)
         // Actually get_type_id sets it to Types but doesn't restore.
         // So we are safe.
-        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 5 /* CrossWorkgroup */, element_type_id});
+        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 12 /* StorageBuffer */, element_type_id});
     } else {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
