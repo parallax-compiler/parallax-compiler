@@ -2,11 +2,16 @@
 #define PARALLAX_SPIRV_GENERATOR_HPP
 
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Type.h>
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 namespace parallax {
+
+class SPIRVBuilder;
 
 // SPIR-V Generator - converts LLVM IR to SPIR-V
 class SPIRVGenerator {
@@ -39,6 +44,12 @@ private:
     void emit_decorations(std::vector<uint32_t>& spirv);
     void emit_types(std::vector<uint32_t>& spirv);
     void emit_function(std::vector<uint32_t>& spirv, llvm::Function* func);
+    
+    // IR translation helpers
+    void translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id);
+    void translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
+                               std::unordered_map<llvm::Value*, uint32_t>& value_map);
+    uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
 };
 
 } // namespace parallax
