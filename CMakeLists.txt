@@ -40,6 +40,7 @@ if(LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL "21.0")
     target_link_libraries(parallax-plugin
         PRIVATE
             LLVM
+            clang-cpp
     )
 else()
     # Use component libraries for older LLVM
