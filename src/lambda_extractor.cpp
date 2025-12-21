@@ -73,7 +73,8 @@ ExtractedLambda LambdaVisitor::extract_lambda_info(clang::LambdaExpr* lambda) {
     // Generate LLVM IR for the lambda
     // This is where we'd use Clang's CodeGen to generate IR
     // For now, create a placeholder module
-    result.ir_module = std::make_unique<llvm::Module>(result.name, *llvm_context_);
+    static llvm::LLVMContext g_llvm_context;
+    result.ir_module = std::make_unique<llvm::Module>(result.name, g_llvm_context);
     
     return result;
 }
