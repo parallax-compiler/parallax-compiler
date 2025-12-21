@@ -122,6 +122,7 @@ enum class SPIRVOp : uint32_t {
     OpBitReverse = 204,
     OpBitCount = 205,
     OpPhi = 245,
+    OpSelectionMerge = 247,
     OpLabel = 248,
     OpBranch = 249,
     OpBranchConditional = 250,
@@ -790,6 +791,8 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.emit_op(SPIRVOp::OpReturn, {});
     builder.emit_op(SPIRVOp::OpFunctionEnd, {});
 }
+
+void SPIRVGenerator::emit_header(std::vector<uint32_t>& spirv) {
     spirv.push_back(0x07230203);
     spirv.push_back(0x00010600);
     spirv.push_back(0x000d000b);
