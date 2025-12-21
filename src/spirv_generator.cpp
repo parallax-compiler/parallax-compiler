@@ -132,12 +132,23 @@ enum class SPIRVOp : uint32_t {
 
 class SPIRVBuilder {
 public:
-    SPIRVBuilder() : next_id_(1) {}
+    enum class Section {
+        Header,
+        Decorations,
+        Types,
+        Code
+    };
+
+    SPIRVBuilder() : next_id_(1), current_section_(Section::Code) {}
     
     uint32_t get_next_id() { return next_id_++; }
     
+    void set_section(Section section) {
+        current_section_ = section;
+    }
+    
     void emit_word(uint32_t word) {
-        spirv_.push_back(word);
+        get_current_buffer().push_back(word);
     }
     
     void emit_op(SPIRVOp op, const std::vector<uint32_t>& operands) {
@@ -160,11 +171,36 @@ public:
         }
     }
     
-    std::vector<uint32_t> get_spirv() const { return spirv_; }
+    std::vector<uint32_t> get_spirv() const {
+        std::vector<uint32_t> combined;
+        combined.insert(combined.end(), header_.begin(), header_.end());
+        combined.insert(combined.end(), decorations_.begin(), decorations_.end());
+        combined.insert(combined.end(), types_.begin(), types_.end());
+        combined.insert(combined.end(), code_.begin(), code_.end());
+        return combined;
+    }
+    
+    // Explicit access for header generation
+    std::vector<uint32_t>& get_header() { return header_; }
     
 private:
-    std::vector<uint32_t> spirv_;
+    std::vector<uint32_t>& get_current_buffer() {
+        switch (current_section_) {
+            case Section::Header: return header_;
+            case Section::Decorations: return decorations_;
+            case Section::Types: return types_;
+            case Section::Code: return code_;
+            default: return code_;
+        }
+    }
+
+    std::vector<uint32_t> header_;
+    std::vector<uint32_t> decorations_;
+    std::vector<uint32_t> types_;
+    std::vector<uint32_t> code_;
+    
     uint32_t next_id_;
+    Section current_section_;
 };
 
 SPIRVGenerator::SPIRVGenerator()
@@ -179,25 +215,44 @@ void SPIRVGenerator::set_target_vulkan_version(uint32_t major, uint32_t minor) {
 
 std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     SPIRVBuilder builder;
+    builder.set_section(SPIRVBuilder::Section::Header);
     
     // Emit header
-    builder.emit_word(0x07230203); // Magic number
-    builder.emit_word(0x00010600); // Version 1.6
-    builder.emit_word(0x000d000b); // Generator
+    emit_header(builder.get_header());
     uint32_t bound_id = builder.get_next_id();
-    builder.emit_word(bound_id);   // Bound (will update)
-    builder.emit_word(0x00000000); // Schema
+    // We need to update bound ID later... but emit_header likely pushed fixed words.
+    // Wait, emit_header (default impl) pushed 5 words.
+    // Word 3 (index 3) is bound.
+    // But builder.get_header() is the vector.
+    // If I used emit_header(builder.get_header()), it pushed words.
+    // I need to update it at the end?
+    // Or just let it be large? No, valid SPIR-V requires correct bound.
     
+    builder.set_section(SPIRVBuilder::Section::Types);
     // Emit capabilities
     builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
     
     // Emit memory model
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // Logical GLSL450
     
+    builder.set_section(SPIRVBuilder::Section::Code);
+    
     // Find entry point
     for (auto& func : module->functions()) {
         if (!func.isDeclaration()) {
             uint32_t func_id = builder.get_next_id();
+            
+            // Entry point needs separate handling to put in Header/Entry section?
+            // Actually EntryPoint is its own section before Types.
+            // My SPIRVBuilder only has 4 sections.
+            // Header, Decoration, Types, Code.
+            // EntryPoint op goes where?
+            // Spec: 1. Header 2. Caps... 4. EntryPoints ... 7. Types 8. Functions
+            // So EntryPoint is BEFORE Types.
+            // I should put it in Decorations section? Or add EntryPoints section?
+            // Using Decorations section for EntryPoint/ExecMode is roughly fine (Both are "Preamble").
+            
+            builder.set_section(SPIRVBuilder::Section::Decorations);
             
             // Emit entry point
             std::vector<uint32_t> entry_operands = {5, func_id}; // GLCompute
@@ -207,11 +262,16 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
             // Emit execution mode
             builder.emit_op(SPIRVOp::OpExecutionMode, {func_id, 17, 256, 1, 1}); // LocalSize
             
+            builder.set_section(SPIRVBuilder::Section::Code);
+            
             // Translate function
             translate_function(builder, &func, func_id);
             break;
         }
     }
+    
+    // Update bound
+    builder.get_header()[3] = builder.get_next_id();
     
     return builder.get_spirv();
 }
@@ -388,47 +448,41 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         return type_cache_[type];
     }
     
+    // Switch to Types section
+    builder.set_section(SPIRVBuilder::Section::Types);
+    
     uint32_t type_id = builder.get_next_id();
     
     if (type->isVoidTy()) {
         builder.emit_op(SPIRVOp::OpTypeVoid, {type_id});
     } else if (type->isIntegerTy(32)) {
-        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0}); // 0 = unsigned? No, 0=unsigned, 1=signed usually. Wait, OpTypeInt width signedness. signedness: 0 indicates unsigned handling, 1 indicates signed handling
-        // LLVM i32 is signless. We default to 0 (unsigned) or 1 (signed)?
-        // For general arithmetic, 0 is safer? Or 1?
-        // Let's use 0 (unsigned) for now as typical for bitwise, but Add can be standard.
-        // Wait, OpIAdd works on both.
-        // Let's use 0.
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     } else if (type->isFloatTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 32});
     } else if (type->isDoubleTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
     } else if (type->isPointerTy()) {
-        // Assume default storage class (Function=7) or Uniform=2 or generic?
-        // LLVM pointers are generic. In SPIR-V we need storage class.
-        // For kernel args, we likely need CrossWorkgroup(5) or Uniform(2).
-        // For local vars, Function(7).
-        // Default to Function(7) for now? Or CrossWorkgroup(5) for buffer pointers?
-        // This is tricky. Let's assume Function(7) for internal pointers, but for Arguments we might need explicit handling.
-        // Let's use CrossWorkgroup(5) for now as it's generic global memory.
-        
+        // Handle pointer types ... 
         uint32_t element_type_id;
-        // LLVM 15+ opaque pointers don't have element type.
-        // We assume float* for now if opaque?
-        // Or we rely on typed pointers if LLVM version is older.
-        // LLVM 21 is Opaque.
-        // We assume 'float' element type as default for this MVP.
-        // TODO: Handle types properly.
         llvm::Type* float_ty = llvm::Type::getFloatTy(type->getContext());
+        // Recursive call (will stay in Types section? No, recursive call resets? No)
+        // Recursive call sets section to Types, returns, then we are still in Types.
         element_type_id = get_type_id(builder, float_ty);
         
+        // Ensure we are back in Types section (get_type_id might change it?)
+        // Actually get_type_id sets it to Types but doesn't restore.
+        // So we are safe.
         builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 5 /* CrossWorkgroup */, element_type_id});
     } else {
-        // Fallback for unknown
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
     
     type_cache_[type] = type_id;
+    
+    // Restore to Code section? 
+    // Usually called from TranslateFunction.
+    builder.set_section(SPIRVBuilder::Section::Code);
+    
     return type_id;
 }
 
