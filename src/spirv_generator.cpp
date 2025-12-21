@@ -463,10 +463,10 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     } else if (type->isDoubleTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
     } else if (type->isPointerTy()) {
-        llvm::Type* element_type = type->getPointerElementType();
-        if (!element_type) element_type = llvm::Type::getFloatTy(type->getContext());
+        // LLVM 21+ uses opaque pointers. For MVP, we assume float elements for array access.
+        llvm::Type* element_type = llvm::Type::getFloatTy(type->getContext());
         uint32_t el_ty_id = get_type_id(builder, element_type);
-        // Default to StorageBuffer(12) for GPU args, but OpVariable will override for Function(7)
+        // Default to StorageBuffer(12) for GPU args
         builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 12 /* StorageBuffer */, el_ty_id});
     } else {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
