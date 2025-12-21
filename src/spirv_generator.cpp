@@ -844,7 +844,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
 void SPIRVGenerator::emit_header(std::vector<uint32_t>& spirv) {
     spirv.push_back(0x07230203);
-    spirv.push_back(0x00010600);
+    spirv.push_back(0x00010500); // Version 1.5
     spirv.push_back(0x000d000b);
     spirv.push_back(0x00000100);
     spirv.push_back(0x00000000);
