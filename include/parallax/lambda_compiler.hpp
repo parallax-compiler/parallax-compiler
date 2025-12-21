@@ -5,11 +5,13 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include "parallax/spirv_generator.hpp"
 #include <vector>
 #include <cstdint>
 #include <string>
 #include <typeinfo>
 #include <functional>
+#include <memory> // Added for std::unique_ptr
 
 namespace parallax {
 
@@ -102,7 +104,8 @@ llvm::Function* LambdaCompiler::generate_ir(Lambda&& lambda, llvm::Module& modul
     // Create function type for GPU kernel
     // void kernel(float* data, uint32_t index)
     auto* float_type = llvm::Type::getFloatTy(*context_);
-    auto* ptr_type = llvm::PointerType::get(float_type, 0);
+    // Use LLVM 21+ API for pointer types
+    auto* ptr_type = llvm::PointerType::get(builder.getContext(), 0);
     auto* uint32_type = llvm::Type::getInt32Ty(*context_);
     auto* void_type = llvm::Type::getVoidTy(*context_);
     
