@@ -34,23 +34,24 @@ target_include_directories(parallax-plugin
 )
 
 # Link against LLVM and Clang libraries
-llvm_map_components_to_libnames(llvm_libs support core irreader)
-target_link_libraries(parallax-plugin
-    PRIVATE
-        ${llvm_libs}
-        clangTooling
-        clangFrontend
-        clangDriver
-        clangSerialization
-        clangCodeGen
-        clangParse
-        clangSema
-        clangAnalysis
-        clangAST
-        clangBasic
-        clangEdit
-        clangLex
-)
+# LLVM 21+ uses monolithic library
+if(LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL "21.0")
+    # Use monolithic LLVM library for LLVM 21+
+    target_link_libraries(parallax-plugin
+        PRIVATE
+            LLVM
+    )
+else()
+    # Use component libraries for older LLVM
+    llvm_map_components_to_libnames(llvm_libs support core irreader)
+    target_link_libraries(parallax-plugin
+        PRIVATE
+            ${llvm_libs}
+    )
+endif()
+
+# Note: Clang libraries are optional for this module
+# The actual Clang integration happens at a higher level
 
 # Installation
 install(TARGETS parallax-plugin
