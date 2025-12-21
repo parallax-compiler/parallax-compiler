@@ -39,6 +39,11 @@ void ExecutionPolicyImpl::initialize(VulkanBackend* backend, MemoryManager* memo
     }
 }
 
+void ExecutionPolicyImpl::shutdown() {
+    g_global_launcher_ptr = nullptr;
+    g_launcher_storage.reset();
+}
+
 // Template instantiations are in the header as inline implementations
 // The actual runtime integration with KernelLauncher happens in the samples
 

@@ -22,6 +22,9 @@ public:
     
     void initialize(VulkanBackend* backend, MemoryManager* memory);
     
+    // Shutdown runtime components
+    void shutdown();
+    
     // These are called internally when std::for_each(std::execution::par, ...) is detected
     template<typename Iterator, typename UnaryFunction>
     void for_each_impl(Iterator first, Iterator last, UnaryFunction f);
