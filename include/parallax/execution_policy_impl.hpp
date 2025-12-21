@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <execution>
 #include <unordered_set>
+#include <iostream>
+#include "parallax/kernel_launcher.hpp"
 
 namespace parallax {
 
