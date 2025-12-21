@@ -62,3 +62,6 @@ install(TARGETS parallax-plugin
 install(DIRECTORY include/parallax
     DESTINATION include
 )
+
+# Clang Plugin
+add_subdirectory(src/plugin)
