@@ -1,5 +1,6 @@
 #include "parallax/execution_policy.hpp"
 #include "parallax/lambda_compiler.hpp"
+#include "parallax/kernel_launcher.hpp"
 #include "parallax/spirv_generator.hpp"
 #include <unordered_map>
 #include <memory>
@@ -22,11 +23,19 @@ ExecutionPolicyImpl& ExecutionPolicyImpl::instance() {
     return impl;
 }
 
+// Global launcher pointer for template header access
+KernelLauncher* g_global_launcher_ptr = nullptr;
+static std::unique_ptr<KernelLauncher> g_launcher_storage;
+
 void ExecutionPolicyImpl::initialize(VulkanBackend* backend, MemoryManager* memory) {
-    // Stub implementation - actual runtime integration happens in samples
-    // This is just the compiler-side framework
     if (!g_lambda_compiler) {
         g_lambda_compiler = std::make_unique<LambdaCompiler>();
+    }
+    
+    // Create launcher if backend is provided
+    if (backend && memory) {
+        g_launcher_storage = std::make_unique<KernelLauncher>(backend, memory);
+        g_global_launcher_ptr = g_launcher_storage.get();
     }
 }
 

@@ -45,27 +45,42 @@ void ExecutionPolicyImpl::for_each_impl(Iterator first, Iterator last, UnaryFunc
             cache[name] = compiler.compile(f);
         }
         
-        // 2. Launch (if we had the launcher)
-        // Since we can't easily get the launcher instance from the opaque class without
-        // casting or globals, let's use the external globals from the main file if possible?
-        // No, that's ugly.
+        // 2. Launch
+        // Access global launcher defined in execution_policy.cpp
+        extern KernelLauncher* g_global_launcher_ptr;
         
-        // Let's just print "Compiled!" and run on CPU for this specific test step 
-        // to prove the "Pipeline" (Lambda->SPIRV) works in this context.
-        // The KernelLauncher integration is trivial once we have the object.
+        if (g_global_launcher_ptr) {
+            // Load if not loaded (Launcher caches but we need to load explicitly first time)
+            // Note: Launcher checks 'pipelines_' map, but we need to pass SPIR-V code
+            // The loading API is distinct from launch.
+            
+            // We should modify load_kernel to check cache internally or call it every time.
+            // Current load_kernel: pipelines_[name] = data; (overwrites?)
+            // We should only load if not present in launcher.
+            // But we don't have is_loaded API. Calling load_kernel is safe (just re-creates pipeline).
+            // Optimization: Track loaded state locally.
+            static std::unordered_set<std::string> loaded_kernels;
+            if (loaded_kernels.find(name) == loaded_kernels.end()) {
+                g_global_launcher_ptr->load_kernel(name, cache[name].data(), cache[name].size() * 4);
+                loaded_kernels.insert(name);
+            }
+            
+            // Assume input is contiguous and 'first' is a pointer
+            // CAUTION: This assumes specific iterator type (float* or similar)
+            // Ideally we check if it's a pointer to unified memory.
+            auto* data_ptr = &(*first);
+            size_t count = std::distance(first, last);
+            
+            if (g_global_launcher_ptr->launch(name, (void*)data_ptr, count)) {
+                return; // GPU execution successful
+            }
+        }
         
-        // Actually, we can assume the user code sets a static pointer we can access.
-        
-        std::vector<uint32_t>& spirv = cache[name];
-        
-        // For the benchmark, we want to run on GPU.
-        // Let's look for a global launcher if available.
-        // extern KernelLauncher* g_launcher_ptr; --> Defined in user code?
-        
-        // Fallback to CPU for now, but confirm compilation happened:
+        // Fallback to CPU if launch failed or launcher not available
         std::for_each(std::execution::seq, first, last, f);
         
     } catch (const std::exception& e) {
+        std::cerr << "GPU Execution Failed: " << e.what() << std::endl;
         std::for_each(std::execution::seq, first, last, f);
     }
 }
