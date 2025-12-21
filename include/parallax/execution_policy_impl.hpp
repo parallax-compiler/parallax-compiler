@@ -7,6 +7,7 @@
 #include "parallax/vulkan_backend.hpp"
 #include <algorithm>
 #include <execution>
+#include <unordered_set>
 
 namespace parallax {
 
