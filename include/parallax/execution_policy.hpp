@@ -31,9 +31,8 @@ public:
     
 private:
     ExecutionPolicyImpl() = default;
-    VulkanBackend* backend_ = nullptr;
-    MemoryManager* memory_ = nullptr;
-    std::unique_ptr<KernelLauncher> launcher_;
+    // Note: Runtime integration (backend, memory, launcher) happens in samples
+    // This is just the compiler-side framework
 };
 
 } // namespace parallax
