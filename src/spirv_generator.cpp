@@ -322,56 +322,56 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
     switch (inst->getOpcode()) {
         case llvm::Instruction::Add:
             if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpIAdd, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             } else {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpFAdd, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             }
             break;
             
         case llvm::Instruction::Sub:
             if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpISub, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             } else {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpFSub, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             }
             break;
             
         case llvm::Instruction::Mul:
             if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpIMul, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             } else {
-                uint32_t op1 = value_map[inst->getOperand(0)];
-                uint32_t op2 = value_map[inst->getOperand(1)];
+                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
                 builder.emit_op(SPIRVOp::OpFMul, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             }
             break;
             
         case llvm::Instruction::FDiv: {
-            uint32_t op1 = value_map[inst->getOperand(0)];
-            uint32_t op2 = value_map[inst->getOperand(1)];
+            uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
             builder.emit_op(SPIRVOp::OpFDiv, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             break;
         }
         
         case llvm::Instruction::Load: {
-            uint32_t ptr = value_map[inst->getOperand(0)];
+            uint32_t ptr = get_value_id(builder, inst->getOperand(0), value_map);
             builder.emit_op(SPIRVOp::OpLoad, {get_type_id(builder, inst->getType()), result_id, ptr});
             break;
         }
         
         case llvm::Instruction::Store: {
-            uint32_t value = value_map[inst->getOperand(0)];
-            uint32_t ptr = value_map[inst->getOperand(1)];
+            uint32_t value = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t ptr = get_value_id(builder, inst->getOperand(1), value_map);
             builder.emit_op(SPIRVOp::OpStore, {ptr, value});
             break;
         }
@@ -383,12 +383,12 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         case llvm::Instruction::Br: {
             auto* br = llvm::cast<llvm::BranchInst>(inst);
             if (br->isUnconditional()) {
-                uint32_t target = value_map[br->getSuccessor(0)];
+                uint32_t target = get_value_id(builder, br->getSuccessor(0), value_map);
                 builder.emit_op(SPIRVOp::OpBranch, {target});
             } else {
-                uint32_t cond = value_map[br->getCondition()];
-                uint32_t true_label = value_map[br->getSuccessor(0)];
-                uint32_t false_label = value_map[br->getSuccessor(1)];
+                uint32_t cond = get_value_id(builder, br->getCondition(), value_map);
+                uint32_t true_label = get_value_id(builder, br->getSuccessor(0), value_map);
+                uint32_t false_label = get_value_id(builder, br->getSuccessor(1), value_map);
                 builder.emit_op(SPIRVOp::OpBranchConditional, {cond, true_label, false_label});
             }
             break;
@@ -396,8 +396,8 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         
         case llvm::Instruction::ICmp: {
             auto* cmp = llvm::cast<llvm::ICmpInst>(inst);
-            uint32_t op1 = value_map[cmp->getOperand(0)];
-            uint32_t op2 = value_map[cmp->getOperand(1)];
+            uint32_t op1 = get_value_id(builder, cmp->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, cmp->getOperand(1), value_map);
             
             SPIRVOp op;
             switch (cmp->getPredicate()) {
@@ -420,8 +420,8 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         
         case llvm::Instruction::FCmp: {
             auto* cmp = llvm::cast<llvm::FCmpInst>(inst);
-            uint32_t op1 = value_map[cmp->getOperand(0)];
-            uint32_t op2 = value_map[cmp->getOperand(1)];
+            uint32_t op1 = get_value_id(builder, cmp->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, cmp->getOperand(1), value_map);
             
             SPIRVOp op;
             switch (cmp->getPredicate()) {
@@ -480,11 +480,53 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     
     type_cache_[type] = type_id;
     
-    // Restore to Code section? 
-    // Usually called from TranslateFunction.
+    // Restore to Code section
     builder.set_section(SPIRVBuilder::Section::Code);
     
     return type_id;
+}
+
+uint32_t SPIRVGenerator::get_value_id(SPIRVBuilder& builder, llvm::Value* val, std::unordered_map<llvm::Value*, uint32_t>& value_map) {
+    if (value_map.count(val)) {
+        return value_map[val];
+    }
+    
+    if (auto* c = llvm::dyn_cast<llvm::Constant>(val)) {
+        return get_constant_id(builder, c);
+    }
+    
+    return 0; // Should not happen in valid IR
+}
+
+uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* c) {
+    if (constant_cache_.count(c)) {
+        return constant_cache_[c];
+    }
+    
+    uint32_t id = builder.get_next_id();
+    uint32_t ty = get_type_id(builder, c->getType());
+    
+    builder.set_section(SPIRVBuilder::Section::Types);
+    
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c)) {
+        uint32_t val = (uint32_t)ci->getZExtValue();
+        builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
+    } else if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c)) {
+        float fval = cf->getValueAPF().convertToFloat();
+        uint32_t val;
+        std::memcpy(&val, &fval, sizeof(float));
+        builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
+    } else if (llvm::isa<llvm::ConstantPointerNull>(c)) {
+        // Technically OpConstantNull, but we'll use 0 for now
+        builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0});
+    } else {
+        // Fallback
+        builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0});
+    }
+    
+    constant_cache_[c] = id;
+    builder.set_section(SPIRVBuilder::Section::Code);
+    return id;
 }
 
 std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
@@ -634,13 +676,21 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Append interface
     ep_operands.push_back(gl_id_var_id);
     
-    // Custom emission for EntryPoint to handle string
-    builder.set_section(SPIRVBuilder::Section::Decorations); // Using Decorations buffer as Preamble
-    uint32_t ep_wc = 1 + ep_operands.size() + 2; // +2 for "main\0"
+    // Correct order for EntryPoint:
+    // OpEntryPoint {Execution Model, Entry Point <id>, Name, Interface <id>, ...}
+    
+    // Using custom words to handle name string properly
+    builder.set_section(SPIRVBuilder::Section::Decorations);
+    
+    // Calculate word count:
+    // OpEntryPoint Word (1) + Model (1) + FuncID (1) + Name ("main\0\0\0" -> 2 words) + Interface (1)
+    uint32_t ep_wc = 1 + 1 + 1 + 2 + 1; 
     builder.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
-    for (auto op : ep_operands) builder.emit_word(op);
+    builder.emit_word(5); // GLCompute
+    builder.emit_word(entry_id);
     builder.emit_word(0x6e69616d); // "main"
     builder.emit_word(0x00000000); // "\0..."
+    builder.emit_word(gl_id_var_id); // Interface
     
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
     

@@ -52,12 +52,15 @@ private:
                                std::unordered_map<llvm::Value*, uint32_t>& value_map);
     uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
     uint32_t get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class);
+    uint32_t get_value_id(SPIRVBuilder& builder, llvm::Value* val, std::unordered_map<llvm::Value*, uint32_t>& value_map);
+    uint32_t get_constant_id(SPIRVBuilder& builder, llvm::Constant* c);
     
     // Kernel generation helpers
     void generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, uint32_t lambda_func_id, llvm::Function* lambda_func);
     
 private:
     std::unordered_map<llvm::Type*, uint32_t> type_cache_;
+    std::unordered_map<llvm::Constant*, uint32_t> constant_cache_;
     std::unordered_map<std::string, uint32_t> builtin_types_; // For manual types
 };
 
