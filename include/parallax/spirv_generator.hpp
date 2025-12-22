@@ -11,6 +11,15 @@
 
 namespace parallax {
 
+struct pair_hash {
+    template <class T1, class T2>
+    std::size_t operator()(const std::pair<T1, T2>& p) const {
+        auto h1 = std::hash<T1>{}(p.first);
+        auto h2 = std::hash<T2>{}(p.second);
+        return h1 ^ (h2 << 1);
+    }
+};
+
 class SPIRVBuilder;
 
 // SPIR-V Generator - converts LLVM IR to SPIR-V
@@ -61,7 +70,8 @@ private:
 private:
     std::unordered_map<llvm::Type*, uint32_t> type_cache_;
     std::unordered_map<llvm::Constant*, uint32_t> constant_cache_;
-    std::unordered_map<std::string, uint32_t> builtin_types_; // For manual types
+    std::unordered_map<std::pair<uint32_t, uint32_t>, uint32_t, pair_hash> pointer_type_cache_;
+    std::unordered_map<std::string, uint32_t> builtin_types_;
 };
 
 } // namespace parallax

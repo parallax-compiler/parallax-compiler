@@ -514,8 +514,10 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         // LLVM 21+ uses opaque pointers. For MVP, we assume float elements for array access.
         llvm::Type* element_type = llvm::Type::getFloatTy(type->getContext());
         uint32_t el_ty_id = get_type_id(builder, element_type);
-        // Default to StorageBuffer(12) for GPU args
-        builder.emit_op(SPIRVOp::OpTypePointer, {type_id, 12 /* StorageBuffer */, el_ty_id});
+        // Use cached pointer type helper
+        uint32_t ptr_ty = get_pointer_type_id(builder, el_ty_id, 12 /* StorageBuffer */);
+        type_cache_[type] = ptr_ty;
+        return ptr_ty;
     } else {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
@@ -599,12 +601,18 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
 }
 
 uint32_t SPIRVGenerator::get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class) {
+    auto key = std::make_pair(element_type_id, storage_class);
+    if (pointer_type_cache_.count(key)) {
+        return pointer_type_cache_[key];
+    }
+
     SPIRVBuilder::Section prev_section = builder.get_current_section();
     builder.set_section(SPIRVBuilder::Section::Types);
     
     uint32_t type_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypePointer, {type_id, storage_class, element_type_id});
     
+    pointer_type_cache_[key] = type_id;
     builder.set_section(prev_section);
     return type_id;
 }
