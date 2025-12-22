@@ -148,6 +148,7 @@ public:
     uint32_t get_next_id() { return next_id_++; }
     
     void set_section(Section section) { current_section_ = section; }
+    Section get_current_section() const { return current_section_; }
     
     void emit_word(uint32_t word) {
         switch (current_section_) {
@@ -286,13 +287,14 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     std::unordered_map<llvm::Value*, uint32_t> value_map;
     
     // Emit type declarations
-    uint32_t void_type = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeVoid, {void_type});
+    builder.set_section(SPIRVBuilder::Section::Types);
+    uint32_t void_type = get_type_id(builder, llvm::Type::getVoidTy(func->getContext()));
     
     uint32_t func_type = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypeFunction, {func_type, void_type});
     
     // Emit function
+    builder.set_section(SPIRVBuilder::Section::Code);
     builder.emit_op(SPIRVOp::OpFunction, {void_type, func_id, 0, func_type});
     
     // Handle arguments
@@ -454,6 +456,8 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         return type_cache_[type];
     }
     
+    SPIRVBuilder::Section prev_section = builder.get_current_section();
+    
     // Switch to Types section
     builder.set_section(SPIRVBuilder::Section::Types);
     
@@ -479,8 +483,8 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     
     type_cache_[type] = type_id;
     
-    // Restore to Code section
-    builder.set_section(SPIRVBuilder::Section::Code);
+    // Restore previous section
+    builder.set_section(prev_section);
     
     return type_id;
 }
@@ -502,6 +506,7 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
         return constant_cache_[c];
     }
     
+    SPIRVBuilder::Section prev_section = builder.get_current_section();
     uint32_t id = builder.get_next_id();
     uint32_t ty = get_type_id(builder, c->getType());
     
@@ -516,15 +521,13 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
         std::memcpy(&val, &fval, sizeof(float));
         builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
     } else if (llvm::isa<llvm::ConstantPointerNull>(c)) {
-        // Technically OpConstantNull, but we'll use 0 for now
         builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0});
     } else {
-        // Fallback
-        builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0});
+        builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0}); // Fallback
     }
     
     constant_cache_[c] = id;
-    builder.set_section(SPIRVBuilder::Section::Code);
+    builder.set_section(prev_section);
     return id;
 }
 
@@ -557,11 +560,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
 }
 
 uint32_t SPIRVGenerator::get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class) {
-    uint32_t ptr_id = builder.get_next_id();
+    SPIRVBuilder::Section prev_section = builder.get_current_section();
     builder.set_section(SPIRVBuilder::Section::Types);
-    builder.emit_op(SPIRVOp::OpTypePointer, {ptr_id, storage_class, element_type_id});
-    builder.set_section(SPIRVBuilder::Section::Code);
-    return ptr_id;
+    
+    uint32_t type_id = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpTypePointer, {type_id, storage_class, element_type_id});
+    
+    builder.set_section(prev_section);
+    return type_id;
 }
 
 void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, 
