@@ -667,6 +667,8 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.set_section(SPIRVBuilder::Section::Decorations);
     builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
     builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 1, 35 /* Offset */, 4});
+    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 2, 35 /* Offset */, 8});
+    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 3, 35 /* Offset */, 12});
     builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
     
     // Pointer PushConstant Struct
