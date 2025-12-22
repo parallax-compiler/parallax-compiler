@@ -583,6 +583,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     // Caps & MemModel
     builder.set_section(SPIRVBuilder::Section::Preamble);
     builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
+    builder.emit_op(SPIRVOp::OpCapability, {4442}); // VariablePointersStorageBuffer
+    builder.emit_word(( (1 + 1 + (std::string("SPV_KHR_variable_pointers").length() + 4) / 4) << 16) | (uint32_t)SPIRVOp::OpExtension);
+    builder.emit_string("SPV_KHR_variable_pointers");
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // GLSL450
     
     // Translate Lambda Helper
