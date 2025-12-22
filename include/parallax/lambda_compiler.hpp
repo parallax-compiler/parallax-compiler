@@ -11,7 +11,9 @@
 #include <string>
 #include <typeinfo>
 #include <functional>
-#include <memory> // Added for std::unique_ptr
+#include <memory>
+#include <iostream>
+#include <ostream>
 
 namespace parallax {
 
