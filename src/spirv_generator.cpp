@@ -225,42 +225,18 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     
     // Emit header
     emit_header(builder.get_header());
-    uint32_t bound_id = builder.get_next_id();
-    // We need to update bound ID later... but emit_header likely pushed fixed words.
-    // Wait, emit_header (default impl) pushed 5 words.
-    // Word 3 (index 3) is bound.
-    // But builder.get_header() is the vector.
-    // If I used emit_header(builder.get_header()), it pushed words.
-    // I need to update it at the end?
-    // Or just let it be large? No, valid SPIR-V requires correct bound.
     
-    // Caps & MemModel
     builder.set_section(SPIRVBuilder::Section::Preamble);
     builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // Logical GLSL450
     
     builder.set_section(SPIRVBuilder::Section::Types);
     
-    builder.set_section(SPIRVBuilder::Section::Code);
-    
-    // Find entry point
     for (auto& func : module->functions()) {
         if (!func.isDeclaration()) {
             uint32_t func_id = builder.get_next_id();
             
-            // Entry point needs separate handling to put in Header/Entry section?
-            // Actually EntryPoint is its own section before Types.
-            // My SPIRVBuilder only has 4 sections.
-            // Header, Decoration, Types, Code.
-            // EntryPoint op goes where?
-            // Spec: 1. Header 2. Caps... 4. EntryPoints ... 7. Types 8. Functions
-            // So EntryPoint is BEFORE Types.
-            // I should put it in Decorations section? Or add EntryPoints section?
-            // Using Decorations section for EntryPoint/ExecMode is roughly fine (Both are "Preamble").
-            
             builder.set_section(SPIRVBuilder::Section::EntryPoints);
-            
-            // Emit entry point with correct word count and name string
             std::string func_name = func.getName().str();
             size_t name_words = (func_name.length() + 4) / 4;
             uint32_t ep_wc = 1 + 1 + 1 + name_words; 
@@ -269,12 +245,9 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
             builder.emit_word(func_id);
             builder.emit_string(func_name);
             
-            // Emit execution mode
-            builder.emit_op(SPIRVOp::OpExecutionMode, {func_id, 17 /* LocalSize */, 256, 1, 1});
+            builder.emit_op(SPIRVOp::OpExecutionMode, {func_id, 17, 256, 1, 1});
             
             builder.set_section(SPIRVBuilder::Section::Code);
-            
-            // Translate function
             translate_function(builder, &func, func_id);
             break;
         }
@@ -331,45 +304,57 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
     
     switch (inst->getOpcode()) {
         case llvm::Instruction::Add:
-            if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpIAdd, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            } else {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpFAdd, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            }
-            break;
+             uint32_t op1_add = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2_add = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpIAdd, {get_type_id(builder, inst->getType()), result_id, op1_add, op2_add});
+             break;
+             
+        case llvm::Instruction::FAdd: {
+             uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpFAdd, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+             break;
+        }
             
         case llvm::Instruction::Sub:
-            if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpISub, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            } else {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpFSub, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            }
-            break;
+             uint32_t op1_sub = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2_sub = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpISub, {get_type_id(builder, inst->getType()), result_id, op1_sub, op2_sub});
+             break;
+
+        case llvm::Instruction::FSub: {
+             uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpFSub, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+             break;
+        }
             
         case llvm::Instruction::Mul:
-            if (inst->getType()->isIntegerTy()) {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpIMul, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            } else {
-                uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
-                uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
-                builder.emit_op(SPIRVOp::OpFMul, {get_type_id(builder, inst->getType()), result_id, op1, op2});
-            }
-            break;
+             uint32_t op1_mul = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2_mul = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpIMul, {get_type_id(builder, inst->getType()), result_id, op1_mul, op2_mul});
+             break;
+
+        case llvm::Instruction::FMul: {
+             uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+             uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+             builder.emit_op(SPIRVOp::OpFMul, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+             break;
+        }
             
         case llvm::Instruction::FDiv: {
             uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
             uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
             builder.emit_op(SPIRVOp::OpFDiv, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+            break;
+        }
+
+        case llvm::Instruction::SDiv:
+        case llvm::Instruction::UDiv: {
+            uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+            SPIRVOp op = (inst->getOpcode() == llvm::Instruction::SDiv) ? SPIRVOp::OpSDiv : SPIRVOp::OpUDiv;
+            builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             break;
         }
         
