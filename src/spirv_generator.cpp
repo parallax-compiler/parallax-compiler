@@ -162,6 +162,9 @@ public:
     }
     
     void emit_op(SPIRVOp op, const std::vector<uint32_t>& operands) {
+        std::cerr << "[SPIRVBuilder] section " << (int)current_section_ << " emit_op " << (uint32_t)op << " operands: ";
+        for(auto o : operands) std::cerr << o << " "; std::cerr << std::endl;
+        
         uint32_t word_count = 1 + operands.size();
         emit_word((word_count << 16) | static_cast<uint32_t>(op));
         for (uint32_t operand : operands) {
