@@ -385,6 +385,35 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             builder.emit_op(SPIRVOp::OpStore, {ptr, value});
             break;
         }
+
+        case llvm::Instruction::GetElementPtr: {
+            auto* gep = llvm::cast<llvm::GetElementPtrInst>(inst);
+            uint32_t base = get_value_id(builder, gep->getPointerOperand(), value_map);
+            
+            std::vector<uint32_t> ops;
+            ops.push_back(get_type_id(builder, gep->getType()));
+            ops.push_back(result_id);
+            ops.push_back(base);
+            
+            for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it) {
+                ops.push_back(get_value_id(builder, *it, value_map));
+            }
+            
+            builder.emit_op(SPIRVOp::OpAccessChain, ops);
+            break;
+        }
+
+        case llvm::Instruction::Alloca: {
+            // Alloca in SPIR-V is OpVariable with Function storage class (7)
+            // It must be in the first block of the function (usually)
+            uint32_t ty = get_type_id(builder, inst->getType());
+            // Need to ensure the type is indeed a pointer to the element type
+            // get_type_id for PointerType already returns a pointer type.
+            // But OpVariable result must be a pointer type, and alloca returns a pointer.
+            // So success.
+            builder.emit_op(SPIRVOp::OpVariable, {ty, result_id, 7 /* Function */});
+            break;
+        }
         
         case llvm::Instruction::Ret:
             builder.emit_op(SPIRVOp::OpReturn, {});
