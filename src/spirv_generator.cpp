@@ -303,11 +303,12 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
     value_map[inst] = result_id;
     
     switch (inst->getOpcode()) {
-        case llvm::Instruction::Add:
+        case llvm::Instruction::Add: {
              uint32_t op1_add = get_value_id(builder, inst->getOperand(0), value_map);
              uint32_t op2_add = get_value_id(builder, inst->getOperand(1), value_map);
              builder.emit_op(SPIRVOp::OpIAdd, {get_type_id(builder, inst->getType()), result_id, op1_add, op2_add});
              break;
+        }
              
         case llvm::Instruction::FAdd: {
              uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
@@ -316,11 +317,12 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
              break;
         }
             
-        case llvm::Instruction::Sub:
+        case llvm::Instruction::Sub: {
              uint32_t op1_sub = get_value_id(builder, inst->getOperand(0), value_map);
              uint32_t op2_sub = get_value_id(builder, inst->getOperand(1), value_map);
              builder.emit_op(SPIRVOp::OpISub, {get_type_id(builder, inst->getType()), result_id, op1_sub, op2_sub});
              break;
+        }
 
         case llvm::Instruction::FSub: {
              uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
@@ -329,11 +331,12 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
              break;
         }
             
-        case llvm::Instruction::Mul:
+        case llvm::Instruction::Mul: {
              uint32_t op1_mul = get_value_id(builder, inst->getOperand(0), value_map);
              uint32_t op2_mul = get_value_id(builder, inst->getOperand(1), value_map);
              builder.emit_op(SPIRVOp::OpIMul, {get_type_id(builder, inst->getType()), result_id, op1_mul, op2_mul});
              break;
+        }
 
         case llvm::Instruction::FMul: {
              uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
