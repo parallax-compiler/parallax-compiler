@@ -215,8 +215,8 @@ void SPIRVGenerator::set_target_vulkan_version(uint32_t major, uint32_t minor) {
 }
 
 std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
+    std::cerr << "[SPIRVGenerator] generate(Module) called" << std::endl;
     SPIRVBuilder builder;
-    builder.set_section(SPIRVBuilder::Section::Header);
     
     // Emit header
     emit_header(builder.get_header());
@@ -229,12 +229,12 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     // I need to update it at the end?
     // Or just let it be large? No, valid SPIR-V requires correct bound.
     
-    builder.set_section(SPIRVBuilder::Section::Types);
-    // Emit capabilities
+    // Caps & MemModel
+    builder.set_section(SPIRVBuilder::Section::Preamble);
     builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
-    
-    // Emit memory model
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // Logical GLSL450
+    
+    builder.set_section(SPIRVBuilder::Section::Types);
     
     builder.set_section(SPIRVBuilder::Section::Code);
     
@@ -253,15 +253,19 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
             // I should put it in Decorations section? Or add EntryPoints section?
             // Using Decorations section for EntryPoint/ExecMode is roughly fine (Both are "Preamble").
             
-            builder.set_section(SPIRVBuilder::Section::Decorations);
+            builder.set_section(SPIRVBuilder::Section::EntryPoints);
             
-            // Emit entry point
-            std::vector<uint32_t> entry_operands = {5, func_id}; // GLCompute
-            builder.emit_op(SPIRVOp::OpEntryPoint, entry_operands);
-            builder.emit_string(func.getName().str());
+            // Emit entry point with correct word count and name string
+            std::string func_name = func.getName().str();
+            size_t name_words = (func_name.length() + 4) / 4;
+            uint32_t ep_wc = 1 + 1 + 1 + name_words; 
+            builder.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
+            builder.emit_word(5); // GLCompute
+            builder.emit_word(func_id);
+            builder.emit_string(func_name);
             
             // Emit execution mode
-            builder.emit_op(SPIRVOp::OpExecutionMode, {func_id, 17, 256, 1, 1}); // LocalSize
+            builder.emit_op(SPIRVOp::OpExecutionMode, {func_id, 17 /* LocalSize */, 256, 1, 1});
             
             builder.set_section(SPIRVBuilder::Section::Code);
             
@@ -526,7 +530,7 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
 std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     llvm::Function* lambda_func,
     const std::vector<std::string>& param_types) {
-    
+    std::cerr << "[SPIRVGenerator] generate_from_lambda called" << std::endl;
     SPIRVBuilder builder;
     builder.set_section(SPIRVBuilder::Section::Header);
     emit_header(builder.get_header());
