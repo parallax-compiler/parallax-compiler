@@ -266,8 +266,16 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t void_type = get_type_id(builder, llvm::Type::getVoidTy(func->getContext()));
     
+    std::vector<uint32_t> func_type_operands;
+    func_type_operands.push_back(void_type); // Return type
+    for (auto& arg : func->args()) {
+        func_type_operands.push_back(get_type_id(builder, arg.getType()));
+    }
+    
     uint32_t func_type = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeFunction, {func_type, void_type});
+    std::vector<uint32_t> all_func_ops = {func_type};
+    all_func_ops.insert(all_func_ops.end(), func_type_operands.begin(), func_type_operands.end());
+    builder.emit_op(SPIRVOp::OpTypeFunction, all_func_ops);
     
     // Emit function
     builder.set_section(SPIRVBuilder::Section::Code);
