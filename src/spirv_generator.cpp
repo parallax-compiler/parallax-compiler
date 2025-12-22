@@ -691,13 +691,15 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     
     // Entry Point Decl
     builder.set_section(SPIRVBuilder::Section::EntryPoints);
-    uint32_t ep_wc = 1 + 1 + 1 + 2 + 1; // Model(1)+Func(1)+Name(2)+Interface(1)
+    uint32_t ep_wc = 1 + 1 + 1 + 2 + 3; // Model(1)+Func(1)+Name(2)+Interfaces(3)
     builder.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
     builder.emit_word(5); // GLCompute
     builder.emit_word(entry_id);
     builder.emit_word(0x6e69616d); // "main"
     builder.emit_word(0x00000000); // "\0..."
-    builder.emit_word(gl_id_var_id); // Interface
+    builder.emit_word(gl_id_var_id); 
+    builder.emit_word(buffer_var_id);
+    builder.emit_word(pc_var_id);
     
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
     
