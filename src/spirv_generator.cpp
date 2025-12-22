@@ -502,6 +502,8 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     
     if (type->isVoidTy()) {
         builder.emit_op(SPIRVOp::OpTypeVoid, {type_id});
+    } else if (type->isIntegerTy(1)) {
+        builder.emit_op(SPIRVOp::OpTypeBool, {type_id});
     } else if (type->isIntegerTy(32)) {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     } else if (type->isFloatTy()) {
