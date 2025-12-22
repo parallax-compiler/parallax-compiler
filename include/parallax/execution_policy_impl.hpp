@@ -45,6 +45,7 @@ void ExecutionPolicyImpl::for_each_impl(Iterator first, Iterator last, UnaryFunc
         // 1. Compile
         std::string name = compiler.get_kernel_name(f);
         if (cache.find(name) == cache.end()) {
+            std::cerr << "Parallax JIT: Compiling " << name << "..." << std::endl;
             cache[name] = compiler.compile(f);
         }
         
@@ -75,7 +76,10 @@ void ExecutionPolicyImpl::for_each_impl(Iterator first, Iterator last, UnaryFunc
             size_t count = std::distance(first, last);
             
             if (g_global_launcher_ptr->launch(name, (void*)data_ptr, count)) {
+                g_global_launcher_ptr->sync(); // Ensure synchronous completion for ISO compliance
                 return; // GPU execution successful
+            } else {
+                std::cerr << "Parallax JIT: Launch failed for " << name << std::endl;
             }
         }
         
@@ -93,12 +97,48 @@ OutputIt ExecutionPolicyImpl::transform_impl(InputIt first, InputIt last,
                                              OutputIt d_first,
                                              UnaryOperation unary_op) {
     static LambdaCompiler compiler;
-    try {
-        auto spirv = compiler.compile(unary_op);
-        // Would launch here
-    } catch (...) {}
+    static std::unordered_map<std::string, std::vector<uint32_t>> cache;
+    static std::unordered_set<std::string> loaded_kernels;
     
+    try {
+        // 1. Compile with 2 arguments (input, output)
+        std::string name = compiler.get_kernel_name(unary_op, 2);
+        if (cache.find(name) == cache.end()) {
+            cache[name] = compiler.compile(unary_op, 2);
+        }
+        
+        // 2. Launch
+        extern KernelLauncher* g_global_launcher_ptr;
+        
+        if (g_global_launcher_ptr) {
+            if (loaded_kernels.find(name) == loaded_kernels.end()) {
+                g_global_launcher_ptr->load_kernel(name, cache[name].data(), cache[name].size() * 4);
+                loaded_kernels.insert(name);
+            }
+            
+            auto* in_ptr = &(*first);
+            auto* out_ptr = &(*d_first);
+            size_t count = std::distance(first, last);
+            
+            if (g_global_launcher_ptr->launch_transform(name, (void*)in_ptr, (void*)out_ptr, count)) {
+                g_global_launcher_ptr->sync(); // Ensure synchronous completion for ISO compliance
+                return d_first + count; // GPU execution successful
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "GPU Transform Failed: " << e.what() << std::endl;
+    }
+    
+    // Fallback
     return std::transform(std::execution::seq, first, last, d_first, unary_op);
+}
+
+template<typename InputIt, typename T, typename BinaryOperation>
+T ExecutionPolicyImpl::reduce_impl(InputIt first, InputIt last, T init, BinaryOperation binary_op) {
+    // Reduction requires specialized GPU logic (atomics/shuffles)
+    // For now, we fallback to CPU seq to maintain results parity
+    return std::reduce(std::execution::seq, first, last, init, binary_op);
 }
 
 } // namespace parallax

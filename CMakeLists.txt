@@ -21,6 +21,7 @@ find_package(Clang REQUIRED CONFIG)
 add_library(parallax-plugin SHARED
     src/lambda_extractor.cpp
     src/lambda_compiler.cpp
+    src/lambda_ir_generator.cpp
     src/spirv_generator.cpp
     src/execution_policy.cpp
 )

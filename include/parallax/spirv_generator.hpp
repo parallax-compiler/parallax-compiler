@@ -72,6 +72,7 @@ private:
     std::unordered_map<llvm::Constant*, uint32_t> constant_cache_;
     std::unordered_map<std::pair<uint32_t, uint32_t>, uint32_t, pair_hash> pointer_type_cache_;
     std::unordered_map<std::string, uint32_t> builtin_types_;
+    uint32_t glsl_std_id_;
 };
 
 } // namespace parallax

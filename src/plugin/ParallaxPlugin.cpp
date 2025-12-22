@@ -1,46 +1,65 @@
 #include "ParallaxPlugin.h"
 #include <clang/Frontend/FrontendPluginRegistry.h>
 #include <clang/AST/Decl.h>
-#include <clang/Rewrite/Core/Rewriter.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Lex/Lexer.h>
 #include <iostream>
+#include <llvm/Support/raw_ostream.h>
+
+// Global initializer to confirm plugin loading
+struct GlobalInit {
+    GlobalInit() {
+        llvm::errs() << "Parallax: Plugin Library Shared Object Loaded\n";
+    }
+} g_parallax_init;
 
 namespace parallax {
 
 bool ParallaxASTVisitor::VisitCallExpr(clang::CallExpr *Call) {
+    if (!Call) return false;
+    clang::FunctionDecl *FD = Call->getDirectCallee();
+    
     if (isParallaxCandidate(Call)) {
-        // This is where we will inject the parallax interception code
-        // For v0.4.0 alpha, we just log detection
-        llvm::outs() << "Parallax: Detected std::for_each with std::execution::par at " 
-                     << Call->getBeginLoc().printToString(Context->getSourceManager()) << "\n";
-                     
-        // TODO: Use Rewriter to replace std::for_each(...) 
-        // with parallax::ExecutionPolicyImpl::instance().for_each_impl(...)
+        std::string Name = FD->getNameInfo().getName().getAsString();
+        llvm::errs() << "Parallax: [MATCHED] Candidate STL call: " << Name << "\n";
+        
+        // Rewriting logic is temporarily disabled for debugging
+        /*
+        std::string NewCall;
+        ...
+        */
     }
     return true;
 }
 
+std::string ParallaxASTVisitor::getSourceText(clang::SourceLocation Start, clang::SourceLocation End) {
+    clang::SourceLocation RealEnd = clang::Lexer::getLocForEndOfToken(End, 0, Context->getSourceManager(), Context->getLangOpts());
+    if (Start.isInvalid() || RealEnd.isInvalid()) return "";
+    return std::string(Context->getSourceManager().getCharacterData(Start),
+                       Context->getSourceManager().getCharacterData(RealEnd) - Context->getSourceManager().getCharacterData(Start));
+}
+
 bool ParallaxASTVisitor::isParallaxCandidate(clang::CallExpr *Call) {
+    if (!Call) return false;
     clang::FunctionDecl *FD = Call->getDirectCallee();
     if (!FD) return false;
     
-    std::string Name = FD->getNameInfo().getName().getAsString();
+    std::string Name = FD->getQualifiedNameAsString();
     
-    // Check if it's for_each
-    if (Name != "for_each") return false;
+    // Check if it's for_each or transform in std namespace
+    if (Name != "std::for_each" && Name != "std::transform" && Name != "std::reduce" &&
+        Name != "std::execution::for_each" && Name != "std::execution::transform") {
+        return false;
+    }
     
-    // Check constraints (namespace std, first arg is execution policy)
-    // This is a simplified check for the prototype
-    
-    // TODO: Verify namespace and argument types rigorously
-    
-    // Check first argument type for std::execution::parallel_policy
     if (Call->getNumArgs() < 3) return false;
     
     auto* Arg0 = Call->getArg(0)->IgnoreImplicit();
     std::string ArgType = Arg0->getType().getAsString();
     
-    if (ArgType.find("execution::parallel_policy") != std::string::npos ||
-        ArgType.find("execution::par") != std::string::npos) {
+    if (ArgType.find("parallel_policy") != std::string::npos ||
+        ArgType.find("par") != std::string::npos) {
         return true;
     }
     

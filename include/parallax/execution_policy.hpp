@@ -32,6 +32,9 @@ public:
     template<typename InputIt, typename OutputIt, typename UnaryOperation>
     OutputIt transform_impl(InputIt first, InputIt last, OutputIt d_first, UnaryOperation unary_op);
     
+    template<typename InputIt, typename T, typename BinaryOperation>
+    T reduce_impl(InputIt first, InputIt last, T init, BinaryOperation binary_op);
+    
 private:
     ExecutionPolicyImpl() = default;
     // Note: Runtime integration (backend, memory, launcher) happens in samples

@@ -210,7 +210,7 @@ private:
 };
 
 SPIRVGenerator::SPIRVGenerator()
-    : vulkan_major_(1), vulkan_minor_(3) {}
+    : vulkan_major_(1), vulkan_minor_(2), glsl_std_id_(0) {}
 
 SPIRVGenerator::~SPIRVGenerator() = default;
 
@@ -278,9 +278,10 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     // Emit type declarations
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t void_type = get_type_id(builder, llvm::Type::getVoidTy(func->getContext()));
-    
+    uint32_t return_type = get_type_id(builder, func->getReturnType());
+
     std::vector<uint32_t> func_type_operands;
-    func_type_operands.push_back(void_type); // Return type
+    func_type_operands.push_back(return_type); // Return type (use actual, not always void)
     for (auto& arg : func->args()) {
         func_type_operands.push_back(get_type_id(builder, arg.getType()));
     }
@@ -292,7 +293,7 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     
     // Emit function
     builder.set_section(SPIRVBuilder::Section::Code);
-    builder.emit_op(SPIRVOp::OpFunction, {void_type, func_id, 0, func_type});
+    builder.emit_op(SPIRVOp::OpFunction, {return_type, func_id, 0, func_type});
     
     // Handle arguments
     for (auto& arg : func->args()) {
@@ -420,9 +421,18 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             break;
         }
         
-        case llvm::Instruction::Ret:
-            builder.emit_op(SPIRVOp::OpReturn, {});
+        case llvm::Instruction::Ret: {
+            auto* ret = llvm::cast<llvm::ReturnInst>(inst);
+            if (ret->getReturnValue()) {
+                // Return with value (OpReturnValue)
+                uint32_t val_id = get_value_id(builder, ret->getReturnValue(), value_map);
+                builder.emit_op(SPIRVOp::OpReturnValue, {val_id});
+            } else {
+                // Void return (OpReturn)
+                builder.emit_op(SPIRVOp::OpReturn, {});
+            }
             break;
+        }
             
         case llvm::Instruction::Br: {
             auto* br = llvm::cast<llvm::BranchInst>(inst);
@@ -479,6 +489,26 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             }
             
             builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+            break;
+        }
+        
+        case llvm::Instruction::Call: {
+            auto* call = llvm::cast<llvm::CallInst>(inst);
+            auto* func = call->getCalledFunction();
+            if (func && func->getIntrinsicID() == llvm::Intrinsic::sqrt) {
+                uint32_t arg = get_value_id(builder, call->getArgOperand(0), value_map);
+                uint32_t ty = get_type_id(builder, inst->getType());
+                // OpExtInst result_ty result_id set_id inst_index operand1
+                builder.emit_op(SPIRVOp::OpExtInst, {ty, result_id, glsl_std_id_, 31 /* sqrt */, arg});
+            } else {
+                // Generic call (OpFunctionCall)
+                uint32_t func_ptr_id = 0; // Would need a map for functions
+                std::vector<uint32_t> ops = {get_type_id(builder, inst->getType()), result_id, func_ptr_id};
+                for (unsigned i = 0; i < call->arg_size(); ++i) {
+                    ops.push_back(get_value_id(builder, call->getArgOperand(i), value_map));
+                }
+                builder.emit_op(SPIRVOp::OpFunctionCall, ops);
+            }
             break;
         }
         
@@ -590,6 +620,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     builder.emit_word((ext_wc << 16) | (uint32_t)SPIRVOp::OpExtension);
     builder.emit_string(ext_name);
     
+    // Import GLSL.std.450 (MUST be before MemoryModel)
+    glsl_std_id_ = builder.get_next_id();
+    std::string glsl_name = "GLSL.std.450";
+    uint32_t glsl_wc = 2 + (glsl_name.length() / 4) + 1; 
+    builder.emit_word((glsl_wc << 16) | (uint32_t)SPIRVOp::OpExtInstImport);
+    builder.emit_word(glsl_std_id_);
+    builder.emit_string(glsl_name);
+    
     builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // GLSL450
     
     // Translate Lambda Helper
@@ -651,16 +689,26 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
     // Pointer StorageBuffer Struct
     uint32_t ptr_struct_id = get_pointer_type_id(builder, struct_id, 12 /* StorageBuffer */);
-    
-    // Buffer Variable (Set 0, Binding 0)
-    builder.set_section(SPIRVBuilder::Section::Types);
-    uint32_t buffer_var_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
-    builder.set_section(SPIRVBuilder::Section::Decorations);
-    builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, 0});
-    builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
 
-    // Push Constants Struct { uint count, float multiplier }
+    // Determine if this is a transform (returns non-void)
+    bool is_transform = !lambda_func->getReturnType()->isVoidTy();
+    size_t num_buffers = is_transform ? 2 : lambda_func->arg_size();
+
+    // Create Variables for buffers
+    // For transform: buffer[0] = input, buffer[1] = output
+    // For for_each: buffers match lambda arguments
+    std::vector<uint32_t> buffer_var_ids;
+    for (size_t i = 0; i < num_buffers; ++i) {
+        builder.set_section(SPIRVBuilder::Section::Types);
+        uint32_t buffer_var_id = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
+        builder.set_section(SPIRVBuilder::Section::Decorations);
+        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, static_cast<uint32_t>(i)});
+        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
+        buffer_var_ids.push_back(buffer_var_id);
+    }
+
+    // Push Constants Struct { uint count, float multiplier, ... }
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t pc_struct_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id, float_id, int_id, int_id}); 
@@ -691,14 +739,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     
     // Entry Point Decl
     builder.set_section(SPIRVBuilder::Section::EntryPoints);
-    uint32_t ep_wc = 1 + 1 + 1 + 2 + 3; // Model(1)+Func(1)+Name(2)+Interfaces(3)
+    uint32_t ep_wc = 1 + 1 + 1 + 2 + 1 + static_cast<uint32_t>(buffer_var_ids.size()) + 1; // Model(1)+Func(1)+Name(2)+PCs+Vars+ID
     builder.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
     builder.emit_word(5); // GLCompute
     builder.emit_word(entry_id);
     builder.emit_word(0x6e69616d); // "main"
     builder.emit_word(0x00000000); // "\0..."
     builder.emit_word(gl_id_var_id); 
-    builder.emit_word(buffer_var_id);
+    for (auto id : buffer_var_ids) builder.emit_word(id);
     builder.emit_word(pc_var_id);
     
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
@@ -739,15 +787,40 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     
     builder.emit_op(SPIRVOp::OpLabel, {label_body});
     
-    // Access Buffer Data: float* element_ptr = &buffer.data[x]
+    // Access Buffer Data for each argument
+    std::vector<uint32_t> arg_ptrs;
     uint32_t ptr_float_sb = get_pointer_type_id(builder, float_id, 12 /* StorageBuffer */);
-    uint32_t element_ptr = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, buffer_var_id, Zero, id_x});
     
-    // Call Lambda(element_ptr)
-    uint32_t call_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpFunctionCall, {void_id, call_id, lambda_func_id, element_ptr});
+    for (auto var_id : buffer_var_ids) {
+        uint32_t element_ptr = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, var_id, Zero, id_x});
+        arg_ptrs.push_back(element_ptr);
+    }
     
+    // Call Lambda - different handling for transform vs for_each
+    bool is_transform = !lambda_func->getReturnType()->isVoidTy();
+
+    if (is_transform && arg_ptrs.size() >= 2) {
+        // Transform: lambda returns value, has separate input/output
+        // Load from input buffer[0]
+        uint32_t input_val = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpLoad, {float_id, input_val, arg_ptrs[0]});
+
+        // Call lambda with value (not pointer)
+        uint32_t result_id = builder.get_next_id();
+        std::vector<uint32_t> call_ops = {float_id, result_id, lambda_func_id, input_val};
+        builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
+
+        // Store result to output buffer[1]
+        builder.emit_op(SPIRVOp::OpStore, {arg_ptrs[1], result_id});
+    } else {
+        // For_each: lambda modifies in-place via pointer
+        uint32_t call_id = builder.get_next_id();
+        std::vector<uint32_t> call_ops = {void_id, call_id, lambda_func_id};
+        call_ops.insert(call_ops.end(), arg_ptrs.begin(), arg_ptrs.end());
+        builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
+    }
+
     builder.emit_op(SPIRVOp::OpBranch, {label_merge});
     
     // Merge Block
