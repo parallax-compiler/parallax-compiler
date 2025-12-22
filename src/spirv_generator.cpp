@@ -221,9 +221,24 @@ void SPIRVGenerator::set_target_vulkan_version(uint32_t major, uint32_t minor) {
 
 std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     std::cerr << "[SPIRVGenerator] generate(Module) called" << std::endl;
-    SPIRVBuilder builder;
     
-    // Emit header
+    // Unify: If there is exactly one non-declaration function, use robust path
+    llvm::Function* main_func = nullptr;
+    int func_count = 0;
+    for (auto& func : module->functions()) {
+        if (!func.isDeclaration()) {
+            main_func = &func;
+            func_count++;
+        }
+    }
+    
+    if (func_count == 1) {
+        std::cerr << "[SPIRVGenerator] Redirecting to generate_from_lambda" << std::endl;
+        return generate_from_lambda(main_func, {"float&"});
+    }
+
+    std::cerr << "[SPIRVGenerator] Falling back to manual generate" << std::endl;
+    SPIRVBuilder builder;
     emit_header(builder.get_header());
     
     builder.set_section(SPIRVBuilder::Section::Preamble);
@@ -253,9 +268,7 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
         }
     }
     
-    // Update bound
     builder.get_header()[3] = builder.get_next_id();
-    
     return builder.get_spirv();
 }
 
