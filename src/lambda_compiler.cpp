@@ -2,6 +2,7 @@
 #include "parallax/spirv_generator.hpp"
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
+#include <iostream>
 
 namespace parallax {
 
@@ -10,6 +11,7 @@ LambdaCompiler::LambdaCompiler()
 
 LambdaCompiler::~LambdaCompiler() = default;
 
-// Explicit instantiation for common lambda types will be in execution_policy.cpp
+// Template implementations are in the header.
+// This file can contain explicit instantiations or non-template helpers.
 
 } // namespace parallax
