@@ -413,14 +413,10 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         }
 
         case llvm::Instruction::Alloca: {
-            // Alloca in SPIR-V is OpVariable with Function storage class (7)
-            // It must be in the first block of the function (usually)
-            uint32_t ty = get_type_id(builder, inst->getType());
-            // Need to ensure the type is indeed a pointer to the element type
-            // get_type_id for PointerType already returns a pointer type.
-            // But OpVariable result must be a pointer type, and alloca returns a pointer.
-            // So success.
-            builder.emit_op(SPIRVOp::OpVariable, {ty, result_id, 7 /* Function */});
+            auto* alloca = llvm::cast<llvm::AllocaInst>(inst);
+            uint32_t element_ty_id = get_type_id(builder, alloca->getAllocatedType());
+            uint32_t ptr_ty_id = get_pointer_type_id(builder, element_ty_id, 7 /* Function */);
+            builder.emit_op(SPIRVOp::OpVariable, {ptr_ty_id, result_id, 7 /* Function */});
             break;
         }
         
@@ -615,23 +611,20 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
                                             uint32_t lambda_func_id, llvm::Function* lambda_func) {
     // 1. Setup Types & Globals (in Types/Decorations Sections)
     
-    // Float Type
+    // Basic Types
     llvm::Type* float_ty = llvm::Type::getFloatTy(lambda_func->getContext());
     uint32_t float_id = get_type_id(builder, float_ty);
-    
-    // Int Type
     llvm::Type* int32_ty = llvm::Type::getInt32Ty(lambda_func->getContext());
     uint32_t int_id = get_type_id(builder, int32_ty);
     
-    builder.set_section(SPIRVBuilder::Section::Types);
-
     // RuntimeArray { float }
+    builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t rarray_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {rarray_id, float_id});
     builder.set_section(SPIRVBuilder::Section::Decorations);
-    builder.emit_op(SPIRVOp::OpDecorate, {rarray_id, 71 /* ArrayStride */, 4});
+    builder.emit_op(SPIRVOp::OpDecorate, {rarray_id, 6 /* ArrayStride */, 4});
 
-    // Struct { RuntimeArray }
+    // Buffer Struct { RuntimeArray }
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t struct_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypeStruct, {struct_id, rarray_id});
@@ -642,95 +635,44 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Pointer StorageBuffer Struct
     uint32_t ptr_struct_id = get_pointer_type_id(builder, struct_id, 12 /* StorageBuffer */);
     
-    // Variable Buffer (Set 0, Binding 0)
+    // Buffer Variable (Set 0, Binding 0)
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t buffer_var_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
     builder.set_section(SPIRVBuilder::Section::Decorations);
     builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, 0});
     builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
-    
-    // Push Constants { uint count, float multiplier }
+
+    // Push Constants Struct { uint count, float multiplier }
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t pc_struct_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id, float_id, int_id, int_id}); // Pad to 16 bytes? No, standard layout.
-    // Layout: 0: count (4 bytes), 4: multiplier (4 bytes).
-    
+    builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id, float_id, int_id, int_id}); 
     builder.set_section(SPIRVBuilder::Section::Decorations);
     builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 1, 35 /* Offset */, 4}); // Ensure generic launch (no multiplier) or legacy? 
-    // KernelLauncher sets {count, 0, 0, 0} then memcpy multiplier at offset 4.
-    // So struct should be { int, float }.
-    
+    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 1, 35 /* Offset */, 4});
     builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
     
     // Pointer PushConstant Struct
     uint32_t ptr_pc_id = get_pointer_type_id(builder, pc_struct_id, 9 /* PushConstant */);
     
-    // Variable PC
+    // PC Variable
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t pc_var_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpVariable, {ptr_pc_id, pc_var_id, 9});
-    
+
     // GlobalInvocationID Builtin
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t v3uint_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpTypeVector, {v3uint_id, int_id, 3});
-    
     uint32_t ptr_input_v3uint_id = get_pointer_type_id(builder, v3uint_id, 1 /* Input */);
-    
     uint32_t gl_id_var_id = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpVariable, {ptr_input_v3uint_id, gl_id_var_id, 1});
     builder.set_section(SPIRVBuilder::Section::Decorations);
     builder.emit_op(SPIRVOp::OpDecorate, {gl_id_var_id, 11 /* BuiltIn */, 28 /* GlobalInvocationID */});
     
     // Entry Point Decl
-    builder.set_section(SPIRVBuilder::Section::Decorations); // Or EntryPoint specific section? 
-    // EntryPoint must be before Types.
-    // We are putting it in Decorations. Hopefully sufficient (Decorations < Types).
-    // Actually Spec requires: EntryPoints < ExecutionModes < Debug < TypeAnnotations(Decorations) < Types.
-    // My SPIRVBuilder order: Header, Decorations, Types, Code.
-    // If I put EntryPoint in Decorations, it is before Types.
-    // But ExecutionMode is also required.
-    
-    builder.emit_op(SPIRVOp::OpEntryPoint, {5 /* GLCompute */, entry_id, 0x6e69616d /* "main" */, gl_id_var_id}); // Interface includes Inputs
-    // Name "main" is "m" "a" "i" "n" = 0x6e69616d (little endian: n i a m).
-    // 0x006e69616d? No, emit_string handles it.
-    // Manually:
-    // builder.emit_op(SPIRVOp::OpEntryPoint, {5, entry_id}); builder.emit_string("main"); ...
-    // But operand vector needed.
-    // Can't mix emit_op operands and subsequent emit_string.
-    // emit_op takes vector. It writes header with length.
-    // String must be PART of operands?
-    // My emit_op impl counts implementation.
-    // I should create a separate emit_entry_point helper or do minimal hack.
-    // Hack: Just emit explicit words for EntryPoint.
-    // OpEntryPoint: OpCode | WordCount. Model, FunctionID, Name (literals), Interface IDs...
-    // Name "main" (null terminated) -> "main\0" -> 5 bytes -> 2 words.
-    // Words: 'm' 'a' 'i' 'n', '\0' 0 0 0.
-    // 0x6e69616d, 0x00000000.
-    
-    // Let's use emit_op but I can't pass string literals easily.
-    // I will use emit_string helper inside decorations section manually?
-    // SPIRVBuilder::emit_string works by pushing words.
-    // But emit_op writes length first.
-    // It's confusing.
-    // I'll skip name for now (empty string "").
-    // Empty string: 1 word 0x00000000.
-    
-    std::vector<uint32_t> ep_operands = {5 /* GLCompute */, entry_id};
-    // Append interface
-    ep_operands.push_back(gl_id_var_id);
-    
-    // Correct order for EntryPoint:
-    // OpEntryPoint {Execution Model, Entry Point <id>, Name, Interface <id>, ...}
-    
-    // Using custom words to handle name string properly
     builder.set_section(SPIRVBuilder::Section::EntryPoints);
-    
-    // Calculate word count:
-    // OpEntryPoint Word (1) + Model (1) + FuncID (1) + Name ("main\0\0\0" -> 2 words) + Interface (1)
-    uint32_t ep_wc = 1 + 1 + 1 + 2 + 1; 
+    uint32_t ep_wc = 1 + 1 + 1 + 2 + 1; // Model(1)+Func(1)+Name(2)+Interface(1)
     builder.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
     builder.emit_word(5); // GLCompute
     builder.emit_word(entry_id);
@@ -738,13 +680,10 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.emit_word(0x00000000); // "\0..."
     builder.emit_word(gl_id_var_id); // Interface
     
-    // ExecutionMode follows EntryPoints
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
     
-    // 2. Define Main Code
+    // 2. Define Main Function
     builder.set_section(SPIRVBuilder::Section::Code);
-    
-    // Void Type
     uint32_t void_id = get_type_id(builder, llvm::Type::getVoidTy(lambda_func->getContext()));
     uint32_t main_func_type = builder.get_next_id();
     builder.set_section(SPIRVBuilder::Section::Types);
@@ -754,133 +693,39 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.emit_op(SPIRVOp::OpFunction, {void_id, entry_id, 0, main_func_type});
     builder.emit_op(SPIRVOp::OpLabel, {builder.get_next_id()});
     
-    // Body Logic
-    // Load GlobalID
+    // Load GlobalID.x
     uint32_t id_vec = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpLoad, {v3uint_id, id_vec, gl_id_var_id});
-    
-    // Extract X
     uint32_t id_x = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpCompositeExtract, {int_id, id_x, id_vec, 0});
     
-    // Access Count (Set 0 in PC struct)
-    // Need pointer to int (Uniform/PushConstant)
-    // Offset 0 is int count.
-    // Ptr -> PC -> Member 0
-    uint32_t Zero = builder.get_next_id();
-    builder.set_section(SPIRVBuilder::Section::Types);
-    builder.emit_op(SPIRVOp::OpConstant, {int_id, Zero, 0});
-    builder.set_section(SPIRVBuilder::Section::Code);
-    
-    uint32_t ptr_count = builder.get_next_id();
+    // Load Count from PC
+    uint32_t Zero = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, 0));
     uint32_t ptr_int_pc = get_pointer_type_id(builder, int_id, 9 /* PushConstant */);
-    
+    uint32_t ptr_count = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpAccessChain, {ptr_int_pc, ptr_count, pc_var_id, Zero});
+    uint32_t count = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpLoad, {int_id, count, ptr_count});
     
-    uint32_t count_val = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpLoad, {int_id, count_val, ptr_count});
-    
-    // Bounds Check: id < count
-    // u32 < u32 ? OpULessThan
-    uint32_t bool_ty = builder.get_next_id();
-    builder.set_section(SPIRVBuilder::Section::Types);
-    builder.emit_op(SPIRVOp::OpTypeBool, {bool_ty});
-    builder.set_section(SPIRVBuilder::Section::Code);
-    
+    // Bounds Check: if (x < count)
     uint32_t cond = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpULessThan, {bool_ty, cond, id_x, count_val});
+    builder.emit_op(SPIRVOp::OpULessThan, {get_type_id(builder, llvm::Type::getInt1Ty(lambda_func->getContext())), cond, id_x, count});
     
-    // Branch
     uint32_t label_body = builder.get_next_id();
     uint32_t label_merge = builder.get_next_id();
-    
-    builder.emit_op(SPIRVOp::OpSelectionMerge, {label_merge, 0 /* None */});
+    builder.emit_op(SPIRVOp::OpSelectionMerge, {label_merge, 0});
     builder.emit_op(SPIRVOp::OpBranchConditional, {cond, label_body, label_merge});
     
-    // Body Block
     builder.emit_op(SPIRVOp::OpLabel, {label_body});
     
-    // Get Data Pointer
-    // Buffer -> Member 0 (RuntimeArray) -> Index id_x
-    // Returns pointer to float (StorageBuffer)
+    // Access Buffer Data: float* element_ptr = &buffer.data[x]
     uint32_t ptr_float_sb = get_pointer_type_id(builder, float_id, 12 /* StorageBuffer */);
     uint32_t element_ptr = builder.get_next_id();
-    
-    // AccessChain indices: 0 (member), id_x (index)
-    // Create constant 0 for member index
-    // Using Zero we already created.
     builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, buffer_var_id, Zero, id_x});
     
-    // For lambda taking float& (pointer), we pass element_ptr.
-    // Call Lambda
-    // Note: Lambda func logic needs to handle StorageBuffer pointer? 
-    // If lambda was compiled with generic pointers or CrossWorkgroup?
-    // get_type_id uses CrossWorkgroup(5) for pointer args.
-    // If we pass StorageBuffer(12) pointer to CrossWorkgroup(5) param... SPIR-V might allow it?
-    // OpFunctionCall operands must match types.
-    // We need to Cast? or Ensure lambda uses StorageBuffer?
-    // But lambda is compiled generally.
-    // Let's assume Lambda uses CrossWorkgroup.
-    // We pass StorageBuffer ptr.
-    // This is type mismatch.
-    // SPIR-V 1.4+ allows generic pointers (StorageClass=8)?
-    // Or we use OpCopyObject? 
-    // Or we just load value, pass value?
-    // Loop lambda: [](float& x).
-    // It expects reference.
-    // If I change get_type_id to use StorageBuffer(12) for float pointers?
-    // Or Generic(8)?
-    // Vulnerability loop: Lambda compiled with type X, we pass type Y.
-    // Fix: Hardcode get_type_id to use StorageBuffer(12) for implementation inside lambda?
-    // But variables inside lambda (alloca) use Function(7).
-    
-    // Simplification: Load, Call(with value), Store.
-    // But `[](float& x)` writes back.
-    // If I pass by value, it won't write back.
-    // I MUST pass pointer.
-    
-    // Hack: Change get_type_id to return StorageBuffer(12) pointer for float* if it's an argument?
-    // But `get_type_id` is generic.
-    
-    // Let's assume Lambda uses CrossWorkgroup(5). 
-    // I can cast StorageBuffer(12) to CrossWorkgroup(5) ??
-    // Not trivially.
-    
-    // For MVP: Let's change `get_type_id` pointer storage class default (in my previous edit it was 5).
-    // Let's change `ptr_float_sb` (the pointer we got from buffer) to be ... specific?
-    // The AccessChain returns a pointer with storage class matching the base (StorageBuffer).
-    
-    // FIX: Change `get_type_id` to use StorageBuffer(12) for pointers?
-    // But then Allocas fail.
-    
-    // We can iterate the arguments of lambda func and get their type ID.
-    // We generated them in `translate_function`.
-    // But we don't have access to the IDs generated inside `translate_function`.
-    // Wait, `get_type_id` is cached!
-    // So if `translate_function` called `get_type_id(float*)`, it got ID X.
-    // We call `get_type_id(float*)` here, we get ID X.
-    // Check `get_type_id` impl: `builder.emit_op(..., {type_id, 5, ...})`.
-    // So ID X is CrossWorkgroup.
-    // But our Buffer `OpVariable` is StorageBuffer(12).
-    // AccessChain will result in StorageBuffer ptr.
-    // Mismatch!
-    
-    // If I assume `get_type_id` returns CrossWorkgroup.
-    // I should create my buffer variable as CrossWorkgroup(5)?
-    // Vulkan allows StorageBuffer resources in Workgroup? No.
-    // Uses StorageBuffer or Uniform.
-    
-    // Maybe I modify `get_type_id` to use `StorageBuffer(12)` for pointers?
-    // And `alloca` (local vars) use `Function(7)`.
-    // `translate_instruction` Alloca logic?
-    // I haven't implemented `Alloca` in `translate_instruction`.
-    
-    // Let's assume lambda arguments are `float*` pointing to buffer.
-    // I'll update `get_type_id` to use `StorageBuffer(12)` for pointers. 
-    // For lambda taking float& (pointer), we pass element_ptr.
-    // Call Lambda
+    // Call Lambda(element_ptr)
     uint32_t call_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpFunctionCall, {void_id, call_id, lambda_func_id, element_ptr}); // Pass pointer
+    builder.emit_op(SPIRVOp::OpFunctionCall, {void_id, call_id, lambda_func_id, element_ptr});
     
     builder.emit_op(SPIRVOp::OpBranch, {label_merge});
     
