@@ -191,6 +191,24 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
                 return nullptr;
             }
+            case clang::BO_SubAssign: {
+                if (lhs->getType()->isPointerTy()) {
+                    llvm::Value* loaded = builder.CreateLoad(builder.getFloatTy(), lhs, "tmp");
+                    llvm::Value* result = builder.CreateFSub(loaded, rhs, "sub");
+                    builder.CreateStore(result, lhs);
+                    return result;
+                }
+                return nullptr;
+            }
+            case clang::BO_DivAssign: {
+                if (lhs->getType()->isPointerTy()) {
+                    llvm::Value* loaded = builder.CreateLoad(builder.getFloatTy(), lhs, "tmp");
+                    llvm::Value* result = builder.CreateFDiv(loaded, rhs, "div");
+                    builder.CreateStore(result, lhs);
+                    return result;
+                }
+                return nullptr;
+            }
             default:
                 llvm::errs() << "Warning: Unhandled binary operator: " << binary_op->getOpcodeStr() << "\n";
                 return nullptr;

@@ -3,9 +3,14 @@
 #include "parallax/spirv_generator.hpp"
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/AST/Type.h>
+#include <clang/AST/DeclTemplate.h>
+#include <clang/AST/TemplateBase.h>
+#include <clang/AST/ExprCXX.h>
 #include <llvm/Support/raw_ostream.h>
 #include <sstream>
 #include <iomanip>
+#include <set>
 
 namespace parallax {
 
@@ -59,11 +64,30 @@ public:
         return !rewriter_.overwriteChangedFiles();
     }
 
+    /**
+     * Mark a container as needing allocator injection
+     */
+    void markContainerForAllocation(const clang::VarDecl* var_decl) {
+        if (var_decl) {
+            containers_needing_allocator_.insert(var_decl);
+        }
+    }
+
+    /**
+     * Apply allocator injections to all marked containers
+     */
+    void applyAllocatorInjections();
+
 private:
     clang::Rewriter rewriter_;
     clang::CompilerInstance& CI_;
     clang::SourceManager& SM_;
     std::vector<TransformInfo> transforms_;
+
+    // Container tracking for allocator injection
+    std::set<const clang::VarDecl*> containers_needing_allocator_;
+    std::set<const clang::VarDecl*> rewritten_containers_;
+    bool allocator_header_included_ = false;
 
     /**
      * Apply a single transformation
@@ -85,6 +109,21 @@ private:
      */
     std::string generateSPIRVArray(const std::string& name,
                                    const std::vector<uint32_t>& spirv);
+
+    /**
+     * Rewrite a container type to inject parallax::allocator
+     */
+    void rewriteContainerType(const clang::VarDecl* var_decl);
+
+    /**
+     * Check if a container can be rewritten
+     */
+    bool canRewriteContainer(const clang::VarDecl* var_decl);
+
+    /**
+     * Ensure allocator header is included
+     */
+    void ensureAllocatorHeader();
 };
 
 void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
@@ -191,6 +230,141 @@ std::string ParallaxRewriter::getSourceText(clang::SourceRange range) {
     return std::string(start_ptr, end_ptr - start_ptr);
 }
 
+void ParallaxRewriter::applyAllocatorInjections() {
+    llvm::errs() << "[ParallaxRewriter] Injecting allocators into "
+                 << containers_needing_allocator_.size() << " containers\n";
+
+    if (!containers_needing_allocator_.empty()) {
+        ensureAllocatorHeader();
+    }
+
+    for (const clang::VarDecl* var_decl : containers_needing_allocator_) {
+        if (rewritten_containers_.count(var_decl)) {
+            continue;  // Already rewritten
+        }
+
+        rewriteContainerType(var_decl);
+        rewritten_containers_.insert(var_decl);
+    }
+}
+
+void ParallaxRewriter::rewriteContainerType(const clang::VarDecl* var_decl) {
+    if (!canRewriteContainer(var_decl)) {
+        return;
+    }
+
+    clang::QualType original_type = var_decl->getType();
+    std::string type_str = original_type.getAsString();
+
+    llvm::errs() << "[ParallaxRewriter] Rewriting type: " << type_str << "\n";
+
+    // Get the source range for the type
+    clang::TypeSourceInfo* type_src_info = var_decl->getTypeSourceInfo();
+    if (!type_src_info) {
+        llvm::errs() << "[ParallaxRewriter] Warning: No type source info for "
+                     << var_decl->getNameAsString() << "\n";
+        return;
+    }
+
+    clang::SourceRange type_range = type_src_info->getTypeLoc().getSourceRange();
+
+    // Handle 'auto' types specially
+    if (original_type->isUndeducedType()) {
+        llvm::errs() << "[ParallaxRewriter] Warning: Cannot rewrite 'auto' types\n";
+        clang::DiagnosticsEngine& diag = CI_.getDiagnostics();
+        unsigned diag_id = diag.getCustomDiagID(
+            clang::DiagnosticsEngine::Warning,
+            "Cannot inject allocator into 'auto' type. Please use explicit type "
+            "std::vector<T, parallax::allocator<T>>"
+        );
+        diag.Report(var_decl->getLocation(), diag_id);
+        return;
+    }
+
+    // Extract element type and container template
+    clang::QualType element_type;
+    std::string container_template;
+
+    // Get non-reference type for analysis
+    clang::QualType base_type = original_type.getNonReferenceType();
+
+    if (const auto* template_spec =
+            base_type->getAs<clang::TemplateSpecializationType>()) {
+
+        // Get template name (std::vector, std::array, etc.)
+        if (auto* template_decl = template_spec->getTemplateName().getAsTemplateDecl()) {
+            container_template = template_decl->getQualifiedNameAsString();
+        }
+
+        llvm::ArrayRef<clang::TemplateArgument> args = template_spec->template_arguments();
+        if (args.size() > 0) {
+            const auto& arg = args[0];
+            if (arg.getKind() == clang::TemplateArgument::Type) {
+                element_type = arg.getAsType();
+            }
+        }
+    }
+
+    if (element_type.isNull()) {
+        llvm::errs() << "[ParallaxRewriter] Warning: Could not extract element type\n";
+        return;
+    }
+
+    // Build new type string with allocator
+    std::string element_type_str = element_type.getAsString();
+    std::string new_type;
+
+    if (container_template == "std::vector") {
+        new_type = "std::vector<" + element_type_str +
+                   ", parallax::allocator<" + element_type_str + ">>";
+    } else if (container_template == "std::deque") {
+        new_type = "std::deque<" + element_type_str +
+                   ", parallax::allocator<" + element_type_str + ">>";
+    } else {
+        llvm::errs() << "[ParallaxRewriter] Warning: Unsupported container type: "
+                     << container_template << "\n";
+        return;
+    }
+
+    llvm::errs() << "[ParallaxRewriter] New type: " << new_type << "\n";
+
+    // Replace the type
+    rewriter_.ReplaceText(type_range, new_type);
+}
+
+bool ParallaxRewriter::canRewriteContainer(const clang::VarDecl* var_decl) {
+    // Don't rewrite function parameters
+    if (llvm::isa<clang::ParmVarDecl>(var_decl)) {
+        llvm::errs() << "[ParallaxRewriter] Skipping function parameter\n";
+        return false;
+    }
+
+    // Don't rewrite global variables (complex initialization issues)
+    if (var_decl->hasGlobalStorage() && !var_decl->isStaticLocal()) {
+        llvm::errs() << "[ParallaxRewriter] Skipping global variable\n";
+        return false;
+    }
+
+    return true;
+}
+
+void ParallaxRewriter::ensureAllocatorHeader() {
+    if (allocator_header_included_) return;
+
+    // Find the first location in the main file
+    clang::SourceLocation insert_loc = SM_.getLocForStartOfFile(
+        SM_.getMainFileID()
+    );
+
+    // Insert the header at the top of the file
+    rewriter_.InsertTextBefore(insert_loc,
+        "#include <parallax/allocator.hpp>\n");
+
+    llvm::errs() << "[ParallaxRewriter] Injected allocator header\n";
+
+    allocator_header_included_ = true;
+}
+
 /**
  * Collector visitor - Phase 1: Collect transformations
  */
@@ -221,6 +395,48 @@ public:
             info.output_iterator = call->getArg(3);  // d_first
         } else {
             info.output_iterator = nullptr;
+        }
+
+        // NEW: Trace iterators to containers and mark for allocator injection
+        const clang::VarDecl* first_container = nullptr;
+        const clang::VarDecl* last_container = nullptr;
+
+        if (info.first_iterator) {
+            first_container = traceIteratorToContainer(info.first_iterator);
+        }
+        if (info.last_iterator) {
+            last_container = traceIteratorToContainer(info.last_iterator);
+        }
+
+        // Validate that both iterators come from the same container
+        if (first_container && last_container && first_container == last_container) {
+            llvm::errs() << "[ParallaxCollector] Found container: "
+                         << first_container->getNameAsString() << "\n";
+
+            // Check if container already has parallax::allocator
+            clang::QualType container_type = first_container->getType();
+            if (!hasParallaxAllocator(container_type)) {
+                llvm::errs() << "[ParallaxCollector] Marking for allocator injection\n";
+                rewriter_.markContainerForAllocation(first_container);
+            } else {
+                llvm::errs() << "[ParallaxCollector] Already has parallax::allocator\n";
+            }
+        } else if (first_container || last_container) {
+            llvm::errs() << "[ParallaxCollector] Warning: Iterators from different "
+                         << "containers or one iterator not traceable\n";
+        }
+
+        // For transform, also check output iterator
+        if (info.algorithm_name == "transform" && info.output_iterator) {
+            const clang::VarDecl* output_container =
+                traceIteratorToContainer(info.output_iterator);
+            if (output_container) {
+                clang::QualType container_type = output_container->getType();
+                if (!hasParallaxAllocator(container_type)) {
+                    llvm::errs() << "[ParallaxCollector] Marking output container for allocator injection\n";
+                    rewriter_.markContainerForAllocation(output_container);
+                }
+            }
         }
 
         info.kernel_name = generateKernelName(info);
@@ -292,6 +508,12 @@ private:
     clang::LambdaExpr* extractLambda(clang::CallExpr* call);
     void extractIterators(clang::CallExpr* call, clang::Expr*& first, clang::Expr*& last);
     std::string generateKernelName(const TransformInfo& info);
+
+    // NEW: Container tracking methods
+    const clang::VarDecl* traceIteratorToContainer(clang::Expr* iterator_expr);
+    bool isStandardContainer(clang::QualType type);
+    clang::QualType getContainerElementType(clang::QualType container_type);
+    bool hasParallaxAllocator(clang::QualType type);
 };
 
 bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
@@ -391,6 +613,105 @@ std::string ParallaxCollectorVisitor::generateKernelName(const TransformInfo& in
     return "__parallax_kernel_" + info.algorithm_name + "_" + line_num;
 }
 
+const clang::VarDecl* ParallaxCollectorVisitor::traceIteratorToContainer(clang::Expr* iterator_expr) {
+    if (!iterator_expr) return nullptr;
+
+    // Remove implicit casts and temporary materializations
+    clang::Expr* expr = iterator_expr->IgnoreImplicit();
+
+    // Pattern 1: container.begin() or container.end()
+    if (auto* member_call = llvm::dyn_cast<clang::CXXMemberCallExpr>(expr)) {
+        clang::Expr* object_expr = member_call->getImplicitObjectArgument();
+        if (!object_expr) return nullptr;
+
+        // Remove more implicit nodes
+        object_expr = object_expr->IgnoreImplicit();
+
+        // Pattern 1a: Direct variable reference (data.begin())
+        if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(object_expr)) {
+            if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+                return var_decl;
+            }
+        }
+
+        // Pattern 1b: Array subscript (arrays[i].begin())
+        if (auto* subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(object_expr)) {
+            // Recurse on the base array
+            return traceIteratorToContainer(subscript->getBase());
+        }
+    }
+
+    // Pattern 2: std::begin(container) or std::end(container)
+    if (auto* call_expr = llvm::dyn_cast<clang::CallExpr>(expr)) {
+        if (auto* func_decl = call_expr->getDirectCallee()) {
+            std::string func_name = func_decl->getQualifiedNameAsString();
+
+            if ((func_name == "std::begin" || func_name == "std::end") &&
+                call_expr->getNumArgs() >= 1) {
+
+                clang::Expr* container_arg = call_expr->getArg(0)->IgnoreImplicit();
+
+                if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(container_arg)) {
+                    if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+                        return var_decl;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 3: Direct DeclRefExpr (rare but possible)
+    if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
+        if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+            return var_decl;
+        }
+    }
+
+    return nullptr;
+}
+
+bool ParallaxCollectorVisitor::isStandardContainer(clang::QualType type) {
+    // Remove cv-qualifiers and references
+    type = type.getNonReferenceType().getUnqualifiedType();
+    std::string type_str = type.getAsString();
+
+    return (type_str.find("std::vector") == 0 ||
+            type_str.find("std::array") == 0 ||
+            type_str.find("std::deque") == 0 ||
+            type_str.find("vector") == 0 ||
+            type_str.find("array") == 0 ||
+            type_str.find("deque") == 0);
+}
+
+clang::QualType ParallaxCollectorVisitor::getContainerElementType(clang::QualType container_type) {
+    // Get the template specialization
+    if (const auto* template_spec =
+            container_type->getAs<clang::TemplateSpecializationType>()) {
+
+        // First template argument is the element type
+        llvm::ArrayRef<clang::TemplateArgument> args = template_spec->template_arguments();
+        if (args.size() > 0) {
+            const auto& arg = args[0];
+            if (arg.getKind() == clang::TemplateArgument::Type) {
+                return arg.getAsType();
+            }
+        }
+    }
+
+    // For elaborated types, recurse
+    if (const auto* elaborated =
+            container_type->getAs<clang::ElaboratedType>()) {
+        return getContainerElementType(elaborated->getNamedType());
+    }
+
+    return clang::QualType();
+}
+
+bool ParallaxCollectorVisitor::hasParallaxAllocator(clang::QualType type) {
+    std::string type_str = type.getAsString();
+    return type_str.find("parallax::allocator") != std::string::npos;
+}
+
 /**
  * Updated AST Consumer
  */
@@ -406,6 +727,11 @@ public:
         // Phase 1: Collect transformations
         ParallaxCollectorVisitor collector(context, CI_, rewriter_);
         collector.TraverseDecl(context.getTranslationUnitDecl());
+
+        llvm::errs() << "[Parallax] Phase 1.5: Injecting allocators...\n";
+
+        // Phase 1.5: Inject allocators into containers
+        rewriter_.applyAllocatorInjections();
 
         llvm::errs() << "[Parallax] Phase 2: Applying transformations...\n";
 
