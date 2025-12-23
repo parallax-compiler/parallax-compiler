@@ -450,7 +450,14 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIR(
                  << " member functions\n";
 
     // Generate IR using Clang CodeGen
-    return generateWithCodeGen(method, class_ctx, context);
+    auto module = generateWithCodeGen(method, class_ctx, context);
+    
+    if (!module) {
+        llvm::errs() << "[V2] ERROR: CodeGen failed, falling back to manual IR\n";
+        return generateIRManualFallback(method, context);
+    }
+    
+    return module;
 }
 
 std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
@@ -529,6 +536,73 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     }
 
     llvm::errs() << "[V2] Generated GPU kernel: " << kernel->getName().str() << "\n";
+
+    return module;
+}
+
+std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManualFallback(
+    clang::CXXMethodDecl* method,
+    clang::ASTContext& context) {
+
+    llvm::errs() << "[LambdaIRGenerator] Using manual IR fallback\n";
+
+    std::string module_name = "functor_manual_" + method->getQualifiedNameAsString();
+    auto module = std::make_unique<llvm::Module>(module_name, *llvm_context_);
+
+    // Build function signature
+    std::vector<llvm::Type*> param_types;
+    std::map<const clang::VarDecl*, llvm::Value*> var_map;
+
+    for (auto* param : method->parameters()) {
+        llvm::Type* param_type = convertType(param->getType());
+        param_types.push_back(param_type);
+    }
+
+    llvm::Type* return_type = convertType(method->getReturnType());
+    llvm::FunctionType* func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+    // Create function
+    llvm::Function* func = llvm::Function::Create(
+        func_type,
+        llvm::Function::ExternalLinkage,
+        "lambda_kernel_fallback",
+        module.get()
+    );
+
+    // Map parameters to LLVM arguments
+    auto arg_it = func->arg_begin();
+    for (auto* param : method->parameters()) {
+        llvm::Argument* arg = &(*arg_it++);
+        arg->setName(param->getNameAsString());
+        var_map[param] = arg;
+    }
+
+    // Create entry basic block
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(*llvm_context_, "entry", func);
+    llvm::IRBuilder<> builder(entry);
+
+    // Translate method body
+    if (clang::Stmt* body = method->getBody()) {
+        translateStmt(body, builder, context, var_map);
+    }
+
+    // Add return if not already present
+    if (!entry->getTerminator()) {
+        if (return_type->isVoidTy()) {
+            builder.CreateRetVoid();
+        }
+    }
+
+    // Verify function
+    if (llvm::verifyFunction(*func, &llvm::errs())) {
+        llvm::errs() << "ERROR: Generated LLVM IR is invalid!\n";
+        func->print(llvm::errs());
+        return nullptr;
+    }
+
+    llvm::errs() << "\n[LambdaIRGenerator] Generated fallback LLVM IR:\n";
+    func->print(llvm::errs());
+    llvm::errs() << "\n";
 
     return module;
 }

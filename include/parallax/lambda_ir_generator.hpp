@@ -88,6 +88,12 @@ private:
         clang::ASTContext& ast_context
     );
 
+    // NEW: Fallback when CodeGen fails
+    std::unique_ptr<llvm::Module> generateIRManualFallback(
+        clang::CXXMethodDecl* method,
+        clang::ASTContext& context
+    );
+
     // NEW: Extract class context for functors
     ClassContextExtractor class_extractor_;
 
