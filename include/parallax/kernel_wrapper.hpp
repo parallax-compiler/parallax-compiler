@@ -15,7 +15,7 @@ namespace parallax {
  * Transforms:
  *   struct Functor {
  *       float omega;
- *       void operator()(CellData& cell) { /* uses omega */ }
+ *       void operator()(CellData& cell) { // uses omega }
  *   };
  *
  * Into GPU kernel:
