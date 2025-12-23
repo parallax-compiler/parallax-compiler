@@ -30,6 +30,10 @@ struct TransformInfo {
     // Generated artifacts
     std::string kernel_name;
     std::vector<uint32_t> spirv;
+
+    // NEW V2: Class context for function objects
+    ClassContext class_context;
+    bool is_function_object = false;
 };
 
 /**
@@ -125,6 +129,16 @@ private:
      * Ensure allocator header is included
      */
     void ensureAllocatorHeader();
+
+    /**
+     * NEW V2: Generate capture code for member variables
+     */
+    std::string generateMemberCaptureCode(const ClassContext& class_ctx, clang::CallExpr* call_expr);
+
+    /**
+     * NEW V2: Get the variable name of the functor from a call expression
+     */
+    std::string getFunctorVariableName(clang::CallExpr* call_expr);
 };
 
 void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
@@ -154,6 +168,13 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
     ss << "{\n";
     ss << "  /* Parallax GPU offload for " << transform.algorithm_name << " */\n";
     ss << "  /* Runtime API: parallax/runtime.h */\n";
+
+    // NEW V2: Generate member capture code for function objects
+    if (transform.is_function_object && !transform.class_context.member_variables.empty()) {
+        ss << "  /* Member capture for function object */\n";
+        ss << generateMemberCaptureCode(transform.class_context, transform.call_expr);
+        ss << "\n";
+    }
 
     // 1. SPIR-V data array
     ss << generateSPIRVArray(transform.kernel_name, transform.spirv);
@@ -366,6 +387,67 @@ void ParallaxRewriter::ensureAllocatorHeader() {
     allocator_header_included_ = true;
 }
 
+std::string ParallaxRewriter::generateMemberCaptureCode(const ClassContext& class_ctx, clang::CallExpr* call_expr) {
+    std::ostringstream ss;
+    
+    ss << "struct KernelCapture {\n";
+    
+    // Add member variables as fields
+    for (const auto* field : class_ctx.member_variables) {
+        clang::QualType field_type = field->getType();
+        std::string type_str = field_type.getAsString();
+        
+        // Handle pointer types
+        if (field_type->isPointerType()) {
+            type_str = "void*";  // Simplified for MVP
+        }
+        
+        ss << "    " << type_str << " " << field->getNameAsString() << ";\n";
+    }
+    
+    ss << "};\n\n";
+    
+    // Generate initialization code
+    std::string functor_name = getFunctorVariableName(call_expr);
+    ss << "KernelCapture capture;\n";
+    
+    for (const auto* field : class_ctx.member_variables) {
+        ss << "  capture." << field->getNameAsString() << " = "
+           << functor_name << "." << field->getNameAsString() << ";\n";
+    }
+    
+    ss << "};\n";
+    
+    return ss.str();
+}
+
+std::string ParallaxRewriter::getFunctorVariableName(clang::CallExpr* call_expr) {
+    if (!call_expr || call_expr->getNumArgs() < 3) {
+        return "";
+    }
+    
+    clang::Expr* last_arg = call_expr->getArg(call_expr->getNumArgs() - 1)->IgnoreImplicit();
+    
+    // Check if it's a DeclRefExpr (variable reference)
+    if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(last_arg)) {
+        if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+            return var_decl->getNameAsString();
+        }
+    }
+    
+    // Check if it's wrapped in casts
+    if (auto* mat_temp = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(last_arg)) {
+        if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(
+                mat_temp->getSubExpr()->IgnoreImplicit())) {
+            if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+                return var_decl->getNameAsString();
+            }
+        }
+    }
+    
+    return "";
+}
+
 /**
  * Collector visitor - Phase 1: Collect transformations
  */
@@ -460,6 +542,10 @@ public:
                     llvm::errs() << "[V2] Class has "
                                 << class_ctx.member_variables.size()
                                 << " members\n";
+
+                    // Store class context in transform info
+                    info.class_context = class_ctx;
+                    info.is_function_object = true;
 
                     // Generate IR with CodeGen
                     auto module = ir_generator_.generateIR(op_call, context_);
