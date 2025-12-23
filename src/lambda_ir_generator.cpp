@@ -1,6 +1,9 @@
 #include "parallax/lambda_ir_generator.hpp"
+#include "parallax/class_context_extractor.hpp"
+#include "parallax/kernel_wrapper.hpp"
 #include <clang/AST/Type.h>
 #include <clang/AST/OperationKinds.h>
+#include <clang/CodeGen/ModuleBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
 #include <iostream>
@@ -430,6 +433,104 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIR(
     // For now, use manual generation
     // TODO: Implement using Clang's CodeGen for more complex cases
     return generateIRManual(lambda, context);
+}
+
+std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIR(
+    clang::CXXMethodDecl* method,
+    clang::ASTContext& context) {
+
+    llvm::errs() << "[LambdaIRGenerator V2] Generating IR with Clang CodeGen\n";
+
+    // Extract full class context
+    ClassContext class_ctx = class_extractor_.extract(method, context);
+
+    llvm::errs() << "[V2] Found " << class_ctx.member_variables.size()
+                 << " member variables\n";
+    llvm::errs() << "[V2] Found " << class_ctx.member_functions.size()
+                 << " member functions\n";
+
+    // Generate IR using Clang CodeGen
+    return generateWithCodeGen(method, class_ctx, context);
+}
+
+std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
+    clang::CXXMethodDecl* method,
+    const ClassContext& context,
+    clang::ASTContext& ast_context) {
+
+    // Step 1: Create CodeGenerator
+    std::unique_ptr<clang::CodeGenerator> codegen(
+        clang::CreateLLVMCodeGen(
+            CI_.getDiagnostics(),
+            "parallax_kernel",
+            CI_.getHeaderSearchOpts(),
+            CI_.getPreprocessorOpts(),
+            CI_.getCodeGenOpts(),
+            *llvm_context_
+        )
+    );
+
+    if (!codegen) {
+        llvm::errs() << "[V2] ERROR: Failed to create CodeGenerator\n";
+        return nullptr;
+    }
+
+    // Step 2: Initialize CodeGen
+    codegen->Initialize(ast_context);
+
+    // Step 3: Generate IR for the class definition
+    llvm::errs() << "[V2] Generating IR for class: "
+                 << context.record->getNameAsString() << "\n";
+
+    codegen->HandleTopLevelDecl(
+        clang::DeclGroupRef(context.record)
+    );
+
+    // Step 4: Generate IR for operator() and called member functions
+    for (clang::CXXMethodDecl* func : context.member_functions) {
+        llvm::errs() << "[V2] Generating IR for member function: "
+                     << func->getNameAsString() << "\n";
+        codegen->HandleTopLevelDecl(clang::DeclGroupRef(func));
+    }
+
+    codegen->HandleTopLevelDecl(clang::DeclGroupRef(method));
+
+    // Step 5: Finalize
+    codegen->HandleTranslationUnit(ast_context);
+
+    // Step 6: Extract module
+    std::unique_ptr<llvm::Module> module(codegen->ReleaseModule());
+
+    if (!module) {
+        llvm::errs() << "[V2] ERROR: CodeGen returned null module\n";
+        return nullptr;
+    }
+
+    // Step 7: Verify IR
+    std::string verify_errors;
+    llvm::raw_string_ostream error_stream(verify_errors);
+    if (llvm::verifyModule(*module, &error_stream)) {
+        llvm::errs() << "[V2] ERROR: Module verification failed:\n"
+                     << verify_errors << "\n";
+        module->print(llvm::errs());
+        return nullptr;
+    }
+
+    llvm::errs() << "[V2] Successfully generated " << module->size()
+                 << " functions\n";
+
+    // Step 8: Generate GPU kernel wrapper
+    KernelWrapper wrapper(*llvm_context_);
+    llvm::Function* kernel = wrapper.generateWrapper(context, module.get());
+
+    if (!kernel) {
+        llvm::errs() << "[V2] ERROR: Failed to generate kernel wrapper\n";
+        return nullptr;
+    }
+
+    llvm::errs() << "[V2] Generated GPU kernel: " << kernel->getName().str() << "\n";
+
+    return module;
 }
 
 } // namespace parallax

@@ -24,6 +24,8 @@ add_library(parallax-plugin SHARED
     src/lambda_ir_generator.cpp
     src/spirv_generator.cpp
     src/execution_policy.cpp
+    src/class_context_extractor.cpp
+    src/kernel_wrapper.cpp
 )
 
 target_include_directories(parallax-plugin
@@ -68,3 +70,6 @@ install(DIRECTORY include/parallax
 
 # Clang Plugin
 add_subdirectory(src/plugin)
+
+# Command-line tools
+add_subdirectory(tools)

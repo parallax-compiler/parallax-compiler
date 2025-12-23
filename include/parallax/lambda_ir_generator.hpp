@@ -16,11 +16,15 @@
 #include <string>
 #include <vector>
 
+#include "class_context_extractor.hpp"
+#include "kernel_wrapper.hpp"
+
 namespace parallax {
 
 /**
- * Generates LLVM IR from Clang Lambda AST nodes
- * Uses Clang's CodeGen infrastructure for accurate translation
+ * Generates LLVM IR from Clang Lambda/Functor AST nodes
+ *
+ * V2: Uses Clang's CodeGen infrastructure for full C++ support
  */
 class LambdaIRGenerator {
 public:
@@ -35,6 +39,17 @@ public:
      */
     std::unique_ptr<llvm::Module> generateIR(
         clang::LambdaExpr* lambda,
+        clang::ASTContext& context
+    );
+
+    /**
+     * Generate LLVM IR for a function object's operator()
+     * @param method The operator() method
+     * @param context Clang AST context
+     * @return LLVM Module containing the function
+     */
+    std::unique_ptr<llvm::Module> generateIR(
+        clang::CXXMethodDecl* method,
         clang::ASTContext& context
     );
 
@@ -65,6 +80,22 @@ public:
 private:
     clang::CompilerInstance& CI_;
     std::unique_ptr<llvm::LLVMContext> llvm_context_;
+
+    // NEW: Full C++ code generation pipeline
+    std::unique_ptr<llvm::Module> generateWithCodeGen(
+        clang::CXXMethodDecl* method,
+        const ClassContext& context,
+        clang::ASTContext& ast_context
+    );
+
+    // NEW: Extract class context for functors
+    ClassContextExtractor class_extractor_;
+
+    // DEPRECATED: Manual IR generation (kept for simple cases)
+    std::unique_ptr<llvm::Module> generateIRManual(
+        clang::LambdaExpr* lambda,
+        clang::ASTContext& context
+    );
 
     // Helper: Convert Clang type to LLVM type
     llvm::Type* convertType(clang::QualType type);

@@ -1,6 +1,7 @@
 #include "ParallaxPlugin.h"
 #include "parallax/lambda_ir_generator.hpp"
 #include "parallax/spirv_generator.hpp"
+#include "parallax/class_context_extractor.hpp"
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/AST/Type.h>
@@ -441,8 +442,87 @@ public:
 
         info.kernel_name = generateKernelName(info);
 
+        // Try to extract lambda first
         if (!info.lambda) {
-            llvm::errs() << "[ParallaxCollector] Warning: Could not extract lambda\n";
+            llvm::errs() << "[ParallaxCollector V2] No lambda found, trying function object...\n";
+
+            // Try function object extraction
+            clang::CXXRecordDecl* functor = extractFunctionObject(info.call_expr);
+            if (functor) {
+                clang::CXXMethodDecl* op_call = getFunctionCallOperator(functor);
+                if (op_call && op_call->hasBody()) {
+                    llvm::errs() << "[ParallaxCollector V2] Using function object: "
+                                << functor->getNameAsString() << "\n";
+
+                    // NEW V2: Extract full class context
+                    ClassContext class_ctx = class_extractor_.extract(op_call, context_);
+
+                    llvm::errs() << "[V2] Class has "
+                                << class_ctx.member_variables.size()
+                                << " members\n";
+
+                    // Generate IR with CodeGen
+                    auto module = ir_generator_.generateIR(op_call, context_);
+
+                    if (!module) {
+                        llvm::errs() << "[ParallaxCollector V2] Error: Failed to generate IR from functor\n";
+                        return true;
+                    }
+
+                    // Find the kernel function in the module
+                    llvm::Function* kernel_func = nullptr;
+                    for (auto& f : *module) {
+                        if (f.getName().startswith("kernel_")) {
+                            kernel_func = &f;
+                            break;
+                        }
+                    }
+
+                    if (!kernel_func) {
+                        // Fallback to first non-declaration function
+                        for (auto& f : *module) {
+                            if (!f.isDeclaration()) {
+                                kernel_func = &f;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!kernel_func) {
+                        llvm::errs() << "[ParallaxCollector V2] Error: No function in module\n";
+                        return true;
+                    }
+
+                    // Generate SPIR-V
+                    SPIRVGenerator spirv_gen;
+                    spirv_gen.set_target_vulkan_version(1, 2);
+
+                    // NEW V2: Extract parameter types including captured members
+                    std::vector<std::string> param_types;
+                    if (info.algorithm_name == "for_each") {
+                        param_types.push_back("float&");
+                    } else if (info.algorithm_name == "transform") {
+                        param_types.push_back("float");
+                        param_types.push_back("float&");
+                    }
+
+                    info.spirv = spirv_gen.generate_from_lambda(kernel_func, param_types);
+
+                    if (info.spirv.empty()) {
+                        llvm::errs() << "[ParallaxCollector V2] Error: SPIR-V generation failed\n";
+                        return true;
+                    }
+
+                    llvm::errs() << "[ParallaxCollector V2] Generated " << info.spirv.size()
+                                << " SPIR-V words\n";
+
+                    // Add to transformations
+                    rewriter_.addTransform(info);
+                    return true;
+                }
+            }
+
+            llvm::errs() << "[ParallaxCollector V2] Warning: Could not extract lambda or function object\n";
             return true;
         }
 
@@ -502,12 +582,17 @@ private:
     clang::CompilerInstance& CI_;
     ParallaxRewriter& rewriter_;
     LambdaIRGenerator ir_generator_;
+    ClassContextExtractor class_extractor_;
 
     bool isParallelAlgorithm(clang::CallExpr* call);
     std::string extractAlgorithmName(clang::CallExpr* call);
     clang::LambdaExpr* extractLambda(clang::CallExpr* call);
     void extractIterators(clang::CallExpr* call, clang::Expr*& first, clang::Expr*& last);
     std::string generateKernelName(const TransformInfo& info);
+
+    // NEW: Function object support
+    clang::CXXRecordDecl* extractFunctionObject(clang::CallExpr* call);
+    clang::CXXMethodDecl* getFunctionCallOperator(clang::CXXRecordDecl* record);
 
     // NEW: Container tracking methods
     const clang::VarDecl* traceIteratorToContainer(clang::Expr* iterator_expr);
@@ -536,6 +621,8 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
     std::string policy_type = policy_arg->getType().getAsString();
 
     return (policy_type.find("parallel_policy") != std::string::npos ||
+            policy_type.find("parallel_unsequenced_policy") != std::string::npos ||
+            policy_type.find("par_unseq") != std::string::npos ||
             policy_type.find("par") != std::string::npos);
 }
 
@@ -569,6 +656,54 @@ clang::LambdaExpr* ParallaxCollectorVisitor::extractLambda(clang::CallExpr* call
         if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(
                 mat_temp->getSubExpr()->IgnoreImplicit())) {
             return lambda;
+        }
+    }
+
+    return nullptr;
+}
+
+clang::CXXRecordDecl* ParallaxCollectorVisitor::extractFunctionObject(clang::CallExpr* call) {
+    // Function object is typically the last argument
+    if (call->getNumArgs() < 3) return nullptr;
+
+    clang::Expr* last_arg = call->getArg(call->getNumArgs() - 1)->IgnoreImplicit();
+
+    // Get the type of the argument
+    clang::QualType arg_type = last_arg->getType();
+
+    // Remove references
+    arg_type = arg_type.getNonReferenceType();
+
+    // Get the record type (struct/class)
+    if (const auto* record_type = arg_type->getAsCXXRecordDecl()) {
+        // Check if it has operator()
+        if (getFunctionCallOperator(const_cast<clang::CXXRecordDecl*>(record_type))) {
+            llvm::errs() << "[ParallaxCollector] Found function object: "
+                        << record_type->getNameAsString() << "\n";
+            return const_cast<clang::CXXRecordDecl*>(record_type);
+        }
+    }
+
+    return nullptr;
+}
+
+clang::CXXMethodDecl* ParallaxCollectorVisitor::getFunctionCallOperator(clang::CXXRecordDecl* record) {
+    if (!record) return nullptr;
+
+    // Complete the definition if needed
+    if (!record->hasDefinition()) {
+        return nullptr;
+    }
+
+    record = record->getDefinition();
+
+    // Look for operator()
+    for (auto* method : record->methods()) {
+        if (method->isOverloadedOperator() &&
+            method->getOverloadedOperator() == clang::OO_Call) {
+            llvm::errs() << "[ParallaxCollector] Found operator() in "
+                        << record->getNameAsString() << "\n";
+            return method;
         }
     }
 
