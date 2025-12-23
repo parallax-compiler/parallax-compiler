@@ -97,12 +97,6 @@ private:
     // NEW: Extract class context for functors
     ClassContextExtractor class_extractor_;
 
-    // DEPRECATED: Manual IR generation (kept for simple cases)
-    std::unique_ptr<llvm::Module> generateIRManual(
-        clang::LambdaExpr* lambda,
-        clang::ASTContext& context
-    );
-
     // Helper: Convert Clang type to LLVM type
     llvm::Type* convertType(clang::QualType type);
 
