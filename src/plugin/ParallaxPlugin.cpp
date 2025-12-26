@@ -68,5 +68,6 @@ bool ParallaxASTVisitor::isParallaxCandidate(clang::CallExpr *Call) {
 
 } // namespace parallax
 
-static clang::FrontendPluginRegistry::Add<parallax::ParallaxPluginAction>
-    X("parallax-plugin", "Parallax Automatic Offload Plugin");
+// Old plugin disabled - V2 plugin is now active
+// static clang::FrontendPluginRegistry::Add<parallax::ParallaxPluginAction>
+//     X("parallax-plugin", "Parallax Automatic Offload Plugin");

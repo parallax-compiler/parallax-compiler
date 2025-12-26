@@ -692,11 +692,36 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
     // Determine if this is a transform (returns non-void)
     bool is_transform = !lambda_func->getReturnType()->isVoidTy();
-    size_t num_buffers = is_transform ? 2 : lambda_func->arg_size();
 
-    // Create Variables for buffers
-    // For transform: buffer[0] = input, buffer[1] = output
-    // For for_each: buffers match lambda arguments
+    // Classify parameters into pointer/buffer params and scalar params
+    std::vector<llvm::Argument*> buffer_params;
+    std::vector<llvm::Argument*> scalar_params;
+
+    llvm::errs() << "[SPIRVGenerator] Classifying " << lambda_func->arg_size()
+                 << " parameters for function: " << lambda_func->getName() << "\n";
+
+    for (auto& arg : lambda_func->args()) {
+        llvm::Type* arg_type = arg.getType();
+        llvm::errs() << "  Param " << arg.getArgNo() << " type: " << *arg_type;
+
+        if (arg_type->isPointerTy()) {
+            llvm::errs() << " -> BUFFER (pointer)\n";
+            buffer_params.push_back(&arg);
+        } else {
+            llvm::errs() << " -> SCALAR (non-pointer)\n";
+            scalar_params.push_back(&arg);
+        }
+    }
+
+    // For transform: always use 2 buffers (input and output)
+    // For for_each: use only the actual pointer parameters
+    size_t num_buffers = is_transform ? 2 : buffer_params.size();
+
+    llvm::errs() << "[SPIRVGenerator] Creating " << num_buffers
+                 << " storage buffers and " << scalar_params.size()
+                 << " push constant scalars\n";
+
+    // Create Variables for buffers (only for pointer parameters)
     std::vector<uint32_t> buffer_var_ids;
     for (size_t i = 0; i < num_buffers; ++i) {
         builder.set_section(SPIRVBuilder::Section::Types);
@@ -708,15 +733,33 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         buffer_var_ids.push_back(buffer_var_id);
     }
 
-    // Push Constants Struct { uint count, float multiplier, ... }
+    // Push Constants Struct { uint count, <scalar_params...> }
+    // Build the struct dynamically based on scalar parameters
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t pc_struct_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id, float_id, int_id, int_id}); 
+
+    std::vector<uint32_t> pc_member_types;
+    pc_member_types.push_back(int_id);  // count (always first member)
+
+    // Add type IDs for scalar parameters
+    for (auto* scalar : scalar_params) {
+        uint32_t scalar_type_id = get_type_id(builder, scalar->getType());
+        pc_member_types.push_back(scalar_type_id);
+    }
+
+    // Emit OpTypeStruct with all member types
+    std::vector<uint32_t> struct_ops = {pc_struct_id};
+    struct_ops.insert(struct_ops.end(), pc_member_types.begin(), pc_member_types.end());
+    builder.emit_op(SPIRVOp::OpTypeStruct, struct_ops);
+
+    // Add member decorations for offsets
     builder.set_section(SPIRVBuilder::Section::Decorations);
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 1, 35 /* Offset */, 4});
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 2, 35 /* Offset */, 8});
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 3, 35 /* Offset */, 12});
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < pc_member_types.size(); ++i) {
+        builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, i, 35 /* Offset */, offset});
+        // All members are 4 bytes (uint32 or float)
+        offset += 4;
+    }
     builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
     
     // Pointer PushConstant Struct
@@ -796,7 +839,30 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, var_id, Zero, id_x});
         arg_ptrs.push_back(element_ptr);
     }
-    
+
+    // Load scalar parameters from push constants
+    std::vector<uint32_t> scalar_values;
+    for (size_t i = 0; i < scalar_params.size(); ++i) {
+        llvm::Type* scalar_type = scalar_params[i]->getType();
+        uint32_t scalar_type_id = get_type_id(builder, scalar_type);
+
+        // Create constant for member index (count is at index 0, scalars start at index 1)
+        uint32_t member_idx = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, i + 1));
+
+        // Access chain to get pointer to this push constant member
+        uint32_t ptr_scalar_pc = get_pointer_type_id(builder, scalar_type_id, 9 /* PushConstant */);
+        uint32_t ptr_scalar = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_scalar_pc, ptr_scalar, pc_var_id, member_idx});
+
+        // Load the scalar value
+        uint32_t scalar_val = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpLoad, {scalar_type_id, scalar_val, ptr_scalar});
+        scalar_values.push_back(scalar_val);
+
+        llvm::errs() << "[SPIRVGenerator] Loaded scalar param " << i
+                     << " from push constant member " << (i + 1) << "\n";
+    }
+
     // Call Lambda - different handling for transform vs for_each
     bool is_transform = !lambda_func->getReturnType()->isVoidTy();
 
@@ -806,9 +872,11 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         uint32_t input_val = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpLoad, {float_id, input_val, arg_ptrs[0]});
 
-        // Call lambda with value (not pointer)
+        // Call lambda with value (not pointer) and scalar parameters
         uint32_t result_id = builder.get_next_id();
         std::vector<uint32_t> call_ops = {float_id, result_id, lambda_func_id, input_val};
+        // Append scalar parameters
+        call_ops.insert(call_ops.end(), scalar_values.begin(), scalar_values.end());
         builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
 
         // Store result to output buffer[1]
@@ -817,8 +885,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         // For_each: lambda modifies in-place via pointer
         uint32_t call_id = builder.get_next_id();
         std::vector<uint32_t> call_ops = {void_id, call_id, lambda_func_id};
+        // Add buffer pointers
         call_ops.insert(call_ops.end(), arg_ptrs.begin(), arg_ptrs.end());
+        // Add scalar parameters
+        call_ops.insert(call_ops.end(), scalar_values.begin(), scalar_values.end());
         builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
+
+        llvm::errs() << "[SPIRVGenerator] Called lambda with " << arg_ptrs.size()
+                     << " buffer args and " << scalar_values.size() << " scalar args\n";
     }
 
     builder.emit_op(SPIRVOp::OpBranch, {label_merge});

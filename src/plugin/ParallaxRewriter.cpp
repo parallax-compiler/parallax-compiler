@@ -57,6 +57,9 @@ public:
      * Apply all transformations
      */
     void applyAllTransformations() {
+        if (!transforms_.empty()) {
+            ensureRuntimeHeader();
+        }
         for (auto& transform : transforms_) {
             applyTransformation(transform);
         }
@@ -93,6 +96,7 @@ private:
     std::set<const clang::VarDecl*> containers_needing_allocator_;
     std::set<const clang::VarDecl*> rewritten_containers_;
     bool allocator_header_included_ = false;
+    bool runtime_header_included_ = false;
 
     /**
      * Apply a single transformation
@@ -129,6 +133,11 @@ private:
      * Ensure allocator header is included
      */
     void ensureAllocatorHeader();
+
+    /**
+     * Ensure runtime header is included
+     */
+    void ensureRuntimeHeader();
 
     /**
      * NEW V2: Generate capture code for member variables
@@ -205,8 +214,15 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
     } else {
         // For_each: single buffer (in-place)
         ss << "  auto __plx_ptr = &(*" << first_it << ");\n\n";
-        ss << "  parallax_kernel_launch(" << transform.kernel_name
-           << ", __plx_ptr, __plx_count);\n";
+
+        // Check if we need to pass captures
+        if (transform.is_function_object && !transform.class_context.member_variables.empty()) {
+            ss << "  parallax_kernel_launch_with_captures(" << transform.kernel_name
+               << ", __plx_ptr, __plx_count, &capture, sizeof(capture));\n";
+        } else {
+            ss << "  parallax_kernel_launch(" << transform.kernel_name
+               << ", __plx_ptr, __plx_count);\n";
+        }
     }
 
     ss << "}";
@@ -387,6 +403,23 @@ void ParallaxRewriter::ensureAllocatorHeader() {
     allocator_header_included_ = true;
 }
 
+void ParallaxRewriter::ensureRuntimeHeader() {
+    if (runtime_header_included_) return;
+
+    // Find the first location in the main file
+    clang::SourceLocation insert_loc = SM_.getLocForStartOfFile(
+        SM_.getMainFileID()
+    );
+
+    // Insert the runtime header at the top of the file
+    rewriter_.InsertTextBefore(insert_loc,
+        "#include <parallax/runtime.h>\n");
+
+    llvm::errs() << "[ParallaxRewriter] Injected runtime header\n";
+
+    runtime_header_included_ = true;
+}
+
 std::string ParallaxRewriter::generateMemberCaptureCode(const ClassContext& class_ctx, clang::CallExpr* call_expr) {
     std::ostringstream ss;
     
@@ -460,6 +493,29 @@ public:
           ir_generator_(CI) {}
 
     bool VisitCallExpr(clang::CallExpr* call) {
+        // Debug: Log ALL call expressions to see if traversal is working
+        static int call_count = 0;
+        call_count++;
+
+        if (call_count == 1) {
+            llvm::errs() << "[ParallaxCollector] VisitCallExpr is being called!\n";
+        }
+
+        if (call && call->getDirectCallee()) {
+            std::string func_name = call->getDirectCallee()->getQualifiedNameAsString();
+
+            // Log all std:: namespace calls
+            if (func_name.find("std::") != std::string::npos) {
+                llvm::errs() << "[ParallaxCollector] Call #" << call_count << ": " << func_name
+                             << " (" << call->getNumArgs() << " args)\n";
+            }
+
+            if (func_name.find("for_each") != std::string::npos ||
+                func_name.find("transform") != std::string::npos) {
+                llvm::errs() << "[ParallaxCollector] >>> Found algorithm: " << func_name << "\n";
+            }
+        }
+
         if (!isParallelAlgorithm(call)) {
             return true;
         }
@@ -558,7 +614,7 @@ public:
                     // Find the kernel function in the module
                     llvm::Function* kernel_func = nullptr;
                     for (auto& f : *module) {
-                        if (f.getName().startswith("kernel_")) {
+                        if (f.getName().starts_with("kernel_")) {
                             kernel_func = &f;
                             break;
                         }
@@ -881,9 +937,34 @@ const clang::VarDecl* ParallaxCollectorVisitor::traceIteratorToContainer(clang::
         }
     }
 
-    // Pattern 3: Direct DeclRefExpr (rare but possible)
+    // Pattern 3: Raw pointer from .data()
+    if (auto* member_call = llvm::dyn_cast<clang::CXXMemberCallExpr>(expr)) {
+        if (auto* method_decl = member_call->getMethodDecl()) {
+            if (method_decl->getNameAsString() == "data") {
+                clang::Expr* object_expr = member_call->getImplicitObjectArgument();
+                if (object_expr) {
+                    object_expr = object_expr->IgnoreImplicit();
+                    if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(object_expr)) {
+                        if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+                            return var_decl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 4: Direct DeclRefExpr (raw pointer variable)
     if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
         if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+            // Check if this is a pointer derived from a container
+            clang::QualType type = var_decl->getType();
+            if (type->isPointerType()) {
+                // Try to trace initialization
+                if (var_decl->hasInit()) {
+                    return traceIteratorToContainer(var_decl->getInit());
+                }
+            }
             return var_decl;
         }
     }
@@ -947,7 +1028,9 @@ public:
 
         // Phase 1: Collect transformations
         ParallaxCollectorVisitor collector(context, CI_, rewriter_);
+        llvm::errs() << "[Parallax] Starting AST traversal...\n";
         collector.TraverseDecl(context.getTranslationUnitDecl());
+        llvm::errs() << "[Parallax] AST traversal complete\n";
 
         llvm::errs() << "[Parallax] Phase 1.5: Injecting allocators...\n";
 
