@@ -566,26 +566,74 @@ std::string ParallaxRewriter::getFunctorVariableName(clang::CallExpr* call_expr)
     if (!call_expr || call_expr->getNumArgs() < 3) {
         return "";
     }
-    
-    clang::Expr* last_arg = call_expr->getArg(call_expr->getNumArgs() - 1)->IgnoreImplicit();
-    
-    // Check if it's a DeclRefExpr (variable reference)
-    if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(last_arg)) {
+
+    clang::Expr* last_arg = call_expr->getArg(call_expr->getNumArgs() - 1);
+
+    // Helper lambda to recursively find DeclRefExpr
+    std::function<clang::DeclRefExpr*(clang::Expr*)> findDeclRef = [&](clang::Expr* expr) -> clang::DeclRefExpr* {
+        if (!expr) return nullptr;
+
+        // Remove all implicit nodes
+        expr = expr->IgnoreImplicit();
+
+        // Check if it's a DeclRefExpr
+        if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
+            return decl_ref;
+        }
+
+        // Recursively search in subexpressions
+        if (auto* mat_temp = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(expr)) {
+            return findDeclRef(mat_temp->getSubExpr());
+        }
+        if (auto* bind_temp = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(expr)) {
+            return findDeclRef(bind_temp->getSubExpr());
+        }
+        if (auto* construct = llvm::dyn_cast<clang::CXXConstructExpr>(expr)) {
+            if (construct->getNumArgs() > 0) {
+                return findDeclRef(construct->getArg(0));
+            }
+        }
+
+        return nullptr;
+    };
+
+    // Try to find DeclRefExpr
+    if (auto* decl_ref = findDeclRef(last_arg)) {
         if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+            llvm::errs() << "[getFunctorVariableName] Found functor variable: "
+                         << var_decl->getNameAsString() << "\n";
             return var_decl->getNameAsString();
         }
     }
-    
-    // Check if it's wrapped in casts
-    if (auto* mat_temp = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(last_arg)) {
-        if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(
-                mat_temp->getSubExpr()->IgnoreImplicit())) {
-            if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
-                return var_decl->getNameAsString();
+
+    // Fallback: extract from source text
+    llvm::errs() << "[getFunctorVariableName] WARNING: Could not find functor variable via AST, "
+                 << "trying source text extraction\n";
+
+    clang::SourceRange arg_range = last_arg->getSourceRange();
+    std::string arg_text = clang::Lexer::getSourceText(
+        clang::CharSourceRange::getTokenRange(arg_range),
+        SM_,
+        clang::LangOptions()
+    ).str();
+
+    // Simple heuristic: if it's a single identifier, use it
+    if (!arg_text.empty() && std::isalpha(arg_text[0])) {
+        // Check if it's a simple identifier (no spaces, parens, etc.)
+        bool is_simple_id = true;
+        for (char c : arg_text) {
+            if (!std::isalnum(c) && c != '_') {
+                is_simple_id = false;
+                break;
             }
         }
+        if (is_simple_id) {
+            llvm::errs() << "[getFunctorVariableName] Extracted from source: " << arg_text << "\n";
+            return arg_text;
+        }
     }
-    
+
+    llvm::errs() << "[getFunctorVariableName] WARNING: Could not determine functor variable name\n";
     return "";
 }
 

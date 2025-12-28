@@ -1,6 +1,7 @@
 #include "parallax/class_context_extractor.hpp"
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <llvm/Support/raw_ostream.h>
+#include <set>
 
 namespace parallax {
 
@@ -59,7 +60,19 @@ void ClassContextExtractor::collectMemberVariables(
 
     if (!record || !record->hasDefinition()) return;
 
-    // Get direct members
+    // First, recursively collect members from base classes
+    for (const auto& base : record->bases()) {
+        clang::QualType base_type = base.getType();
+        if (const auto* base_record = base_type->getAsCXXRecordDecl()) {
+            if (base_record->hasDefinition()) {
+                llvm::errs() << "[ClassContextExtractor]   Collecting from base class: "
+                              << base_record->getNameAsString() << "\n";
+                collectMemberVariables(const_cast<clang::CXXRecordDecl*>(base_record), members);
+            }
+        }
+    }
+
+    // Then, get direct members of this class
     for (auto* field : record->fields()) {
         members.push_back(field);
         llvm::errs() << "[ClassContextExtractor]   Member: "
@@ -76,7 +89,9 @@ void ClassContextExtractor::collectCalledMemberFunctions(
 
     MemberCallVisitor visitor;
     visitor.TraverseStmt(method->getBody());
-    functions.insert(visitor.called_methods.begin(), visitor.called_methods.end());
+    for (auto* func : visitor.called_methods) {
+        functions.push_back(func);
+    }
 }
 
 void ClassContextExtractor::collectBaseClasses(
@@ -85,8 +100,11 @@ void ClassContextExtractor::collectBaseClasses(
 
     if (!record || !record->hasDefinition()) return;
 
-    for (auto* base : record->bases()) {
-        bases.push_back(base_record);
+    for (const auto& base : record->bases()) {
+        clang::QualType base_type = base.getType();
+        if (const auto* base_record = base_type->getAsCXXRecordDecl()) {
+            bases.push_back(const_cast<clang::CXXRecordDecl*>(base_record));
+        }
     }
 }
 

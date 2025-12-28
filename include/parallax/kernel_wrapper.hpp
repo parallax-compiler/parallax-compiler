@@ -57,8 +57,12 @@ private:
     // Inline the operator() body
     void inlineOperatorBody(
         llvm::Function* wrapper,
-        llvm::Function* operator_impl
+        llvm::Function* operator_impl,
+        const ClassContext& context
     );
+
+    // Convert Clang type to LLVM type
+    llvm::Type* convertClangType(clang::QualType clang_type);
 };
 
 } // namespace parallax

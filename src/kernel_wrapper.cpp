@@ -2,6 +2,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
 
 namespace parallax {
@@ -40,7 +41,7 @@ llvm::Function* KernelWrapper::generateWrapper(
     // Find the operator() function in the module
     llvm::Function* operator_func = nullptr;
     for (auto& func : *module) {
-        if (func.getName().equals("operator()")) {
+        if (func.getName() == "operator()") {
             operator_func = &func;
             break;
         }
@@ -52,7 +53,7 @@ llvm::Function* KernelWrapper::generateWrapper(
     }
 
     // Inline the operator body
-    inlineOperatorBody(kernel, operator_func);
+    inlineOperatorBody(kernel, operator_func, context);
 
     // Add return
     builder.CreateRetVoid();
@@ -134,7 +135,8 @@ void KernelWrapper::generateParameterMarshalling(
 
 void KernelWrapper::inlineOperatorBody(
     llvm::Function* wrapper,
-    llvm::Function* operator_impl) {
+    llvm::Function* operator_impl,
+    const ClassContext& context) {
 
     llvm::IRBuilder<> builder(&wrapper->getEntryBlock());
 
@@ -155,7 +157,7 @@ void KernelWrapper::inlineOperatorBody(
     // Bitcast to correct element type (assuming float for now)
     llvm::Value* typed_ptr = builder.CreateBitCast(
         element_ptr,
-        llvm::PointerType::get(llvm::Type::getFloatTy(llvm_ctx_), 0),
+        llvm::PointerType::get(llvm_ctx_, 0),
         "typed_ptr"
     );
 
@@ -166,10 +168,17 @@ void KernelWrapper::inlineOperatorBody(
         "element"
     );
 
-    // Call operator() with the element value
-    // Note: This is simplified - real implementation needs to handle references properly
+    // Call operator() with the element value AND captured variables
     std::vector<llvm::Value*> call_args;
     call_args.push_back(element_value);
+
+    // Add captured member variables (lambda captures) as additional arguments
+    for (size_t i = 0; i < context.member_variables.size(); ++i) {
+        llvm::Value* capture_arg = &(*arg_it++);
+        call_args.push_back(capture_arg);
+        llvm::errs() << "[inlineOperatorBody] Adding capture argument: "
+                     << context.member_variables[i]->getNameAsString() << "\n";
+    }
 
     llvm::Value* result = builder.CreateCall(
         operator_impl,
