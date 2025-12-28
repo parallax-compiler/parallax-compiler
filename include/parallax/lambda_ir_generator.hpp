@@ -8,6 +8,7 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/CodeGen/ModuleBuilder.h>
+#include <clang/Sema/Sema.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/LLVMContext.h>
@@ -69,6 +70,7 @@ public:
         std::string name;
         clang::QualType type;
         bool is_by_reference;
+        const clang::VarDecl* var_decl;  // The captured variable declaration
     };
     std::vector<CaptureInfo> extractCaptures(clang::LambdaExpr* lambda);
 
@@ -91,6 +93,12 @@ private:
     // NEW: Fallback when CodeGen fails
     std::unique_ptr<llvm::Module> generateIRManualFallback(
         clang::CXXMethodDecl* method,
+        clang::ASTContext& context
+    );
+
+    // NEW: Generate simplified stub when manual generation fails
+    std::unique_ptr<llvm::Module> generateSimplifiedStub(
+        clang::LambdaExpr* lambda,
         clang::ASTContext& context
     );
 
