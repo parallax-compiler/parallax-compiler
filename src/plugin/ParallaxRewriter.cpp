@@ -16,6 +16,16 @@
 namespace parallax {
 
 /**
+ * Capture information for lambda expressions
+ */
+struct LambdaCaptureInfo {
+    std::string name;
+    clang::QualType type;
+    bool is_by_reference;
+    const clang::VarDecl* var_decl;
+};
+
+/**
  * Transformation information for a single parallel algorithm call
  */
 struct TransformInfo {
@@ -34,6 +44,32 @@ struct TransformInfo {
     // NEW V2: Class context for function objects
     ClassContext class_context;
     bool is_function_object = false;
+
+    // Lambda captures
+    std::vector<LambdaCaptureInfo> lambda_captures;
+    bool has_captures() const {
+        return !lambda_captures.empty();
+    }
+
+    /**
+     * Check if this transform has class/struct reference captures
+     * (which exceed push constant size limits on some GPUs)
+     */
+    bool has_class_reference_captures() const {
+        for (const auto& capture : lambda_captures) {
+            // Check if captured by reference
+            if (capture.is_by_reference) {
+                // Get the underlying type (without reference)
+                clang::QualType underlying_type = capture.type.getNonReferenceType();
+                // Check if it's a class/struct/record type
+                if (underlying_type->isRecordType() || underlying_type->isClassType() ||
+                    underlying_type->isStructureType()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 };
 
 /**
@@ -174,6 +210,20 @@ void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
 std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) {
     std::ostringstream ss;
 
+    // NEW: For now, we'll still skip kernels with class reference captures
+    // TODO: In the future, we could extract individual members from the class
+    // For example, instead of capturing "Domain& domain", we could capture
+    // specific members like "domain.p", "domain.q", etc.
+    if (transform.has_class_reference_captures()) {
+        llvm::errs() << "[ParallaxRewriter] WARNING: Skipping GPU offload for kernel with class reference captures\n";
+        llvm::errs() << "[ParallaxRewriter] This kernel will execute on CPU instead\n";
+        llvm::errs() << "[ParallaxRewriter] Future: Could extract individual members to reduce capture size\n";
+
+        // Return the original source code for CPU execution (with semicolon)
+        std::string original_code = getSourceText(transform.call_expr->getSourceRange());
+        return original_code + ";";
+    }
+
     ss << "{\n";
     ss << "  /* Parallax GPU offload for " << transform.algorithm_name << " */\n";
     ss << "  /* Runtime API: parallax/runtime.h */\n";
@@ -183,6 +233,47 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         ss << "  /* Member capture for function object */\n";
         ss << generateMemberCaptureCode(transform.class_context, transform.call_expr);
         ss << "\n";
+    }
+
+    // Generate lambda capture packing code
+    if (transform.has_captures()) {
+        ss << "  /* Lambda captures */\n";
+        ss << "  struct {\n";
+        for (const auto& capture : transform.lambda_captures) {
+            // For GPU offload, convert arrays to pointers (we pass by reference anyway)
+            std::string type_str = capture.type.getAsString();
+            std::string base_type = type_str;
+
+            // Check if this is an array type (contains '[')
+            size_t bracket_pos = type_str.find('[');
+            if (bracket_pos != std::string::npos) {
+                // Convert array to pointer: Real_t[4][8] -> Real_t (*)[8]
+                base_type = type_str.substr(0, bracket_pos);
+                // For simplicity, just use pointer to base type
+                ss << "    " << base_type << " * " << capture.name << ";\n";
+            } else {
+                ss << "    " << type_str << " " << capture.name << ";\n";
+            }
+        }
+        ss << "  } __plx_captures = {\n";
+        for (size_t i = 0; i < transform.lambda_captures.size(); ++i) {
+            const auto& capture = transform.lambda_captures[i];
+            std::string type_str = capture.type.getAsString();
+
+            // For array types, cast to pointer type in initializer
+            if (type_str.find('[') != std::string::npos) {
+                // Extract base type for casting
+                size_t bracket_pos = type_str.find('[');
+                std::string base_type = type_str.substr(0, bracket_pos);
+                ss << "    (" << base_type << "*)" << capture.name;
+            } else {
+                ss << "    " << capture.name;
+            }
+
+            if (i < transform.lambda_captures.size() - 1) ss << ",";
+            ss << "\n";
+        }
+        ss << "  };\n\n";
     }
 
     // 1. SPIR-V data array
@@ -199,11 +290,20 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
 
     // 3. Extract iterator range
     std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
-    std::string last_it = getSourceText(transform.last_iterator->getSourceRange());
 
-    ss << "  size_t __plx_count = std::distance(" << first_it << ", " << last_it << ");\n";
+    // Handle for_each_n differently (has count instead of last iterator)
+    if (transform.algorithm_name == "for_each_n") {
+        // for_each_n(policy, first, count, func)
+        // Extract count from arg 2
+        clang::Expr* count_expr = transform.call_expr->getArg(2);
+        std::string count_str = getSourceText(count_expr->getSourceRange());
+        ss << "  size_t __plx_count = " << count_str << ";\n";
+    } else {
+        std::string last_it = getSourceText(transform.last_iterator->getSourceRange());
+        ss << "  size_t __plx_count = std::distance(" << first_it << ", " << last_it << ");\n";
+    }
 
-    // 4. Launch kernel (different for transform vs for_each)
+    // 4. Launch kernel (different for transform vs for_each vs fill/copy)
     if (transform.algorithm_name == "transform" && transform.output_iterator) {
         // Transform: two buffers (input and output)
         std::string output_it = getSourceText(transform.output_iterator->getSourceRange());
@@ -212,13 +312,21 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         ss << "  parallax_kernel_launch_transform(" << transform.kernel_name
            << ", __plx_in_ptr, __plx_out_ptr, __plx_count);\n";
     } else {
-        // For_each: single buffer (in-place)
-        ss << "  auto __plx_ptr = &(*" << first_it << ");\n\n";
+        // For_each / for_each_n: single buffer (in-place)
+        // Special handling for counting_iterator (no underlying data, just indices)
+        if (first_it.find("counting_iterator") != std::string::npos) {
+            ss << "  void* __plx_ptr = nullptr;  // counting_iterator: no data pointer needed\n\n";
+        } else {
+            ss << "  auto __plx_ptr = &(*" << first_it << ");\n\n";
+        }
 
-        // Check if we need to pass captures
+        // Check if we need to pass captures (functor or lambda)
         if (transform.is_function_object && !transform.class_context.member_variables.empty()) {
             ss << "  parallax_kernel_launch_with_captures(" << transform.kernel_name
                << ", __plx_ptr, __plx_count, &capture, sizeof(capture));\n";
+        } else if (transform.has_captures()) {
+            ss << "  parallax_kernel_launch_with_captures(" << transform.kernel_name
+               << ", __plx_ptr, __plx_count, &__plx_captures, sizeof(__plx_captures));\n";
         } else {
             ss << "  parallax_kernel_launch(" << transform.kernel_name
                << ", __plx_ptr, __plx_count);\n";
@@ -511,7 +619,10 @@ public:
             }
 
             if (func_name.find("for_each") != std::string::npos ||
-                func_name.find("transform") != std::string::npos) {
+                func_name.find("transform") != std::string::npos ||
+                func_name.find("fill") != std::string::npos ||
+                func_name.find("copy") != std::string::npos ||
+                func_name.find("any_of") != std::string::npos) {
                 llvm::errs() << "[ParallaxCollector] >>> Found algorithm: " << func_name << "\n";
             }
         }
@@ -526,6 +637,15 @@ public:
         TransformInfo info;
         info.call_expr = call;
         info.algorithm_name = extractAlgorithmName(call);
+
+        // Skip unsupported algorithms gracefully (leave them as CPU code)
+        if (info.algorithm_name != "for_each" && info.algorithm_name != "for_each_n" &&
+            info.algorithm_name != "transform") {
+            llvm::errs() << "[ParallaxCollector] Skipping unsupported algorithm: "
+                         << info.algorithm_name << " (will run on CPU)\n";
+            return true;
+        }
+
         info.lambda = extractLambda(call);
         extractIterators(call, info.first_iterator, info.last_iterator);
 
@@ -603,8 +723,8 @@ public:
                     info.class_context = class_ctx;
                     info.is_function_object = true;
 
-                    // Generate IR with CodeGen
-                    auto module = ir_generator_.generateIR(op_call, context_);
+                    // NEW: Use manual IR generation for functors (treats members like lambda captures)
+                    auto module = ir_generator_.generateIRManual(op_call, class_ctx, context_);
 
                     if (!module) {
                         llvm::errs() << "[ParallaxCollector V2] Error: Failed to generate IR from functor\n";
@@ -614,7 +734,8 @@ public:
                     // Find the kernel function in the module
                     llvm::Function* kernel_func = nullptr;
                     for (auto& f : *module) {
-                        if (f.getName().starts_with("kernel_")) {
+                        std::string name = f.getName().str();
+                        if (name.find("kernel_") == 0) {
                             kernel_func = &f;
                             break;
                         }
@@ -641,7 +762,7 @@ public:
 
                     // NEW V2: Extract parameter types including captured members
                     std::vector<std::string> param_types;
-                    if (info.algorithm_name == "for_each") {
+                    if (info.algorithm_name == "for_each" || info.algorithm_name == "for_each_n") {
                         param_types.push_back("float&");
                     } else if (info.algorithm_name == "transform") {
                         param_types.push_back("float");
@@ -666,6 +787,22 @@ public:
 
             llvm::errs() << "[ParallaxCollector V2] Warning: Could not extract lambda or function object\n";
             return true;
+        }
+
+        // Extract lambda captures
+        llvm::errs() << "[ParallaxCollector] Extracting lambda captures...\n";
+        for (const auto& capture : info.lambda->captures()) {
+            if (capture.capturesVariable()) {
+                LambdaCaptureInfo cap_info;
+                cap_info.var_decl = llvm::dyn_cast<clang::VarDecl>(capture.getCapturedVar());
+                cap_info.name = capture.getCapturedVar()->getNameAsString();
+                cap_info.type = capture.getCapturedVar()->getType();
+                cap_info.is_by_reference = (capture.getCaptureKind() == clang::LCK_ByRef);
+                info.lambda_captures.push_back(cap_info);
+
+                llvm::errs() << "[ParallaxCollector] Found capture: " << cap_info.name
+                             << " (" << (cap_info.is_by_reference ? "by ref" : "by value") << ")\n";
+            }
         }
 
         // Generate LLVM IR for lambda
@@ -696,7 +833,7 @@ public:
 
         // Determine parameter types based on algorithm
         std::vector<std::string> param_types;
-        if (info.algorithm_name == "for_each") {
+        if (info.algorithm_name == "for_each" || info.algorithm_name == "for_each_n") {
             param_types.push_back("float&");
         } else if (info.algorithm_name == "transform") {
             param_types.push_back("float");
@@ -752,11 +889,14 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
     std::string name = func->getQualifiedNameAsString();
 
     // Check for parallel algorithms
-    if (name != "std::for_each" && name != "std::transform" && name != "std::reduce") {
+    if (name != "std::for_each" && name != "std::for_each_n" &&
+        name != "std::transform" && name != "std::reduce" &&
+        name != "std::fill" && name != "std::copy" && name != "std::any_of") {
         return false;
     }
 
     // Check if first argument is std::execution::par
+    // Note: some algorithms like fill/copy have minimum 3 args, any_of has 3
     if (call->getNumArgs() < 3) return false;
 
     clang::Expr* policy_arg = call->getArg(0)->IgnoreImplicit();
@@ -1045,7 +1185,7 @@ public:
         llvm::errs() << "[Parallax] Phase 3: Writing rewritten files...\n";
 
         // Phase 3: Output rewritten source
-        if (!rewriter_.writeRewrittenFiles()) {
+        if (rewriter_.writeRewrittenFiles()) {
             llvm::errs() << "[Parallax] Successfully rewrote files\n";
         } else {
             llvm::errs() << "[Parallax] Failed to rewrite files\n";

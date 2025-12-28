@@ -772,6 +772,28 @@ llvm::Value* LambdaIRGenerator::translateExpr(
     }
 
     // Handle variable references (parameters, captures)
+    // Handle member access expressions (functor members)
+    if (auto* member_expr = llvm::dyn_cast<clang::MemberExpr>(expr)) {
+        llvm::errs() << "[translateExpr] MemberExpr: " << member_expr->getMemberDecl()->getNameAsString() << "\n";
+
+        if (auto* field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
+            auto it = current_functor_members_.find(field_decl);
+            if (it != current_functor_members_.end()) {
+                llvm::Value* member_val = it->second;
+                llvm::errs() << "[translateExpr] Found functor member in map\n";
+
+                // Members are passed as arguments, return them directly
+                // For pointer/reference types, they're already the right type
+                return member_val;
+            } else {
+                llvm::errs() << "[translateExpr] Warning: Functor member not found in map\n";
+            }
+        }
+
+        // Fallback: try to translate the base expression
+        return translateExpr(member_expr->getBase(), builder, context, var_map);
+    }
+
     if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
         llvm::errs() << "[translateExpr] DeclRefExpr: " << decl_ref->getDecl()->getNameAsString() << "\n";
         llvm::errs() << "[translateExpr] Type: " << decl_ref->getType().getAsString() << "\n";
@@ -1483,6 +1505,119 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManual(
     }
 
     std::cerr << "\n[LambdaIRGenerator] Generated LLVM IR:\n";
+    func->print(llvm::errs());
+    std::cerr << "\n";
+
+    return module;
+}
+
+// NEW: Generate IR for functor (function object) - treats members like lambda captures
+std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManual(
+    clang::CXXMethodDecl* method,
+    const ClassContext& class_ctx,
+    clang::ASTContext& context) {
+
+    std::string module_name = "functor_" + std::to_string(reinterpret_cast<uintptr_t>(method));
+    auto module = std::make_unique<llvm::Module>(module_name, *llvm_context_);
+
+    llvm::errs() << "[generateIRManual] Functor operator() in class: "
+                 << class_ctx.record->getNameAsString() << "\n";
+    llvm::errs() << "[generateIRManual] Functor has " << class_ctx.member_variables.size()
+                 << " member variables\n";
+    for (const auto& member : class_ctx.member_variables) {
+        llvm::errs() << "  - " << member->getNameAsString() << " : "
+                     << member->getType().getAsString() << "\n";
+    }
+
+    // Build function signature
+    std::vector<llvm::Type*> param_types;
+    std::map<const clang::VarDecl*, llvm::Value*> var_map;
+
+    // Add explicit operator() parameters
+    for (auto* param : method->parameters()) {
+        llvm::Type* param_type = convertType(param->getType());
+        param_types.push_back(param_type);
+    }
+
+    // Add functor member variables as additional parameters (like lambda captures)
+    // IMPORTANT: Pointers are passed as uint32 from uniform buffer
+    for (const auto& member : class_ctx.member_variables) {
+        llvm::Type* member_type;
+
+        clang::QualType member_qtype = member->getType();
+        if (member_qtype->isPointerType() || member_qtype->isReferenceType()) {
+            // Use uint32 placeholder for pointers/references
+            member_type = llvm::Type::getInt32Ty(*llvm_context_);
+            llvm::errs() << "[LambdaIRGenerator] Functor member '" << member->getNameAsString()
+                         << "' is pointer/ref, using uint32 placeholder\n";
+        } else {
+            // Use actual type for value members
+            member_type = convertType(member_qtype);
+        }
+        param_types.push_back(member_type);
+    }
+
+    llvm::Type* return_type = convertType(method->getReturnType());
+    llvm::FunctionType* func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+    // Create function
+    llvm::Function* func = llvm::Function::Create(
+        func_type,
+        llvm::Function::ExternalLinkage,
+        "lambda_kernel",
+        module.get()
+    );
+
+    // Map explicit parameters to LLVM arguments
+    auto arg_it = func->arg_begin();
+    for (auto* param : method->parameters()) {
+        llvm::Argument* arg = &(*arg_it++);
+        arg->setName(param->getNameAsString());
+        var_map[param] = arg;
+    }
+
+    // Map functor members to LLVM arguments (like captures)
+    // Create a temporary map for member -> argument mapping
+    std::map<const clang::FieldDecl*, llvm::Value*> member_map;
+    for (const auto& member : class_ctx.member_variables) {
+        llvm::Argument* arg = &(*arg_it++);
+        arg->setName("member_" + member->getNameAsString());
+        // Store member in member_map
+        member_map[member] = arg;
+        llvm::errs() << "[generateIRManual] Mapped member " << member->getNameAsString()
+                     << " to argument\n";
+    }
+
+    // Create entry basic block
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(*llvm_context_, "entry", func);
+    llvm::IRBuilder<> builder(entry);
+
+    // Store member_map in class member for access during translation
+    current_functor_members_ = member_map;
+
+    // Translate operator() body
+    if (clang::Stmt* body = method->getBody()) {
+        translateStmt(body, builder, context, var_map);
+    }
+
+    // Clear member map after translation
+    current_functor_members_.clear();
+
+    // Add return if not already present
+    if (!entry->getTerminator()) {
+        if (return_type->isVoidTy()) {
+            builder.CreateRetVoid();
+        }
+    }
+
+    // Verify function
+    if (llvm::verifyFunction(*func, &llvm::errs())) {
+        llvm::errs() << "ERROR: Generated LLVM IR is invalid for functor!\n";
+        func->print(llvm::errs());
+        return nullptr;
+    }
+
+    std::cerr << "\n[LambdaIRGenerator] Generated Functor LLVM IR:\n";
     func->print(llvm::errs());
     std::cerr << "\n";
 

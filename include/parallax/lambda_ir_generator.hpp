@@ -64,6 +64,16 @@ public:
     );
 
     /**
+     * Generate LLVM IR for a functor (function object) using manual IR construction
+     * Treats functor members like lambda captures
+     */
+    std::unique_ptr<llvm::Module> generateIRManual(
+        clang::CXXMethodDecl* method,
+        const ClassContext& class_ctx,
+        clang::ASTContext& context
+    );
+
+    /**
      * Extract information about lambda captures
      */
     struct CaptureInfo {
@@ -115,6 +125,9 @@ private:
         clang::ASTContext& context,
         std::map<const clang::VarDecl*, llvm::Value*>& var_map
     );
+
+    // Temporary storage for functor member -> LLVM value mapping (used during functor IR generation)
+    std::map<const clang::FieldDecl*, llvm::Value*> current_functor_members_;
 
     // Helper: Translate expression to LLVM IR
     llvm::Value* translateExpr(
