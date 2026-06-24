@@ -551,19 +551,54 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         case llvm::Instruction::Call: {
             auto* call = llvm::cast<llvm::CallInst>(inst);
             auto* func = call->getCalledFunction();
-            if (func && func->getIntrinsicID() == llvm::Intrinsic::sqrt) {
-                uint32_t arg = get_value_id(builder, call->getArgOperand(0), value_map);
-                uint32_t ty = get_type_id(builder, inst->getType());
-                // OpExtInst result_ty result_id set_id inst_index operand1
-                builder.emit_op(SPIRVOp::OpExtInst, {ty, result_id, glsl_std_id_, 31 /* sqrt */, arg});
-            } else {
-                // Generic call (OpFunctionCall)
-                uint32_t func_ptr_id = 0; // Would need a map for functions
-                std::vector<uint32_t> ops = {get_type_id(builder, inst->getType()), result_id, func_ptr_id};
-                for (unsigned i = 0; i < call->arg_size(); ++i) {
-                    ops.push_back(get_value_id(builder, call->getArgOperand(i), value_map));
-                }
-                builder.emit_op(SPIRVOp::OpFunctionCall, ops);
+            llvm::Intrinsic::ID iid =
+                func ? func->getIntrinsicID() : llvm::Intrinsic::not_intrinsic;
+            uint32_t ty = get_type_id(builder, inst->getType());
+
+            // Map an LLVM intrinsic to a GLSL.std.450 ext-inst. Codes per the
+            // GLSL.std.450 spec.
+            auto extinst = [&](uint32_t glsl_op, std::vector<uint32_t> args) {
+                std::vector<uint32_t> ops = {ty, result_id, glsl_std_id_, glsl_op};
+                ops.insert(ops.end(), args.begin(), args.end());
+                builder.emit_op(SPIRVOp::OpExtInst, ops);
+            };
+            auto arg = [&](unsigned i) {
+                return get_value_id(builder, call->getArgOperand(i), value_map);
+            };
+
+            switch (iid) {
+                case llvm::Intrinsic::sqrt:    extinst(31, {arg(0)}); break;
+                case llvm::Intrinsic::fabs:    extinst(4,  {arg(0)}); break;
+                case llvm::Intrinsic::floor:   extinst(8,  {arg(0)}); break;
+                case llvm::Intrinsic::ceil:    extinst(9,  {arg(0)}); break;
+                case llvm::Intrinsic::sin:     extinst(13, {arg(0)}); break;
+                case llvm::Intrinsic::cos:     extinst(14, {arg(0)}); break;
+                case llvm::Intrinsic::exp:     extinst(27, {arg(0)}); break;
+                case llvm::Intrinsic::log:     extinst(28, {arg(0)}); break;
+                case llvm::Intrinsic::pow:     extinst(26, {arg(0), arg(1)}); break;
+                case llvm::Intrinsic::minnum:  extinst(37, {arg(0), arg(1)}); break;
+                case llvm::Intrinsic::maxnum:  extinst(40, {arg(0), arg(1)}); break;
+                case llvm::Intrinsic::fma:
+                case llvm::Intrinsic::fmuladd: extinst(50 /* Fma */, {arg(0), arg(1), arg(2)}); break;
+                // No-op intrinsics carry no SPIR-V meaning; emit nothing.
+                case llvm::Intrinsic::lifetime_start:
+                case llvm::Intrinsic::lifetime_end:
+                case llvm::Intrinsic::dbg_declare:
+                case llvm::Intrinsic::dbg_value:
+                case llvm::Intrinsic::assume:
+                case llvm::Intrinsic::donothing:
+                    break;
+                default:
+                    // Unsupported call: alias the result to the first argument rather
+                    // than emit an OpFunctionCall with id 0 (invalid SPIR-V). This is
+                    // a graceful degradation until call-graph compilation (Phase 4).
+                    llvm::errs() << "[SPIRVGenerator] Unsupported call '"
+                                 << (func ? func->getName() : "<indirect>")
+                                 << "'; aliasing result to first argument\n";
+                    if (call->arg_size() > 0) {
+                        value_map[inst] = arg(0);
+                    }
+                    break;
             }
             break;
         }

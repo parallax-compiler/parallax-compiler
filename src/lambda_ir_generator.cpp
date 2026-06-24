@@ -1888,6 +1888,9 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     inv->getFrontendOpts().Inputs.emplace_back(
         source_path, clang::InputKind(clang::Language::CXX));
     inv->getCodeGenOpts().OptimizationLevel = 0;
+    // Disable FP contraction so a*b+c stays as separate fmul/fadd instead of
+    // llvm.fmuladd (kept simple for the SPIR-V translator; fmuladd is also handled).
+    inv->getLangOpts().setDefaultFPContractMode(clang::LangOptions::FPM_Off);
 
     clang::CompilerInstance sub_ci(inv);
     sub_ci.createDiagnostics(*llvm::vfs::getRealFileSystem());
