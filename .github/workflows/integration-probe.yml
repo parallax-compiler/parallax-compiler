@@ -144,38 +144,41 @@ jobs:
             echo "no kernel.spv produced"
           fi
 
-      - name: "PROBE (Phase 1c): int64 emits real Int64, no truncation"
-        # Informational: end-to-end int64 transform also needs non-float element
-        # support in the rewriter + runtime (Phase 4). This checks the truncation
-        # fix itself once an int64 kernel reaches SPIR-V generation.
-        continue-on-error: true
+      - name: "GATE (int64): end-to-end execution with correct element size"
         run: |
           cat > probe_i64.cpp <<'EOF'
           #include <vector>
           #include <algorithm>
           #include <execution>
-          #include <cstdint>
+          #include <cstdio>
           int main() {
-              std::vector<long long> d(8, (long long)1 << 40);
+              std::vector<long long> d(64, (long long)1 << 40);
               std::for_each(std::execution::par, d.begin(), d.end(),
                             [](long long& x) { x += 1; });
-              return 0;
+              long long expected = ((long long)1 << 40) + 1;
+              std::printf("i64 result=%lld expected=%lld\n", (long long)d[0], expected);
+              return d[0] == expected ? 0 : 1;
           }
           EOF
+          # Rewrite in place, then compile + link + run on lavapipe.
           "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" \
             -Xclang -plugin -Xclang parallax \
             -c probe_i64.cpp -o /dev/null 2> i64.log || true
-          echo "--- int64 transform decision (key lines from i64.log) ---"
-          grep -inE "for_each|Transforming call|Generated [0-9]+|Skipping|unsupported|Kernel element type|spirv.*empty|will run on CPU|CodeGen|class reference|emit_op 17 operands: 11|OpTypeInt" i64.log | head -40 || true
-          echo "----------------------------------------------------------"
-          # SPIRVBuilder logs every op: OpCapability(17) with operand 11 == Int64.
           grep -q "emit_op 17 operands: 11" i64.log \
-            || { echo "::error::Int64 capability not emitted for an int64 kernel"; exit 1; }
-          if grep -qiE "Mapping .*64-bit.* to 32-bit|Mapping Int64 type to Int32" i64.log; then
-            echo "::error::int64 is still being truncated to 32-bit"; exit 1
-          fi
-          echo "PASS: int64 kernel emits real Int64 capability with no truncation"
+            || { echo "::error::Int64 capability not emitted"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 probe_i64.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_i64 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_i64 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::int64 kernel not offloaded"; exit 1; }
+          exp=$(( (1<<40) + 1 ))
+          echo "$out" | grep -q "i64 result=$exp expected=$exp" \
+            || { echo "::error::int64 produced wrong result (truncation/size bug)"; exit 1; }
+          echo "PASS: int64 for_each executed correctly end-to-end on the GPU"
 
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |

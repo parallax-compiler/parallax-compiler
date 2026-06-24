@@ -347,28 +347,31 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         // Transform: two buffers (input and output)
         std::string output_it = getSourceText(transform.output_iterator->getSourceRange());
         ss << "  auto __plx_in_ptr = &(*" << first_it << ");\n";
-        ss << "  auto __plx_out_ptr = &(*" << output_it << ");\n\n";
+        ss << "  auto __plx_out_ptr = &(*" << output_it << ");\n";
+        ss << "  size_t __plx_elem_size = sizeof(*__plx_in_ptr);\n\n";
         ss << "  parallax_kernel_launch_transform(" << transform.kernel_name
-           << ", __plx_in_ptr, __plx_out_ptr, __plx_count);\n";
+           << ", __plx_in_ptr, __plx_out_ptr, __plx_count, __plx_elem_size);\n";
     } else {
         // For_each / for_each_n: single buffer (in-place)
         // Special handling for counting_iterator (no underlying data, just indices)
         if (first_it.find("counting_iterator") != std::string::npos) {
-            ss << "  void* __plx_ptr = nullptr;  // counting_iterator: no data pointer needed\n\n";
+            ss << "  void* __plx_ptr = nullptr;  // counting_iterator: no data pointer needed\n";
+            ss << "  size_t __plx_elem_size = 4;\n\n";
         } else {
-            ss << "  auto __plx_ptr = &(*" << first_it << ");\n\n";
+            ss << "  auto __plx_ptr = &(*" << first_it << ");\n";
+            ss << "  size_t __plx_elem_size = sizeof(*__plx_ptr);\n\n";
         }
 
         // Check if we need to pass captures (functor or lambda)
         if (transform.is_function_object && !transform.class_context.member_variables.empty()) {
             ss << "  parallax_kernel_launch_with_captures(" << transform.kernel_name
-               << ", __plx_ptr, __plx_count, &capture, sizeof(capture));\n";
+               << ", __plx_ptr, __plx_count, &capture, sizeof(capture), __plx_elem_size);\n";
         } else if (transform.has_captures()) {
             ss << "  parallax_kernel_launch_with_captures(" << transform.kernel_name
-               << ", __plx_ptr, __plx_count, &__plx_captures, sizeof(__plx_captures));\n";
+               << ", __plx_ptr, __plx_count, &__plx_captures, sizeof(__plx_captures), __plx_elem_size);\n";
         } else {
             ss << "  parallax_kernel_launch(" << transform.kernel_name
-               << ", __plx_ptr, __plx_count);\n";
+               << ", __plx_ptr, __plx_count, __plx_elem_size);\n";
         }
     }
 
