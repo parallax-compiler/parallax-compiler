@@ -81,6 +81,13 @@ private:
     std::unordered_map<std::string, uint32_t> builtin_types_;
     std::set<uint32_t> emitted_capabilities_;
     uint32_t glsl_std_id_;
+
+    // The element type the kernel operates on (the T in for_each<T>/transform<T>).
+    // LLVM 21 opaque pointers carry no pointee type, so rather than assume float
+    // everywhere, the generator is monomorphic in this type: data buffers, the
+    // lambda's pointer parameters, and element loads/stores all use it. Set per
+    // generate_from_lambda(); null falls back to float.
+    llvm::Type* active_element_type_ = nullptr;
 };
 
 } // namespace parallax

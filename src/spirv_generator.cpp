@@ -602,8 +602,11 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         require_capability(builder, 10 /* Float64 */);
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
     } else if (type->isPointerTy()) {
-        // LLVM 21+ uses opaque pointers. For MVP, we assume float elements for array access.
-        llvm::Type* element_type = llvm::Type::getFloatTy(type->getContext());
+        // LLVM 21 opaque pointers carry no pointee type; use the kernel's active
+        // element type (set per generate_from_lambda) instead of assuming float.
+        llvm::Type* element_type = active_element_type_
+                                       ? active_element_type_
+                                       : llvm::Type::getFloatTy(type->getContext());
         uint32_t el_ty_id = get_type_id(builder, element_type);
         // Use cached pointer type helper
         uint32_t ptr_ty = get_pointer_type_id(builder, el_ty_id, 12 /* StorageBuffer */);
@@ -678,6 +681,23 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
     return id;
 }
 
+// Recover the element type accessed through an (opaque) pointer parameter by
+// inspecting the first load/store/GEP that uses it. Returns nullptr if none.
+static llvm::Type* infer_pointee_type(llvm::Function* f, const llvm::Argument* arg) {
+    for (auto& bb : *f) {
+        for (auto& inst : bb) {
+            if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+                if (ld->getPointerOperand() == arg) return ld->getType();
+            } else if (auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+                if (st->getPointerOperand() == arg) return st->getValueOperand()->getType();
+            } else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+                if (gep->getPointerOperand() == arg) return gep->getSourceElementType();
+            }
+        }
+    }
+    return nullptr;
+}
+
 std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     llvm::Function* lambda_func,
     const std::vector<std::string>& param_types) {
@@ -740,8 +760,33 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
         }
     }
 
+    // Derive the kernel's element type so opaque data pointers and the data
+    // buffer use the real type instead of float. for_each: the first data
+    // parameter is the element pointer (recover its pointee). transform: the
+    // first parameter is the element value.
+    active_element_type_ = nullptr;
+    if (is_transform) {
+        if (lambda_func->arg_size() > 0) {
+            active_element_type_ = lambda_func->getArg(0)->getType();
+        }
+    } else {
+        for (auto& a : lambda_func->args()) {
+            if (a.getType()->isPointerTy() && a.getArgNo() < num_data_params) {
+                active_element_type_ = infer_pointee_type(lambda_func, &a);
+                break;
+            }
+        }
+    }
+    if (active_element_type_ &&
+        (active_element_type_->isVoidTy() || active_element_type_->isPointerTy())) {
+        active_element_type_ = nullptr;  // unsupported; fall back to float
+    }
+    if (active_element_type_) {
+        llvm::errs() << "[SPIRVGenerator] Kernel element type: " << *active_element_type_ << "\n";
+    }
+
     translate_function(builder, lambda_func, lambda_id, buffer_param_indices);
-    
+
     // Generate Kernel Entry Point
     uint32_t entry_id = builder.get_next_id();
     generate_kernel_wrapper(builder, entry_id, lambda_id, lambda_func);
@@ -778,13 +823,19 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     uint32_t float_id = get_type_id(builder, float_ty);
     llvm::Type* int32_ty = llvm::Type::getInt32Ty(lambda_func->getContext());
     uint32_t int_id = get_type_id(builder, int32_ty);
-    
-    // RuntimeArray { float }
+
+    // The data buffer element type — the kernel's active element type, not float.
+    llvm::Type* data_elem_ty = active_element_type_ ? active_element_type_ : float_ty;
+    uint32_t data_elem_id = get_type_id(builder, data_elem_ty);
+    uint32_t data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
+    if (data_elem_stride < 4) data_elem_stride = 4;
+
+    // RuntimeArray { element }
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t rarray_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {rarray_id, float_id});
+    builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {rarray_id, data_elem_id});
     builder.set_section(SPIRVBuilder::Section::Decorations);
-    builder.emit_op(SPIRVOp::OpDecorate, {rarray_id, 6 /* ArrayStride */, 4});
+    builder.emit_op(SPIRVOp::OpDecorate, {rarray_id, 6 /* ArrayStride */, data_elem_stride});
 
     // Buffer Struct { RuntimeArray }
     builder.set_section(SPIRVBuilder::Section::Types);
@@ -1013,11 +1064,11 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Access Buffer Data for data buffer arguments
     std::vector<uint32_t> data_buffer_ptrs;
 
-    uint32_t ptr_float_sb = get_pointer_type_id(builder, float_id, 12 /* StorageBuffer */);
+    uint32_t ptr_elem_sb = get_pointer_type_id(builder, data_elem_id, 12 /* StorageBuffer */);
     for (size_t i = 0; i < buffer_params.size(); ++i) {
         uint32_t var_id = buffer_var_ids[i];
         uint32_t element_ptr = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, var_id, Zero, id_x});
+        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_elem_sb, element_ptr, var_id, Zero, id_x});
         data_buffer_ptrs.push_back(element_ptr);
         llvm::errs() << "[SPIRVGenerator] Data buffer param " << i << " -> element ptr\n";
     }
@@ -1063,13 +1114,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
     if (is_transform && data_buffer_ptrs.size() >= 2) {
         // Transform: lambda returns value, has separate input/output
-        // Load from input buffer[0]
+        // Load from input buffer[0] using the input element type
         uint32_t input_val = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpLoad, {float_id, input_val, data_buffer_ptrs[0]});
+        builder.emit_op(SPIRVOp::OpLoad, {data_elem_id, input_val, data_buffer_ptrs[0]});
 
         // Call lambda with value (not pointer), captured buffers, and scalar parameters
+        uint32_t result_type_id = get_type_id(builder, lambda_func->getReturnType());
         uint32_t result_id = builder.get_next_id();
-        std::vector<uint32_t> call_ops = {float_id, result_id, lambda_func_id, input_val};
+        std::vector<uint32_t> call_ops = {result_type_id, result_id, lambda_func_id, input_val};
         // Append captured buffer pointers
         call_ops.insert(call_ops.end(), captured_buffer_ptrs.begin(), captured_buffer_ptrs.end());
         // Append scalar parameters
