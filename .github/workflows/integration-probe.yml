@@ -20,7 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CLANGXX: /usr/lib/llvm-21/bin/clang++
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # Let the Vulkan loader auto-discover the lavapipe ICD that mesa installs in
+      # /usr/share/vulkan/icd.d/. Forcing VK_ICD_FILENAMES to a guessed path left
+      # the loader with zero ICDs (VK_ERROR_INCOMPATIBLE_DRIVER, -9).
+      LIBGL_ALWAYS_SOFTWARE: "1"
     steps:
       - name: Checkout compiler
         uses: actions/checkout@v4
@@ -42,6 +45,11 @@ jobs:
           sudo apt-get install -y cmake ninja-build \
             libvulkan-dev vulkan-tools mesa-vulkan-drivers \
             vulkan-validationlayers spirv-tools
+
+      - name: Show Vulkan ICDs + devices (lavapipe)
+        run: |
+          echo "== ICD manifests =="; ls -la /usr/share/vulkan/icd.d/ || true
+          echo "== vulkaninfo =="; vulkaninfo --summary 2>&1 | head -40 || echo "vulkaninfo failed"
 
       - name: Build runtime
         run: |
