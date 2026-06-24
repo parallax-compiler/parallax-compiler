@@ -52,8 +52,23 @@ struct TransformInfo {
     }
 
     /**
+     * Check if captured type is a supported container (std::vector, std::array, etc.)
+     */
+    bool is_supported_container(clang::QualType type) const {
+        std::string type_str = type.getAsString();
+        // Check for std::vector, std::array, and other STL containers
+        if (type_str.find("std::vector<") != std::string::npos) return true;
+        if (type_str.find("std::array<") != std::string::npos) return true;
+        if (type_str.find("std::span<") != std::string::npos) return true;
+        return false;
+    }
+
+    /**
      * Check if this transform has class/struct reference captures
      * (which exceed push constant size limits on some GPUs)
+     *
+     * Now allows STL containers like std::vector since we can pass them
+     * as data pointer + size using descriptor sets.
      */
     bool has_class_reference_captures() const {
         for (const auto& capture : lambda_captures) {
@@ -61,10 +76,16 @@ struct TransformInfo {
             if (capture.is_by_reference) {
                 // Get the underlying type (without reference)
                 clang::QualType underlying_type = capture.type.getNonReferenceType();
+
+                // Allow supported containers (std::vector, etc.)
+                if (is_supported_container(underlying_type)) {
+                    continue;  // Skip this capture - it's supported
+                }
+
                 // Check if it's a class/struct/record type
                 if (underlying_type->isRecordType() || underlying_type->isClassType() ||
                     underlying_type->isStructureType()) {
-                    return true;
+                    return true;  // Unsupported class reference
                 }
             }
         }
@@ -244,9 +265,21 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             std::string type_str = capture.type.getAsString();
             std::string base_type = type_str;
 
+            // Check if this is a vector type - decompose into data pointer + size
+            if (transform.is_supported_container(capture.type.getNonReferenceType())) {
+                // Extract element type from vector
+                // e.g., "std::vector<Body, allocator<Body>>" -> "Body"
+                size_t start = type_str.find('<') + 1;
+                size_t end = type_str.find(',');
+                if (end == std::string::npos) end = type_str.find('>');
+                std::string elem_type = type_str.substr(start, end - start);
+
+                ss << "    " << elem_type << "* " << capture.name << "_data;\n";
+                ss << "    size_t " << capture.name << "_size;\n";
+            }
             // Check if this is an array type (contains '[')
-            size_t bracket_pos = type_str.find('[');
-            if (bracket_pos != std::string::npos) {
+            else if (type_str.find('[') != std::string::npos) {
+                size_t bracket_pos = type_str.find('[');
                 // Convert array to pointer: Real_t[4][8] -> Real_t (*)[8]
                 base_type = type_str.substr(0, bracket_pos);
                 // For simplicity, just use pointer to base type
@@ -260,8 +293,13 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             const auto& capture = transform.lambda_captures[i];
             std::string type_str = capture.type.getAsString();
 
+            // For vector types, extract data() and size()
+            if (transform.is_supported_container(capture.type.getNonReferenceType())) {
+                ss << "    " << capture.name << ".data(),\n";
+                ss << "    " << capture.name << ".size()";
+            }
             // For array types, cast to pointer type in initializer
-            if (type_str.find('[') != std::string::npos) {
+            else if (type_str.find('[') != std::string::npos) {
                 // Extract base type for casting
                 size_t bracket_pos = type_str.find('[');
                 std::string base_type = type_str.substr(0, bracket_pos);

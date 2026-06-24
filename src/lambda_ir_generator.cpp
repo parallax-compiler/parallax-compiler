@@ -75,12 +75,11 @@ llvm::Type* LambdaIRGenerator::convertType(clang::QualType clang_type) {
             case clang::BuiltinType::ULong:
             case clang::BuiltinType::LongLong:
             case clang::BuiltinType::ULongLong:
-                // IMPORTANT: Use Int32 instead of Int64 since many GPUs (like GTX 980M)
-                // don't support the Int64 capability. This may cause issues with
-                // code that relies on 64-bit integer precision, but it's necessary
-                // for compatibility.
-                llvm::errs() << "Warning: Mapping 64-bit integer type to 32-bit for GPU compatibility\n";
-                return llvm::Type::getInt32Ty(*llvm_context_);
+                // Emit a real 64-bit integer. The SPIR-V generator declares the
+                // Int64 capability when this type is used, and the runtime checks
+                // shaderInt64 at kernel load. Truncating to 32 bits silently
+                // corrupted values above 2^31.
+                return llvm::Type::getInt64Ty(*llvm_context_);
             case clang::BuiltinType::Float:
                 return llvm::Type::getFloatTy(*llvm_context_);
             case clang::BuiltinType::Double:
@@ -772,26 +771,20 @@ llvm::Value* LambdaIRGenerator::translateExpr(
     }
 
     // Handle variable references (parameters, captures)
-    // Handle member access expressions (functor members)
+    // Handle member access expressions (functor members ONLY - early check)
     if (auto* member_expr = llvm::dyn_cast<clang::MemberExpr>(expr)) {
-        llvm::errs() << "[translateExpr] MemberExpr: " << member_expr->getMemberDecl()->getNameAsString() << "\n";
-
         if (auto* field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
             auto it = current_functor_members_.find(field_decl);
             if (it != current_functor_members_.end()) {
                 llvm::Value* member_val = it->second;
-                llvm::errs() << "[translateExpr] Found functor member in map\n";
+                llvm::errs() << "[translateExpr] Found functor member in map: " << field_decl->getNameAsString() << "\n";
 
                 // Members are passed as arguments, return them directly
                 // For pointer/reference types, they're already the right type
                 return member_val;
-            } else {
-                llvm::errs() << "[translateExpr] Warning: Functor member not found in map\n";
             }
         }
-
-        // Fallback: try to translate the base expression
-        return translateExpr(member_expr->getBase(), builder, context, var_map);
+        // NOT a functor member - fall through to general struct member access handler below
     }
 
     if (auto* decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
@@ -800,12 +793,34 @@ llvm::Value* LambdaIRGenerator::translateExpr(
         llvm::errs() << "[translateExpr] Is LValue: " << decl_ref->isLValue() << "\n";
 
         if (auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl_ref->getDecl())) {
+            // Check for global constants (constexpr)
+            if (var_decl->isConstexpr() || (var_decl->hasGlobalStorage() && var_decl->getType().isConstQualified())) {
+                llvm::errs() << "[translateExpr] Global constant, evaluating...\n";
+                if (auto* init_expr = var_decl->getAnyInitializer()) {
+                    // Evaluate constant expression
+                    if (auto* float_lit = llvm::dyn_cast<clang::FloatingLiteral>(init_expr->IgnoreImplicit())) {
+                        double value = float_lit->getValueAsApproximateDouble();
+                        return llvm::ConstantFP::get(builder.getFloatTy(), value);
+                    } else if (auto* int_lit = llvm::dyn_cast<clang::IntegerLiteral>(init_expr->IgnoreImplicit())) {
+                        int64_t value = int_lit->getValue().getSExtValue();
+                        return llvm::ConstantInt::get(builder.getInt32Ty(), value);
+                    }
+                }
+            }
+
             auto it = var_map.find(var_decl);
             if (it != var_map.end()) {
                 llvm::Value* var = it->second;
                 llvm::errs() << "[translateExpr] Found variable in map, type: ";
                 var->getType()->print(llvm::errs());
                 llvm::errs() << "\n";
+
+                // If the variable is already a value type (not a pointer), return it directly
+                // This handles captured-by-value parameters like 'N' which are stored as i32
+                if (!var->getType()->isPointerTy()) {
+                    llvm::errs() << "[translateExpr] Variable is already a value type, returning directly\n";
+                    return var;
+                }
 
                 // For reference types or lvalues, return the pointer directly
                 // Don't auto-load for LHS of assignments
@@ -815,11 +830,9 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
 
                 // For rvalue uses, load the value
-                if (var->getType()->isPointerTy()) {
-                    llvm::errs() << "[translateExpr] Loading rvalue\n";
-                    return builder.CreateLoad(builder.getFloatTy(), var, var_decl->getNameAsString());
-                }
-                return var;
+                llvm::errs() << "[translateExpr] Loading rvalue\n";
+                llvm::Type* load_type = decl_ref->getType()->isIntegerType() ? builder.getInt32Ty() : builder.getFloatTy();
+                return builder.CreateLoad(load_type, var, var_decl->getNameAsString());
             }
         }
 
@@ -829,6 +842,13 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             if (it != var_map.end()) {
                 llvm::Value* var = it->second;
                 llvm::errs() << "[translateExpr] Found parameter in map\n";
+
+                // If parameter is a value type (not pointer), return directly
+                if (!var->getType()->isPointerTy()) {
+                    llvm::errs() << "[translateExpr] Parameter is value type, returning directly\n";
+                    return var;
+                }
+
                 // Parameters are pointers for reference types
                 if (decl_ref->getType()->isReferenceType() || decl_ref->isLValue()) {
                     llvm::errs() << "[translateExpr] Returning parameter pointer\n";
@@ -951,6 +971,71 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             );
             llvm::Value* one_third = llvm::ConstantFP::get(args[0]->getType(), 1.0/3.0);
             return builder.CreateCall(pow_fn, {args[0], one_third}, "cbrt");
+        } else if (func_name == "operator[]") {
+            // Handle vector/array indexing: vec[index]
+            llvm::errs() << "[translateExpr] Handling operator[]\n";
+
+            if (args.size() != 1) {
+                llvm::errs() << "[translateExpr] operator[] expects 1 argument, got " << args.size() << "\n";
+                return nullptr;
+            }
+
+            // Get the object being indexed (the 'this' pointer for the call)
+            // For vec[index], the callee->getThisObjectType() gives us the vector type
+            if (auto* member_call = llvm::dyn_cast<clang::CXXMemberCallExpr>(call)) {
+                llvm::Value* base = translateExpr(member_call->getImplicitObjectArgument(), builder, context, var_map);
+                llvm::Value* index = args[0];
+
+                if (!base || !index) {
+                    llvm::errs() << "[translateExpr] Failed to get base or index for operator[]\n";
+                    return nullptr;
+                }
+
+                llvm::errs() << "[translateExpr] Base type: ";
+                base->getType()->print(llvm::errs());
+                llvm::errs() << ", Index type: ";
+                index->getType()->print(llvm::errs());
+                llvm::errs() << "\n";
+
+                // Base should be a pointer (i32 for decomposed vector data pointer)
+                // For decomposed vectors, 'base' is the data pointer passed as i32
+                // We need to get the actual element type
+                clang::QualType obj_type = member_call->getImplicitObjectArgument()->getType();
+
+                // Get element type - for std::vector<T>, we want T
+                if (obj_type->isReferenceType()) {
+                    obj_type = obj_type->getPointeeType();
+                }
+
+                // Extract element type from vector<T>
+                llvm::Type* element_type = builder.getFloatTy(); // default
+                std::string type_str = obj_type.getAsString();
+                if (type_str.find("std::vector<") != std::string::npos) {
+                    // Parse element type from "std::vector<ElementType, ...>"
+                    size_t start = type_str.find('<') + 1;
+                    size_t end = type_str.find(',', start);
+                    if (end == std::string::npos) end = type_str.find('>', start);
+                    std::string elem_type_str = type_str.substr(start, end - start);
+
+                    // Map to LLVM type
+                    element_type = convertType(call->getType());
+                }
+
+                // If base is i32 (decomposed vector data pointer), we need to convert it to a proper pointer
+                // For now, treat it as an opaque pointer and use GEP
+                if (!base->getType()->isPointerTy()) {
+                    // base is i32, need to inttoptr
+                    llvm::Type* ptr_type = llvm::PointerType::getUnqual(builder.getContext());
+                    base = builder.CreateIntToPtr(base, ptr_type, "vec_data_ptr");
+                }
+
+                // Create GEP for array indexing
+                llvm::Value* elem_ptr = builder.CreateGEP(element_type, base, index, "vec_elem_ptr");
+                llvm::errs() << "[translateExpr] Created GEP for operator[]\n";
+
+                // Return pointer to element (caller will load if needed)
+                return elem_ptr;
+            }
         }
 
         llvm::errs() << "[translateExpr] Warning: Unhandled function call: " << func_name << "\n";
@@ -972,8 +1057,20 @@ llvm::Value* LambdaIRGenerator::translateExpr(
         if (auto* field_decl = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl())) {
             llvm::errs() << "[translateExpr] Field access: " << field_decl->getNameAsString() << "\n";
 
-            // Get the struct type from the base
-            const clang::RecordDecl* record_decl = member->getBase()->getType()->getAsStructureType()->getDecl();
+            // Get the struct type from the base, handling references and pointers
+            clang::QualType base_type = member->getBase()->getType();
+
+            // Strip reference if present
+            if (base_type->isReferenceType()) {
+                base_type = base_type->getPointeeType();
+            }
+
+            // Strip pointer if present
+            if (base_type->isPointerType()) {
+                base_type = base_type->getPointeeType();
+            }
+
+            const clang::RecordDecl* record_decl = base_type->getAsStructureType()->getDecl();
 
             // Find the field index
             unsigned field_idx = 0;
@@ -986,8 +1083,8 @@ llvm::Value* LambdaIRGenerator::translateExpr(
 
             llvm::errs() << "[translateExpr] Field index: " << field_idx << "\n";
 
-            // Get the struct type in LLVM IR
-            llvm::Type* struct_type = convertType(member->getBase()->getType());
+            // Get the struct type in LLVM IR (using the stripped base_type)
+            llvm::Type* struct_type = convertType(base_type);
 
             // If base is not a pointer (value type), we need its address
             // For now, assume base is already a pointer to the struct
@@ -1436,17 +1533,16 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManual(
     }
 
     // Add captures as additional parameters (passed by the runtime)
-    // IMPORTANT: For GPU offload, all captured pointers/references are passed as uint32
-    // from push constants (since GPU doesn't support Int64). We use uint32 placeholders.
+    // Pointer captures should be passed as actual pointers for array indexing to work
     for (const auto& capture : captures) {
         llvm::Type* capture_type;
 
         // Check if this is a pointer or reference type
         if (capture.is_by_reference || capture.type->isPointerType()) {
-            // Use uint32 placeholder for all pointer/reference captures
-            capture_type = llvm::Type::getInt32Ty(*llvm_context_);
+            // Use opaque pointer type for pointer/reference captures
+            capture_type = llvm::PointerType::getUnqual(*llvm_context_);
             llvm::errs() << "[LambdaIRGenerator] Manual: Capture '" << capture.name
-                         << "' is pointer/ref, using uint32 placeholder\n";
+                         << "' is pointer/ref, using pointer type\n";
         } else {
             // Use actual type for value captures
             capture_type = convertType(capture.type);
@@ -1540,16 +1636,16 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManual(
     }
 
     // Add functor member variables as additional parameters (like lambda captures)
-    // IMPORTANT: Pointers are passed as uint32 from uniform buffer
+    // Functor members: use actual pointer types for array indexing
     for (const auto& member : class_ctx.member_variables) {
         llvm::Type* member_type;
 
         clang::QualType member_qtype = member->getType();
         if (member_qtype->isPointerType() || member_qtype->isReferenceType()) {
-            // Use uint32 placeholder for pointers/references
-            member_type = llvm::Type::getInt32Ty(*llvm_context_);
+            // Use pointer type for pointers/references
+            member_type = llvm::PointerType::getUnqual(*llvm_context_);
             llvm::errs() << "[LambdaIRGenerator] Functor member '" << member->getNameAsString()
-                         << "' is pointer/ref, using uint32 placeholder\n";
+                         << "' is pointer/ref, using pointer type\n";
         } else {
             // Use actual type for value members
             member_type = convertType(member_qtype);
@@ -1700,17 +1796,16 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateSimplifiedStub(
     }
 
     // Add captures
-    // IMPORTANT: For GPU offload, all captured pointers/references are passed as uint32
-    // from push constants (since GPU doesn't support Int64). We use uint32 placeholders.
+    // Add captures as parameters using actual pointer types
     for (const auto& capture : captures) {
         llvm::Type* capture_type;
 
         // Check if this is a pointer or reference type
         if (capture.is_by_reference || capture.type->isPointerType()) {
-            // Use uint32 placeholder for all pointer/reference captures
-            capture_type = llvm::Type::getInt32Ty(*llvm_context_);
+            // Use pointer type for pointer/reference captures
+            capture_type = llvm::PointerType::getUnqual(*llvm_context_);
             llvm::errs() << "[LambdaIRGenerator] Capture '" << capture.name
-                         << "' is pointer/ref, using uint32 placeholder\n";
+                         << "' is pointer/ref, using pointer type\n";
         } else {
             // Use actual type for value captures
             capture_type = convertType(capture.type);
@@ -1925,10 +2020,10 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateIRManualFallback(
 
         // Check if this is a pointer or reference type
         if (param_type->isPointerType() || param_type->isReferenceType()) {
-            // Use uint32 placeholder for all pointer/reference parameters
-            param_llvm_type = llvm::Type::getInt32Ty(*llvm_context_);
+            // Use pointer type for pointer/reference parameters
+            param_llvm_type = llvm::PointerType::getUnqual(*llvm_context_);
             llvm::errs() << "[LambdaIRGenerator] Parameter '" << param->getNameAsString()
-                         << "' is pointer/ref, using uint32 placeholder\n";
+                         << "' is pointer/ref, using pointer type\n";
         } else {
             // Use actual type for value parameters
             param_llvm_type = convertType(param_type);

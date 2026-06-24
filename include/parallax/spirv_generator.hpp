@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <set>
 
 namespace parallax {
 
@@ -56,7 +57,8 @@ private:
     
     // IR translation helpers
     // IR translation helpers
-    void translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id);
+    void translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id,
+                            const std::set<size_t>& buffer_param_indices = {});
     void translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
                                std::unordered_map<llvm::Value*, uint32_t>& value_map);
     uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
@@ -66,12 +68,18 @@ private:
     
     // Kernel generation helpers
     void generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, uint32_t lambda_func_id, llvm::Function* lambda_func);
-    
+
+    // Emit an OpCapability into the Capabilities section exactly once. Used to
+    // declare Int64 / Float64 lazily when those types appear, so we emit real
+    // 64-bit types instead of silently truncating them.
+    void require_capability(SPIRVBuilder& builder, uint32_t capability);
+
 private:
     std::unordered_map<llvm::Type*, uint32_t> type_cache_;
     std::unordered_map<llvm::Constant*, uint32_t> constant_cache_;
     std::unordered_map<std::pair<uint32_t, uint32_t>, uint32_t, pair_hash> pointer_type_cache_;
     std::unordered_map<std::string, uint32_t> builtin_types_;
+    std::set<uint32_t> emitted_capabilities_;
     uint32_t glsl_std_id_;
 };
 

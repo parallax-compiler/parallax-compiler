@@ -6,6 +6,7 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <iostream>
 #include <unordered_map>
+#include <set>
 #include <stdexcept>
 
 namespace parallax {
@@ -137,7 +138,8 @@ class SPIRVBuilder {
 public:
     enum class Section {
         Header,
-        Preamble,     // Capabilities, MemoryModel
+        Capabilities, // OpCapability only (must precede everything else)
+        Preamble,     // Extensions, ExtInstImport, MemoryModel
         EntryPoints,
         Decorations,
         Types,        // Types, Constants, Global Variables
@@ -154,6 +156,7 @@ public:
     void emit_word(uint32_t word) {
         switch (current_section_) {
             case Section::Header: header_.push_back(word); break;
+            case Section::Capabilities: capabilities_.push_back(word); break;
             case Section::Preamble: preamble_.push_back(word); break;
             case Section::EntryPoints: entry_points_.push_back(word); break;
             case Section::Decorations: decorations_.push_back(word); break;
@@ -188,6 +191,7 @@ public:
     std::vector<uint32_t> get_spirv() const {
         std::vector<uint32_t> combined;
         combined.insert(combined.end(), header_.begin(), header_.end());
+        combined.insert(combined.end(), capabilities_.begin(), capabilities_.end());
         combined.insert(combined.end(), preamble_.begin(), preamble_.end());
         combined.insert(combined.end(), entry_points_.begin(), entry_points_.end());
         combined.insert(combined.end(), decorations_.begin(), decorations_.end());
@@ -203,6 +207,7 @@ private:
     uint32_t next_id_;
     Section current_section_;
     std::vector<uint32_t> header_;
+    std::vector<uint32_t> capabilities_;
     std::vector<uint32_t> preamble_;
     std::vector<uint32_t> entry_points_;
     std::vector<uint32_t> decorations_;
@@ -218,6 +223,16 @@ SPIRVGenerator::~SPIRVGenerator() = default;
 void SPIRVGenerator::set_target_vulkan_version(uint32_t major, uint32_t minor) {
     vulkan_major_ = major;
     vulkan_minor_ = minor;
+}
+
+void SPIRVGenerator::require_capability(SPIRVBuilder& builder, uint32_t capability) {
+    if (!emitted_capabilities_.insert(capability).second) {
+        return;  // already declared
+    }
+    SPIRVBuilder::Section prev = builder.get_current_section();
+    builder.set_section(SPIRVBuilder::Section::Capabilities);
+    builder.emit_op(SPIRVOp::OpCapability, {capability});
+    builder.set_section(prev);
 }
 
 std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
@@ -277,9 +292,22 @@ std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     return builder.get_spirv();
 }
 
-void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id) {
+void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* func, uint32_t func_id,
+                                        const std::set<size_t>& buffer_param_indices) {
     std::unordered_map<llvm::Value*, uint32_t> value_map;
-    
+
+    // Get runtime array type for buffer parameters
+    llvm::Type* float_ty = llvm::Type::getFloatTy(func->getContext());
+    uint32_t float_id = get_type_id(builder, float_ty);
+
+    builder.set_section(SPIRVBuilder::Section::Types);
+    uint32_t rarray_id_local = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {rarray_id_local, float_id});
+    builder.set_section(SPIRVBuilder::Section::Decorations);
+    builder.emit_op(SPIRVOp::OpDecorate, {rarray_id_local, 6 /* ArrayStride */, 4});
+
+    uint32_t ptr_rarray_sb = get_pointer_type_id(builder, rarray_id_local, 12 /* StorageBuffer */);
+
     // Emit type declarations
     builder.set_section(SPIRVBuilder::Section::Types);
     uint32_t void_type = get_type_id(builder, llvm::Type::getVoidTy(func->getContext()));
@@ -288,33 +316,41 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     std::vector<uint32_t> func_type_operands;
     func_type_operands.push_back(return_type); // Return type (use actual, not always void)
     for (auto& arg : func->args()) {
-        func_type_operands.push_back(get_type_id(builder, arg.getType()));
+        size_t arg_no = arg.getArgNo();
+        bool is_buffer_param = buffer_param_indices.count(arg_no) > 0;
+        uint32_t arg_type_id = is_buffer_param ? ptr_rarray_sb : get_type_id(builder, arg.getType());
+        func_type_operands.push_back(arg_type_id);
     }
-    
+
     uint32_t func_type = builder.get_next_id();
     std::vector<uint32_t> all_func_ops = {func_type};
     all_func_ops.insert(all_func_ops.end(), func_type_operands.begin(), func_type_operands.end());
     builder.emit_op(SPIRVOp::OpTypeFunction, all_func_ops);
-    
+
     // Emit function
     builder.set_section(SPIRVBuilder::Section::Code);
     builder.emit_op(SPIRVOp::OpFunction, {return_type, func_id, 0, func_type});
-    
+
     // Handle arguments
     for (auto& arg : func->args()) {
         uint32_t arg_id = builder.get_next_id();
         llvm::Type* arg_llvm_type = arg.getType();
+        size_t arg_no = arg.getArgNo();
+        bool is_buffer_param = buffer_param_indices.count(arg_no) > 0;
 
-        llvm::errs() << "[SPIRVGenerator] Function arg " << arg.getArgNo()
+        llvm::errs() << "[SPIRVGenerator] Function arg " << arg_no
                      << " LLVM type: " << *arg_llvm_type;
         if (arg_llvm_type->isPointerTy()) {
             llvm::errs() << " (POINTER TYPE!)";
+            if (is_buffer_param) {
+                llvm::errs() << " -> BUFFER (RuntimeArray)";
+            }
         } else if (arg_llvm_type->isIntegerTy()) {
             llvm::errs() << " (INTEGER TYPE, width=" << arg_llvm_type->getIntegerBitWidth() << ")";
         }
         llvm::errs() << "\n";
 
-        uint32_t arg_type_id = get_type_id(builder, arg_llvm_type);
+        uint32_t arg_type_id = is_buffer_param ? ptr_rarray_sb : get_type_id(builder, arg_llvm_type);
         llvm::errs() << "[SPIRVGenerator]   -> SPIR-V type ID: " << arg_type_id << "\n";
 
         builder.emit_op(SPIRVOp::OpFunctionParameter, {arg_type_id, arg_id});
@@ -555,13 +591,15 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     } else if (type->isIntegerTy(32)) {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     } else if (type->isIntegerTy(64)) {
-        // IMPORTANT: Map Int64 to Int32 for GPU compatibility
-        // Many GPUs don't support Int64 capability
-        llvm::errs() << "[SPIRVGenerator] WARNING: Mapping Int64 type to Int32 for GPU compatibility\n";
-        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
+        // Emit a real 64-bit integer and declare the Int64 capability. Truncating
+        // to 32 bits silently corrupted values above 2^31; the device's shaderInt64
+        // support is verified by the runtime at kernel load instead.
+        require_capability(builder, 11 /* Int64 */);
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 64, 0});
     } else if (type->isFloatTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 32});
     } else if (type->isDoubleTy()) {
+        require_capability(builder, 10 /* Float64 */);
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 64});
     } else if (type->isPointerTy()) {
         // LLVM 21+ uses opaque pointers. For MVP, we assume float elements for array access.
@@ -654,17 +692,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     builder.set_section(SPIRVBuilder::Section::Header);
     emit_header(builder.get_header());
     
-    // Caps & MemModel
+    // Base capabilities go into the dedicated Capabilities section so that the
+    // Int64 / Float64 capabilities emitted lazily during type translation still
+    // precede the memory model. Extensions / imports / memory model stay here.
+    emitted_capabilities_.clear();
+    require_capability(builder, 1);    // Shader
+    require_capability(builder, 4441); // VariablePointersStorageBuffer
+
     builder.set_section(SPIRVBuilder::Section::Preamble);
-    llvm::errs() << "[SPIRVGenerator] DEBUG: About to emit capabilities (Shader and VariablePointersStorageBuffer ONLY)\n";
-    builder.emit_op(SPIRVOp::OpCapability, {1}); // Shader
-    llvm::errs() << "[SPIRVGenerator] DEBUG: Emitted Shader capability (1)\n";
-    // Note: Int64 capability removed - GTX 980M doesn't support shaderInt64
-    // builder.emit_op(SPIRVOp::OpCapability, {11}); // Int64
-    llvm::errs() << "[SPIRVGenerator] DEBUG: NOT emitting Int64 capability (11) - commented out\n";
-    builder.emit_op(SPIRVOp::OpCapability, {4441}); // VariablePointersStorageBuffer
-    llvm::errs() << "[SPIRVGenerator] DEBUG: Emitted VariablePointersStorageBuffer capability (4441)\n";
-    
     std::string ext_name = "SPV_KHR_variable_pointers";
     uint32_t ext_wc = 1 + (ext_name.length() + 4) / 4;
     builder.emit_word((ext_wc << 16) | (uint32_t)SPIRVOp::OpExtension);
@@ -683,7 +718,29 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     // Translate Lambda Helper
     builder.set_section(SPIRVBuilder::Section::Code);
     uint32_t lambda_id = builder.get_next_id();
-    translate_function(builder, lambda_func, lambda_id);
+
+    // Build set of buffer parameter indices - ONLY for captured buffer pointers!
+    // Data buffer parameters (param 0 for for_each, params 0-1 for transform) are element pointers,
+    // not array pointers, so they should NOT be in buffer_param_indices.
+    // Only captured buffer pointers (parameters beyond num_data_params) should be runtime arrays.
+    std::set<size_t> buffer_param_indices;
+
+    // Determine how many parameters are data buffers (not captured buffers)
+    bool is_transform = !lambda_func->getReturnType()->isVoidTy();
+    size_t num_data_params = is_transform ? 2 : 1;
+
+    for (auto& arg : lambda_func->args()) {
+        size_t arg_no = arg.getArgNo();
+        // Only mark captured buffer pointers (beyond the data buffer params) as buffer parameters
+        if (arg.getType()->isPointerTy() && arg_no >= num_data_params) {
+            buffer_param_indices.insert(arg_no);
+            llvm::errs() << "[SPIRVGenerator] Marking param " << arg_no << " as captured buffer (RuntimeArray)\n";
+        } else if (arg.getType()->isPointerTy()) {
+            llvm::errs() << "[SPIRVGenerator] Param " << arg_no << " is data buffer (element pointer, not array)\n";
+        }
+    }
+
+    translate_function(builder, lambda_func, lambda_id, buffer_param_indices);
     
     // Generate Kernel Entry Point
     uint32_t entry_id = builder.get_next_id();
@@ -772,52 +829,75 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         }
     }
 
-    // Determine actual number of buffers to create
-    // For transform: always 2 (even if not all are pointers - shouldn't happen)
-    // For for_each/for_each_n: only if first param is actually a pointer
-    size_t num_buffers = buffer_params.size();
+    // Further classify scalar_params into captured buffers vs true scalars
+    std::vector<llvm::Argument*> captured_buffers;
+    std::vector<llvm::Argument*> true_scalars;
 
-    llvm::errs() << "[SPIRVGenerator] Creating " << num_buffers
-                 << " storage buffers and " << scalar_params.size()
-                 << " capture parameters in descriptor set\n";
+    for (auto* param : scalar_params) {
+        if (param->getType()->isPointerTy()) {
+            llvm::errs() << "  Param " << param->getArgNo() << " is a captured buffer pointer\n";
+            captured_buffers.push_back(param);
+        } else {
+            true_scalars.push_back(param);
+        }
+    }
 
-    // Create Variables for data buffers (binding 0, 1, ...)
+    // Total number of buffer bindings = data buffers + captured buffers
+    size_t num_buffers = buffer_params.size() + captured_buffers.size();
+
+    llvm::errs() << "[SPIRVGenerator] Creating " << buffer_params.size()
+                 << " data buffers, " << captured_buffers.size()
+                 << " captured buffer bindings, and " << true_scalars.size()
+                 << " scalar captures\n";
+
+    // Create Variables for data buffers (binding 0, ...) and captured buffers (binding N, ...)
     std::vector<uint32_t> buffer_var_ids;
-    for (size_t i = 0; i < num_buffers; ++i) {
+    size_t binding_idx = 0;
+
+    // Data buffers first
+    for (size_t i = 0; i < buffer_params.size(); ++i) {
         builder.set_section(SPIRVBuilder::Section::Types);
         uint32_t buffer_var_id = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
         builder.set_section(SPIRVBuilder::Section::Decorations);
-        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, static_cast<uint32_t>(i)});
+        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
         builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
         buffer_var_ids.push_back(buffer_var_id);
+        llvm::errs() << "[SPIRVGenerator] Data buffer " << i << " -> binding " << binding_idx << "\n";
+        binding_idx++;
     }
 
-    // NEW: Use Uniform Buffer for Captures instead of Push Constants
-    // Captures Struct { <scalar_params...> } - in uniform buffer (no size limit!)
+    // Captured buffers next
+    for (size_t i = 0; i < captured_buffers.size(); ++i) {
+        builder.set_section(SPIRVBuilder::Section::Types);
+        uint32_t buffer_var_id = builder.get_next_id();
+        builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
+        builder.set_section(SPIRVBuilder::Section::Decorations);
+        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
+        builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
+        buffer_var_ids.push_back(buffer_var_id);
+        llvm::errs() << "[SPIRVGenerator] Captured buffer " << i << " (param " << captured_buffers[i]->getArgNo()
+                     << ") -> binding " << binding_idx << "\n";
+        binding_idx++;
+    }
+
+    // NEW: Use Storage Buffer for Captures instead of Push Constants
+    // Captures Struct { <true_scalars...> } - only non-pointer captures!
     uint32_t captures_struct_id = 0;
     uint32_t captures_var_id = 0;
     std::vector<uint32_t> capture_member_types;
 
-    if (!scalar_params.empty()) {
+    if (!true_scalars.empty()) {
         builder.set_section(SPIRVBuilder::Section::Types);
         captures_struct_id = builder.get_next_id();
 
-        // Add type IDs for scalar parameters
-        for (auto* scalar : scalar_params) {
+        // Add type IDs for true scalar parameters (no pointers!)
+        for (auto* scalar : true_scalars) {
             llvm::Type* scalar_type = scalar->getType();
-
-            // Check if this is a pointer (captured pointer/struct)
-            if (scalar_type->isPointerTy()) {
-                llvm::errs() << "[SPIRVGenerator] WARNING: Captured pointer detected at param "
-                             << scalar->getArgNo() << "\n";
-                llvm::errs() << "[SPIRVGenerator] Using uint32 placeholder for pointer capture\n";
-                uint32_t uint32_id = get_type_id(builder, llvm::Type::getInt32Ty(lambda_func->getContext()));
-                capture_member_types.push_back(uint32_id);
-            } else {
-                uint32_t scalar_type_id = get_type_id(builder, scalar_type);
-                capture_member_types.push_back(scalar_type_id);
-            }
+            uint32_t scalar_type_id = get_type_id(builder, scalar_type);
+            capture_member_types.push_back(scalar_type_id);
+            llvm::errs() << "[SPIRVGenerator] Scalar capture param " << scalar->getArgNo()
+                         << " added to captures struct\n";
         }
 
         // Emit OpTypeStruct for captures
@@ -834,18 +914,19 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         }
         builder.emit_op(SPIRVOp::OpDecorate, {captures_struct_id, 2 /* Block */});
 
-        // Create uniform buffer pointer for captures (binding = num_buffers)
-        uint32_t ptr_captures_uniform = get_pointer_type_id(builder, captures_struct_id, 2 /* Uniform */);
+        // Create storage buffer pointer for captures (binding after all data/captured buffers)
+        uint32_t ptr_captures_storage = get_pointer_type_id(builder, captures_struct_id, 12 /* StorageBuffer */);
 
-        // Create captures variable (binding after data buffers)
+        // Create captures variable
         builder.set_section(SPIRVBuilder::Section::Types);
         captures_var_id = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpVariable, {ptr_captures_uniform, captures_var_id, 2 /* Uniform */});
+        builder.emit_op(SPIRVOp::OpVariable, {ptr_captures_storage, captures_var_id, 12 /* StorageBuffer */});
         builder.set_section(SPIRVBuilder::Section::Decorations);
-        builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 33 /* Binding */, static_cast<uint32_t>(num_buffers)});
+        builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
         builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 34 /* DescriptorSet */, 0});
 
-        llvm::errs() << "[SPIRVGenerator] Created captures uniform buffer at binding " << num_buffers << "\n";
+        llvm::errs() << "[SPIRVGenerator] Created captures storage buffer at binding " << binding_idx << "\n";
+        binding_idx++;
     }
 
     // Push Constants now only contain count (no captures!)
@@ -929,74 +1010,74 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     
     builder.emit_op(SPIRVOp::OpLabel, {label_body});
     
-    // Access Buffer Data for each argument
-    std::vector<uint32_t> arg_ptrs;
+    // Access Buffer Data for data buffer arguments
+    std::vector<uint32_t> data_buffer_ptrs;
+
     uint32_t ptr_float_sb = get_pointer_type_id(builder, float_id, 12 /* StorageBuffer */);
-    
-    for (auto var_id : buffer_var_ids) {
+    for (size_t i = 0; i < buffer_params.size(); ++i) {
+        uint32_t var_id = buffer_var_ids[i];
         uint32_t element_ptr = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpAccessChain, {ptr_float_sb, element_ptr, var_id, Zero, id_x});
-        arg_ptrs.push_back(element_ptr);
+        data_buffer_ptrs.push_back(element_ptr);
+        llvm::errs() << "[SPIRVGenerator] Data buffer param " << i << " -> element ptr\n";
     }
 
-    // Load scalar parameters from uniform buffer (captures)
+    // Access captured buffer pointers (these are separate buffer bindings!)
+    std::vector<uint32_t> captured_buffer_ptrs;
+    for (size_t i = 0; i < captured_buffers.size(); ++i) {
+        uint32_t var_id = buffer_var_ids[buffer_params.size() + i];
+        uint32_t array_ptr = builder.get_next_id();
+        uint32_t ptr_rarray_sb = get_pointer_type_id(builder, rarray_id, 12 /* StorageBuffer */);
+        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_rarray_sb, array_ptr, var_id, Zero});
+        captured_buffer_ptrs.push_back(array_ptr);
+        llvm::errs() << "[SPIRVGenerator] Captured buffer param " << captured_buffers[i]->getArgNo()
+                     << " -> buffer var " << var_id << " -> array ptr " << array_ptr << "\n";
+    }
+
+    // Load scalar parameters from storage buffer (captures) - only true scalars, no pointers!
     std::vector<uint32_t> scalar_values;
-    for (size_t i = 0; i < scalar_params.size(); ++i) {
-        llvm::Type* scalar_type = scalar_params[i]->getType();
-        bool is_pointer = scalar_type->isPointerTy();
+    for (size_t i = 0; i < true_scalars.size(); ++i) {
+        llvm::Type* scalar_type = true_scalars[i]->getType();
 
         // Create constant for member index in captures struct
         uint32_t member_idx = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, i));
 
-        // Determine the actual type stored in uniform buffer
-        // Pointers are stored as uint32 (placeholder), everything else is stored as-is
-        llvm::Type* capture_member_type = is_pointer ?
-            llvm::Type::getInt32Ty(lambda_func->getContext()) : scalar_type;
-        uint32_t capture_member_type_id = get_type_id(builder, capture_member_type);
+        uint32_t scalar_type_id = get_type_id(builder, scalar_type);
 
-        // Access chain to get pointer to this capture member in uniform buffer
-        uint32_t ptr_scalar_uniform = get_pointer_type_id(builder, capture_member_type_id, 2 /* Uniform */);
+        // Access chain to get pointer to this capture member in storage buffer
+        uint32_t ptr_scalar_sb = get_pointer_type_id(builder, scalar_type_id, 12 /* StorageBuffer */);
         uint32_t ptr_scalar = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_scalar_uniform, ptr_scalar, captures_var_id, member_idx});
+        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_scalar_sb, ptr_scalar, captures_var_id, member_idx});
 
-        // Load the value from uniform buffer
+        // Load the value from storage buffer
         uint32_t loaded_val = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpLoad, {capture_member_type_id, loaded_val, ptr_scalar});
+        builder.emit_op(SPIRVOp::OpLoad, {scalar_type_id, loaded_val, ptr_scalar});
+        scalar_values.push_back(loaded_val);
 
-        // If this was a pointer, convert uint32 to pointer type using bitcast
-        if (is_pointer) {
-            uint32_t ptr_type_id = get_type_id(builder, scalar_type);
-            uint32_t converted_ptr = builder.get_next_id();
-            // OpBitcast: reinterpret uint32 as pointer (this is a placeholder)
-            builder.emit_op(SPIRVOp::OpBitcast, {ptr_type_id, converted_ptr, loaded_val});
-            scalar_values.push_back(converted_ptr);
-            llvm::errs() << "[SPIRVGenerator] Loaded pointer param " << i
-                         << " from uniform buffer (bitcast from uint32 placeholder)\n";
-        } else {
-            scalar_values.push_back(loaded_val);
-            llvm::errs() << "[SPIRVGenerator] Loaded scalar param " << i
-                         << " from uniform buffer member " << i << "\n";
-        }
+        llvm::errs() << "[SPIRVGenerator] Loaded scalar param " << true_scalars[i]->getArgNo()
+                     << " from captures buffer member " << i << "\n";
     }
 
     // Call Lambda - different handling for transform vs for_each
     // Note: is_transform was already determined earlier
 
-    if (is_transform && arg_ptrs.size() >= 2) {
+    if (is_transform && data_buffer_ptrs.size() >= 2) {
         // Transform: lambda returns value, has separate input/output
         // Load from input buffer[0]
         uint32_t input_val = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpLoad, {float_id, input_val, arg_ptrs[0]});
+        builder.emit_op(SPIRVOp::OpLoad, {float_id, input_val, data_buffer_ptrs[0]});
 
-        // Call lambda with value (not pointer) and scalar parameters
+        // Call lambda with value (not pointer), captured buffers, and scalar parameters
         uint32_t result_id = builder.get_next_id();
         std::vector<uint32_t> call_ops = {float_id, result_id, lambda_func_id, input_val};
+        // Append captured buffer pointers
+        call_ops.insert(call_ops.end(), captured_buffer_ptrs.begin(), captured_buffer_ptrs.end());
         // Append scalar parameters
         call_ops.insert(call_ops.end(), scalar_values.begin(), scalar_values.end());
         builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
 
         // Store result to output buffer[1]
-        builder.emit_op(SPIRVOp::OpStore, {arg_ptrs[1], result_id});
+        builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], result_id});
     } else {
         // For_each: lambda modifies in-place via pointer
         // Get the actual return type of the lambda function
@@ -1004,14 +1085,17 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
         uint32_t call_id = builder.get_next_id();
         std::vector<uint32_t> call_ops = {lambda_return_type_id, call_id, lambda_func_id};
-        // Add buffer pointers
-        call_ops.insert(call_ops.end(), arg_ptrs.begin(), arg_ptrs.end());
+        // Add data buffer pointers
+        call_ops.insert(call_ops.end(), data_buffer_ptrs.begin(), data_buffer_ptrs.end());
+        // Add captured buffer pointers
+        call_ops.insert(call_ops.end(), captured_buffer_ptrs.begin(), captured_buffer_ptrs.end());
         // Add scalar parameters
         call_ops.insert(call_ops.end(), scalar_values.begin(), scalar_values.end());
         builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
 
-        llvm::errs() << "[SPIRVGenerator] Called lambda with " << arg_ptrs.size()
-                     << " buffer args and " << scalar_values.size() << " scalar args\n";
+        llvm::errs() << "[SPIRVGenerator] Called lambda with " << data_buffer_ptrs.size()
+                     << " data buffer args, " << captured_buffer_ptrs.size()
+                     << " captured buffer args, and " << scalar_values.size() << " scalar args\n";
     }
 
     builder.emit_op(SPIRVOp::OpBranch, {label_merge});
