@@ -3,7 +3,10 @@
 #include "parallax/kernel_wrapper.hpp"
 #include <clang/AST/Type.h>
 #include <clang/AST/OperationKinds.h>
+#include <clang/AST/Mangle.h>
 #include <clang/CodeGen/ModuleBuilder.h>
+#include <clang/CodeGen/CodeGenAction.h>
+#include <clang/Frontend/CompilerInvocation.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
@@ -1855,124 +1858,81 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     const ClassContext& context,
     clang::ASTContext& ast_context) {
 
-    // Step 1: Create CodeGenerator
-    std::unique_ptr<clang::CodeGenerator> codegen(
-        clang::CreateLLVMCodeGen(
-            CI_.getDiagnostics(),
-            "parallax_kernel",
-            llvm::vfs::getRealFileSystem(),
-            CI_.getHeaderSearchOpts(),
-            CI_.getPreprocessorOpts(),
-            CI_.getCodeGenOpts(),
-            *llvm_context_
-        )
-    );
+    // Proper code generation: run Clang's real CodeGen pipeline (EmitLLVMOnly)
+    // over the translation unit so the lambda/functor operator() is emitted with
+    // natively-correct LLVM types for every type and operation, then pick out that
+    // one function by its mangled name. This replaces the fragile manual translator.
 
-    if (!codegen) {
-        llvm::errs() << "[V2] ERROR: Failed to create CodeGenerator\n";
+    clang::SourceManager& SM = ast_context.getSourceManager();
+    clang::FileID fid = SM.getFileID(method->getLocation());
+    auto file_ref = SM.getFileEntryRefForID(fid);
+    if (!file_ref) {
+        llvm::errs() << "[CodeGen] Could not resolve source file for operator()\n";
+        return nullptr;
+    }
+    std::string source_path = file_ref->getName().str();
+
+    // Clone the current invocation, retargeting it to emit LLVM IR only for just
+    // this file, with optimizations and plugins disabled (avoid plugin recursion).
+    auto inv = std::make_shared<clang::CompilerInvocation>(CI_.getInvocation());
+    inv->getFrontendOpts().ProgramAction = clang::frontend::EmitLLVMOnly;
+    inv->getFrontendOpts().ActionName.clear();
+    inv->getFrontendOpts().Plugins.clear();
+    inv->getFrontendOpts().AddPluginActions.clear();
+    inv->getFrontendOpts().PluginArgs.clear();
+    inv->getFrontendOpts().Inputs.clear();
+    inv->getFrontendOpts().Inputs.emplace_back(
+        source_path, clang::InputKind(clang::Language::CXX));
+    inv->getCodeGenOpts().OptimizationLevel = 0;
+
+    clang::CompilerInstance sub_ci;
+    sub_ci.setInvocation(inv);
+    sub_ci.createDiagnostics(*llvm::vfs::getRealFileSystem());
+    if (!sub_ci.hasDiagnostics()) {
+        llvm::errs() << "[CodeGen] Failed to create diagnostics for sub-compilation\n";
         return nullptr;
     }
 
-    // Step 2: Initialize CodeGen
-    codegen->Initialize(ast_context);
-
-    // Step 3: Generate IR for the class definition
-    llvm::errs() << "[V2] Generating IR for class: "
-                 << context.record->getNameAsString() << "\n";
-
-    // IMPORTANT: HandleTagDeclDefinition tells CodeGen to emit the complete class definition
-    // This should trigger emission of all member functions
-    codegen->HandleTagDeclDefinition(context.record);
-
-    // Also try HandleTopLevelDecl for the record
-    codegen->HandleTopLevelDecl(clang::DeclGroupRef(context.record));
-
-    // Step 4: Force emission of operator() by marking it as DEFINITION to emit
-    llvm::errs() << "[V2] Forcing emission of operator()\n";
-
-    // Get Sema for forcing instantiation
-    clang::Sema& sema = CI_.getSema();
-
-    // CRITICAL: CodeGen only emits functions that are marked for emission
-    // We need to explicitly tell CodeGen to emit this function
-    if (method->hasBody() && method->isThisDeclarationADefinition()) {
-        llvm::errs() << "[V2] operator() has body, marking for emission\n";
-
-        // Mark as used (necessary but not sufficient)
-        method->setIsUsed();
-
-        // Use Sema to force it
-        sema.MarkFunctionReferenced(method->getBeginLoc(), method);
-
-        // IMPORTANT: Manually mark for deferred emission
-        // This is what makes CodeGen actually emit the function!
-        ast_context.getTranslationUnitDecl()->addDecl(const_cast<clang::CXXMethodDecl*>(method));
+    clang::EmitLLVMOnlyAction action(llvm_context_);
+    if (!sub_ci.ExecuteAction(action)) {
+        llvm::errs() << "[CodeGen] EmitLLVMOnly sub-compilation failed\n";
+        return nullptr;
     }
 
-    codegen->HandleTopLevelDecl(clang::DeclGroupRef(method));
-
-    for (clang::CXXMethodDecl* func : context.member_functions) {
-        llvm::errs() << "[V2] Generating IR for member function: "
-                     << func->getNameAsString() << "\n";
-        if (func->hasBody() && func->isThisDeclarationADefinition()) {
-            func->setIsUsed();
-            sema.MarkFunctionReferenced(func->getBeginLoc(), func);
-            if (func->getTemplatedKind() != clang::FunctionDecl::TK_NonTemplate) {
-                sema.InstantiateFunctionDefinition(func->getBeginLoc(), func, true);
-            }
-        }
-        codegen->HandleTopLevelDecl(clang::DeclGroupRef(func));
-    }
-
-    // Step 5: Finalize
-    llvm::errs() << "[V2] Finalizing code generation\n";
-    codegen->HandleTranslationUnit(ast_context);
-
-    // Step 6: Extract module
-    std::unique_ptr<llvm::Module> module(codegen->ReleaseModule());
-
+    std::unique_ptr<llvm::Module> module = action.takeModule();
     if (!module) {
-        llvm::errs() << "[V2] ERROR: CodeGen returned null module\n";
+        llvm::errs() << "[CodeGen] Sub-compilation produced no module\n";
         return nullptr;
     }
 
-    llvm::errs() << "[V2] CodeGen produced module with " << module->size() << " functions\n";
-
-    // DEBUG: Print all functions in module
-    for (auto& func : *module) {
-        llvm::errs() << "[V2]   Function: " << func.getName() << " (declaration="
-                     << func.isDeclaration() << ", empty=" << func.empty() << ")\n";
+    // Locate operator() by its mangled name in the freshly emitted module.
+    std::unique_ptr<clang::MangleContext> mangler(ast_context.createMangleContext());
+    std::string mangled;
+    {
+        llvm::raw_string_ostream os(mangled);
+        if (mangler->shouldMangleDeclName(method)) {
+            mangler->mangleName(method, os);
+        } else {
+            os << method->getName();
+        }
     }
 
-    if (module->empty()) {
-        llvm::errs() << "[V2] WARNING: CodeGen produced empty module - operator() not instantiated\n";
-        llvm::errs() << "[V2] This happens because lambdas are only emitted when called\n";
+    llvm::Function* target = module->getFunction(mangled);
+    if (!target || target->isDeclaration()) {
+        llvm::errs() << "[CodeGen] Could not locate emitted operator() '"
+                     << mangled << "' in module\n";
         return nullptr;
     }
+    llvm::errs() << "[CodeGen] Located operator(): " << mangled
+                 << " (" << target->arg_size() << " args)\n";
 
-    // Step 7: Verify IR
-    std::string verify_errors;
-    llvm::raw_string_ostream error_stream(verify_errors);
-    if (llvm::verifyModule(*module, &error_stream)) {
-        llvm::errs() << "[V2] ERROR: Module verification failed:\n"
-                     << verify_errors << "\n";
-        module->print(llvm::errs(), nullptr);
-        return nullptr;
+    // Leave only the target defined so the caller's first-definition lookup picks
+    // it. (Compiling the lambda's callees for the GPU is Phase 4 call-graph work.)
+    for (llvm::Function& f : *module) {
+        if (&f != target && !f.isDeclaration()) {
+            f.deleteBody();
+        }
     }
-
-    llvm::errs() << "[V2] Successfully generated " << module->size()
-                 << " functions\n";
-
-    // Step 8: Generate GPU kernel wrapper
-    KernelWrapper wrapper(*llvm_context_);
-    llvm::Function* kernel = wrapper.generateWrapper(context, module.get());
-
-    if (!kernel) {
-        llvm::errs() << "[V2] ERROR: Failed to generate kernel wrapper\n";
-        return nullptr;
-    }
-
-    llvm::errs() << "[V2] Generated GPU kernel: " << kernel->getName().str() << "\n";
 
     return module;
 }
