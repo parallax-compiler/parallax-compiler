@@ -82,9 +82,10 @@ jobs:
         continue-on-error: true
         run: |
           cp probe.cpp probe_rw.cpp
-          echo "===== running rewriter ====="
+          echo "===== running rewriter (loading $PLUGIN) ====="
           "$CLANGXX" -std=c++20 \
             -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" \
             -Xclang -plugin -Xclang parallax \
             -c probe_rw.cpp -o /dev/null 2>&1 | tee rewrite.log || true
           echo "===== rewritten source (probe_rw.cpp) ====="
