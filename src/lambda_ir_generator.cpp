@@ -132,8 +132,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             case clang::BO_Mul: {
                 // For arithmetic operators, operands must be values, not pointers
                 // Determine actual type from AST, not just assuming float
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -150,8 +149,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_Add: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -167,8 +165,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_Sub: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -184,8 +181,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_Div: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -205,8 +201,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             // Comparison operators
             case clang::BO_LT: {
                 // Determine the correct load type from Clang AST
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -221,8 +216,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_LE: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -237,8 +231,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_GT: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -253,8 +246,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_GE: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -269,8 +261,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_EQ: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -285,8 +276,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 }
             }
             case clang::BO_NE: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -305,8 +295,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 llvm::errs() << "[translateExpr] Handling assignment\n";
                 // LHS should be an lvalue (pointer/reference)
                 // RHS should be a value (not pointer) - load if needed
-                llvm::Type* load_type = binary_op->getRHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getRHS()->getType());
 
                 if (rhs->getType()->isPointerTy()) {
                     rhs = builder.CreateLoad(load_type, rhs, "rhs_load");
@@ -319,8 +308,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             }
             case clang::BO_MulAssign: {
                 llvm::errs() << "[translateExpr] Handling *=\n";
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     llvm::errs() << "[translateExpr] LHS is pointer, loading value\n";
@@ -349,8 +337,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 return nullptr;
             }
             case clang::BO_AddAssign: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     llvm::Value* loaded = builder.CreateLoad(load_type, lhs, "tmp");
@@ -370,8 +357,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 return nullptr;
             }
             case clang::BO_SubAssign: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     llvm::Value* loaded = builder.CreateLoad(load_type, lhs, "tmp");
@@ -391,8 +377,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
                 return nullptr;
             }
             case clang::BO_DivAssign: {
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     llvm::Value* loaded = builder.CreateLoad(load_type, lhs, "tmp");
@@ -413,8 +398,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             }
             case clang::BO_Rem: {
                 // Modulo/remainder operator
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -497,8 +481,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
 
             case clang::BO_LAnd: {
                 // Logical AND
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -520,8 +503,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
 
             case clang::BO_LOr: {
                 // Logical OR
-                llvm::Type* load_type = binary_op->getLHS()->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(binary_op->getLHS()->getType());
 
                 if (lhs->getType()->isPointerTy()) {
                     lhs = builder.CreateLoad(load_type, lhs, "lhs_load");
@@ -544,8 +526,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             default:
                 llvm::errs() << "Warning: Unhandled binary operator: " << binary_op->getOpcodeStr() << "\n";
                 // Instead of returning nullptr, create a dummy zero value to prevent "Id is 0" errors
-                llvm::Type* result_type = binary_op->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* result_type = convertType(binary_op->getType());
                 if (result_type->isFloatingPointTy()) {
                     return llvm::ConstantFP::get(result_type, 0.0);
                 } else {
@@ -640,8 +621,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             case clang::UO_LNot: {
                 // Logical NOT: !x
                 if (operand->getType()->isPointerTy()) {
-                    llvm::Type* load_type = unary_op->getSubExpr()->getType()->isFloatingType() ?
-                        builder.getFloatTy() : builder.getInt32Ty();
+                    llvm::Type* load_type = convertType(unary_op->getSubExpr()->getType());
                     operand = builder.CreateLoad(load_type, operand, "lnot_load");
                 }
 
@@ -668,8 +648,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             case clang::UO_Plus: {
                 // Unary plus: +x (no-op, just return operand)
                 if (operand->getType()->isPointerTy()) {
-                    llvm::Type* load_type = unary_op->getSubExpr()->getType()->isFloatingType() ?
-                        builder.getFloatTy() : builder.getInt32Ty();
+                    llvm::Type* load_type = convertType(unary_op->getSubExpr()->getType());
                     operand = builder.CreateLoad(load_type, operand, "plus_load");
                 }
                 return operand;
@@ -893,8 +872,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
             }
             // Load argument if it's a pointer
             if (arg->getType()->isPointerTy()) {
-                llvm::Type* load_type = call->getArg(i)->getType()->isFloatingType() ?
-                    builder.getFloatTy() : builder.getInt32Ty();
+                llvm::Type* load_type = convertType(call->getArg(i)->getType());
                 arg = builder.CreateLoad(load_type, arg, "arg_load");
             }
             args.push_back(arg);
@@ -1149,8 +1127,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
         }
         // Load if pointer
         if (true_val->getType()->isPointerTy()) {
-            llvm::Type* load_type = cond_op->getTrueExpr()->getType()->isFloatingType() ?
-                builder.getFloatTy() : builder.getInt32Ty();
+            llvm::Type* load_type = convertType(cond_op->getTrueExpr()->getType());
             true_val = builder.CreateLoad(load_type, true_val, "true_val");
         }
         llvm::BasicBlock* true_bb_end = builder.GetInsertBlock(); // May have changed
@@ -1165,8 +1142,7 @@ llvm::Value* LambdaIRGenerator::translateExpr(
         }
         // Load if pointer
         if (false_val->getType()->isPointerTy()) {
-            llvm::Type* load_type = cond_op->getFalseExpr()->getType()->isFloatingType() ?
-                builder.getFloatTy() : builder.getInt32Ty();
+            llvm::Type* load_type = convertType(cond_op->getFalseExpr()->getType());
             false_val = builder.CreateLoad(load_type, false_val, "false_val");
         }
         llvm::BasicBlock* false_bb_end = builder.GetInsertBlock(); // May have changed
