@@ -44,18 +44,18 @@ jobs:
 
       - name: Build runtime
         run: |
-          cmake -S parallax-runtime -B parallax-runtime/build -G Ninja \
+          cmake -S parallax-runtime -B parallax-runtime/out -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DPARALLAX_BUILD_TESTS=OFF
-          cmake --build parallax-runtime/build -j
+          cmake --build parallax-runtime/out -j
 
       - name: Build plugin
         run: |
-          cmake -S parallax-compiler -B parallax-compiler/build -G Ninja \
+          cmake -S parallax-compiler -B parallax-compiler/out -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
             -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
-          cmake --build parallax-compiler/build -j
-          echo "PLUGIN=$PWD/parallax-compiler/build/src/plugin/libparallax-clang-plugin.so" >> "$GITHUB_ENV"
+          cmake --build parallax-compiler/out -j
+          echo "PLUGIN=$PWD/parallax-compiler/out/src/plugin/libparallax-clang-plugin.so" >> "$GITHUB_ENV"
 
       - name: Write probe program
         run: |
@@ -99,14 +99,14 @@ jobs:
         run: |
           "$CLANGXX" -std=c++20 -O2 probe_rw.cpp \
             -I parallax-runtime/include \
-            -L parallax-runtime/build -lparallax-runtime \
+            -L parallax-runtime/out -lparallax-runtime \
             -o probe_gpu 2>&1 | tee compile.log
           echo "[PROBE] linked probe_gpu: $([ -x probe_gpu ] && echo yes || echo no)"
 
       - name: "Stage 3: run offloaded binary on software Vulkan (lavapipe)"
         continue-on-error: true
         run: |
-          export LD_LIBRARY_PATH="$PWD/parallax-runtime/build:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
           ./probe_gpu; echo "[PROBE] exit=$?"
 
       - name: "Stage 4: validate any emitted SPIR-V"
