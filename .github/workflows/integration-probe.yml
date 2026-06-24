@@ -1,0 +1,119 @@
+name: Integration Probe
+
+# Empirically establishes the TRUE state of the end-to-end GPU-offload pipeline.
+# The Parallax plugin is a ReplaceAction that rewrites source IN PLACE (allocator
+# injection + replacing std::execution::par calls with runtime dispatch + embedded
+# SPIR-V), so it is driven with `-Xclang -plugin -Xclang parallax`, NOT `-fplugin`.
+#
+# Every offload step is non-gating (continue-on-error) — this job is a diagnostic
+# that always completes so we can read exactly where the pipeline stands. It is the
+# capstone integration check: plugin load -> detection -> rewrite -> SPIR-V ->
+# compile -> dispatch on software Vulkan (lavapipe) -> correctness vs CPU.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      CLANGXX: /usr/lib/llvm-21/bin/clang++
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+    steps:
+      - name: Checkout compiler
+        uses: actions/checkout@v4
+        with: { path: parallax-compiler }
+
+      - name: Checkout runtime (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: parallax-compiler/parallax-runtime
+          ref: main
+          path: parallax-runtime
+
+      - name: Install LLVM/Clang 21, Vulkan + lavapipe, spirv-tools
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build \
+            libvulkan-dev vulkan-tools mesa-vulkan-drivers spirv-tools
+
+      - name: Build runtime
+        run: |
+          cmake -S parallax-runtime -B parallax-runtime/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DPARALLAX_BUILD_TESTS=OFF
+          cmake --build parallax-runtime/build -j
+
+      - name: Build plugin
+        run: |
+          cmake -S parallax-compiler -B parallax-compiler/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+            -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
+          cmake --build parallax-compiler/build -j
+          echo "PLUGIN=$PWD/parallax-compiler/build/src/plugin/libparallax-clang-plugin.so" >> "$GITHUB_ENV"
+
+      - name: Write probe program
+        run: |
+          cat > probe.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> d(16, 1.0f);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("result=%.1f (expected 3.0)\n", d[0]);
+              return (d[0] == 3.0f) ? 0 : 1;
+          }
+          EOF
+
+      - name: "Baseline: compile + run on CPU (no plugin)"
+        run: |
+          "$CLANGXX" -std=c++20 -O2 probe.cpp -o probe_cpu
+          ./probe_cpu
+
+      - name: "Stage 1: plugin load + detection + in-place rewrite"
+        continue-on-error: true
+        run: |
+          cp probe.cpp probe_rw.cpp
+          echo "===== running rewriter ====="
+          "$CLANGXX" -std=c++20 \
+            -I parallax-runtime/include \
+            -Xclang -plugin -Xclang parallax \
+            -c probe_rw.cpp -o /dev/null 2>&1 | tee rewrite.log || true
+          echo "===== rewritten source (probe_rw.cpp) ====="
+          if ! diff -q probe.cpp probe_rw.cpp >/dev/null; then
+            echo "[PROBE] source WAS rewritten:"; cat probe_rw.cpp
+          else
+            echo "[PROBE] source was NOT modified by the plugin"
+          fi
+
+      - name: "Stage 2: compile rewritten source + link runtime"
+        continue-on-error: true
+        run: |
+          "$CLANGXX" -std=c++20 -O2 probe_rw.cpp \
+            -I parallax-runtime/include \
+            -L parallax-runtime/build -lparallax-runtime \
+            -o probe_gpu 2>&1 | tee compile.log
+          echo "[PROBE] linked probe_gpu: $([ -x probe_gpu ] && echo yes || echo no)"
+
+      - name: "Stage 3: run offloaded binary on software Vulkan (lavapipe)"
+        continue-on-error: true
+        run: |
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/build:$LD_LIBRARY_PATH"
+          ./probe_gpu; echo "[PROBE] exit=$?"
+
+      - name: "Stage 4: validate any emitted SPIR-V"
+        continue-on-error: true
+        run: |
+          shopt -s globstar nullglob
+          found=0
+          for f in **/*.spv; do found=1; echo "validating $f"; spirv-val "$f" || true; done
+          [ "$found" = 0 ] && echo "[PROBE] no .spv files emitted to disk (SPIR-V may be embedded as a byte array)"
+          true
