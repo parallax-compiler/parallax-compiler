@@ -1885,15 +1885,14 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         source_path, clang::InputKind(clang::Language::CXX));
     inv->getCodeGenOpts().OptimizationLevel = 0;
 
-    clang::CompilerInstance sub_ci;
-    sub_ci.setInvocation(inv);
+    clang::CompilerInstance sub_ci(inv);
     sub_ci.createDiagnostics(*llvm::vfs::getRealFileSystem());
     if (!sub_ci.hasDiagnostics()) {
         llvm::errs() << "[CodeGen] Failed to create diagnostics for sub-compilation\n";
         return nullptr;
     }
 
-    clang::EmitLLVMOnlyAction action(llvm_context_);
+    clang::EmitLLVMOnlyAction action(llvm_context_.get());
     if (!sub_ci.ExecuteAction(action)) {
         llvm::errs() << "[CodeGen] EmitLLVMOnly sub-compilation failed\n";
         return nullptr;
