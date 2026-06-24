@@ -127,3 +127,14 @@ jobs:
           for f in **/*.spv; do found=1; echo "validating $f"; spirv-val "$f" || true; done
           [ "$found" = 0 ] && echo "[PROBE] no .spv files emitted to disk (SPIR-V may be embedded as a byte array)"
           true
+
+      - name: "GATE: assert end-to-end GPU offload correctness"
+        run: |
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_gpu 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::no GPU offload — kernel was not loaded"; exit 1; }
+          echo "$out" | grep -q "result=3.0" \
+            || { echo "::error::GPU produced wrong result"; exit 1; }
+          echo "PASS: GPU offload produced the correct result via compiler-emitted SPIR-V"
