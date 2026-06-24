@@ -5,6 +5,8 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <iostream>
+#include <fstream>
+#include <cstdlib>
 #include <unordered_map>
 #include <set>
 #include <stdexcept>
@@ -793,8 +795,18 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     
     // Update Bound
     builder.get_header()[3] = builder.get_next_id();
-    
-    return builder.get_spirv();
+
+    std::vector<uint32_t> spirv = builder.get_spirv();
+    if (const char* dump_path = std::getenv("PARALLAX_DUMP_SPIRV")) {
+        std::ofstream out(dump_path, std::ios::binary);
+        if (out) {
+            out.write(reinterpret_cast<const char*>(spirv.data()),
+                      static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+            std::cerr << "[SPIRVGenerator] Dumped " << spirv.size()
+                      << " words to " << dump_path << "\n";
+        }
+    }
+    return spirv;
 }
 
 uint32_t SPIRVGenerator::get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class) {
