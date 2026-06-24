@@ -10,6 +10,8 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <iostream>
@@ -1972,6 +1974,18 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         if (&f != wrapper && !f.isDeclaration()) {
             f.deleteBody();
         }
+    }
+
+    // Promote allocas to SSA registers (mem2reg) + simplify. At -O0 Clang emits
+    // stack slots and pointer-to-pointer indirection that the opaque-pointer SPIR-V
+    // translator cannot type; after promotion the body is clean load/compute/store.
+    {
+        llvm::PassBuilder PB;
+        llvm::FunctionAnalysisManager FAM;
+        PB.registerFunctionAnalyses(FAM);
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(llvm::PromotePass());  // mem2reg
+        FPM.run(*wrapper, FAM);
     }
 
     return module;
