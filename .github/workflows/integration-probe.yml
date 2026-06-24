@@ -40,7 +40,8 @@ jobs:
           sudo ./llvm.sh 21 all
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build \
-            libvulkan-dev vulkan-tools mesa-vulkan-drivers spirv-tools
+            libvulkan-dev vulkan-tools mesa-vulkan-drivers \
+            vulkan-validationlayers spirv-tools
 
       - name: Build runtime
         run: |
