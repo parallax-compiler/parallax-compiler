@@ -150,9 +150,12 @@ jobs:
             -Xclang -load -Xclang "$PLUGIN" \
             -Xclang -plugin -Xclang parallax \
             -c probe_i64.cpp -o /dev/null 2> i64.log || true
+          echo "--- int64 transform decision (key lines from i64.log) ---"
+          grep -inE "for_each|Transforming call|Generated [0-9]+|Skipping|unsupported|Kernel element type|spirv.*empty|will run on CPU|CodeGen|class reference|emit_op 17 operands: 11|OpTypeInt" i64.log | head -40 || true
+          echo "----------------------------------------------------------"
           # SPIRVBuilder logs every op: OpCapability(17) with operand 11 == Int64.
           grep -q "emit_op 17 operands: 11" i64.log \
-            || { echo "::error::Int64 capability not emitted for an int64 kernel"; sed -n '1,40p' i64.log; exit 1; }
+            || { echo "::error::Int64 capability not emitted for an int64 kernel"; exit 1; }
           if grep -qiE "Mapping .*64-bit.* to 32-bit|Mapping Int64 type to Int32" i64.log; then
             echo "::error::int64 is still being truncated to 32-bit"; exit 1
           fi
