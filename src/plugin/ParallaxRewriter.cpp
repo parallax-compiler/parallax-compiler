@@ -1,4 +1,5 @@
 #include "ParallaxPlugin.h"
+#include <cstdlib>
 #include "parallax/lambda_ir_generator.hpp"
 #include "parallax/spirv_generator.hpp"
 #include "parallax/class_context_extractor.hpp"
@@ -698,8 +699,9 @@ public:
         if (call && call->getDirectCallee()) {
             std::string func_name = call->getDirectCallee()->getQualifiedNameAsString();
 
-            // Log all std:: namespace calls
-            if (func_name.find("std::") != std::string::npos) {
+            // Log all std:: namespace calls (very verbose; gated behind PARALLAX_DEBUG).
+            static const bool plx_verbose = std::getenv("PARALLAX_DEBUG") != nullptr;
+            if (plx_verbose && func_name.find("std::") != std::string::npos) {
                 llvm::errs() << "[ParallaxCollector] Call #" << call_count << ": " << func_name
                              << " (" << call->getNumArgs() << " args)\n";
             }
