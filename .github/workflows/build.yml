@@ -1,0 +1,52 @@
+name: Compiler Build
+
+# Builds the Parallax Clang plugin + tools against LLVM/Clang 21 (the version the
+# code targets). The runtime repo is checked out as a sibling because the plugin
+# includes its headers (../parallax-runtime/include).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout compiler
+        uses: actions/checkout@v4
+        with:
+          path: parallax-compiler
+
+      - name: Checkout runtime (sibling, for headers)
+        uses: actions/checkout@v4
+        with:
+          repository: parallax-compiler/parallax-runtime
+          ref: main
+          path: parallax-runtime
+
+      - name: Install LLVM/Clang 21 + Vulkan headers
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libvulkan-dev
+
+      - name: Configure
+        working-directory: parallax-compiler
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+            -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
+
+      - name: Build
+        working-directory: parallax-compiler
+        run: cmake --build build -j
+
+      - name: Show plugin artifact
+        working-directory: parallax-compiler
+        run: |
+          echo "Built artifacts:"
+          find build \( -name "*.so" -o -name "parallax-transform" \) -print
