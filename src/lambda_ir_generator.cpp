@@ -8,6 +8,8 @@
 #include <clang/CodeGen/CodeGenAction.h>
 #include <clang/Frontend/CompilerInvocation.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <iostream>
@@ -1925,10 +1927,49 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     llvm::errs() << "[CodeGen] Located operator(): " << mangled
                  << " (" << target->arg_size() << " args)\n";
 
-    // Leave only the target defined so the caller's first-definition lookup picks
-    // it. (Compiling the lambda's callees for the GPU is Phase 4 call-graph work.)
+    // The member operator() has an implicit leading 'this' (the closure object).
+    // Downstream SPIR-V codegen expects a plain kernel whose first parameter is the
+    // data element, so wrap operator() in a this-less function and inline it. For a
+    // captureless lambda 'this' is unused, so a null closure pointer is correct.
+    // (Lambdas with captures need the closure passed as a buffer — Phase 4.)
+    llvm::FunctionType* target_fty = target->getFunctionType();
+    if (target_fty->getNumParams() < 1) {
+        llvm::errs() << "[CodeGen] operator() has no 'this' parameter; unexpected\n";
+        return nullptr;
+    }
+    std::vector<llvm::Type*> wrapper_params(target_fty->param_begin() + 1,
+                                            target_fty->param_end());
+    llvm::FunctionType* wrapper_fty =
+        llvm::FunctionType::get(target_fty->getReturnType(), wrapper_params, false);
+    llvm::Function* wrapper = llvm::Function::Create(
+        wrapper_fty, llvm::Function::ExternalLinkage, "__parallax_kernel_body", module.get());
+
+    llvm::BasicBlock* entry =
+        llvm::BasicBlock::Create(*llvm_context_, "entry", wrapper);
+    llvm::IRBuilder<> builder(entry);
+    std::vector<llvm::Value*> call_args;
+    call_args.push_back(llvm::ConstantPointerNull::get(
+        llvm::cast<llvm::PointerType>(target_fty->getParamType(0))));  // null 'this'
+    for (llvm::Argument& a : wrapper->args()) call_args.push_back(&a);
+    llvm::CallInst* fwd = builder.CreateCall(target, call_args);
+    if (wrapper_fty->getReturnType()->isVoidTy()) {
+        builder.CreateRetVoid();
+    } else {
+        builder.CreateRet(fwd);
+    }
+
+    // Inline operator() into the wrapper so the body is self-contained, then drop
+    // every other definition's body. The wrapper becomes the lone definition the
+    // caller selects.
+    llvm::InlineFunctionInfo ifi;
+    llvm::InlineResult ir = llvm::InlineFunction(*fwd, ifi);
+    if (!ir.isSuccess()) {
+        llvm::errs() << "[CodeGen] Failed to inline operator() into wrapper: "
+                     << ir.getFailureReason() << "\n";
+        return nullptr;
+    }
     for (llvm::Function& f : *module) {
-        if (&f != target && !f.isDeclaration()) {
+        if (&f != wrapper && !f.isDeclaration()) {
             f.deleteBody();
         }
     }
