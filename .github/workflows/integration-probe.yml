@@ -180,6 +180,37 @@ jobs:
             || { echo "::error::int64 produced wrong result (truncation/size bug)"; exit 1; }
           echo "PASS: int64 for_each executed correctly end-to-end on the GPU"
 
+      - name: "GATE (double): end-to-end execution (Float64)"
+        run: |
+          cat > probe_f64.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<double> d(64, 1.0);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [](double& x) { x = x * 2.0 + 1.0; });
+              std::printf("f64 result=%.1f expected=3.0\n", d[0]);
+              return (d[0] == 3.0) ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -O2 probe_f64.cpp \
+            -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_f64.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_f64.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_f64 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_f64 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::double kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "f64 result=3.0 expected=3.0" \
+            || { echo "::error::double produced wrong result"; exit 1; }
+          echo "PASS: double for_each executed correctly end-to-end on the GPU"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
