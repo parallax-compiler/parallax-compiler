@@ -33,9 +33,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: parallax-compiler/parallax-runtime
-          # TEMP: Phase 2d needs the runtime's push-constant change (host_base/
-          # dev_base) which is on phase-2-physptr; restore to main before merge.
-          ref: phase-2-physptr
+          ref: main
           path: parallax-runtime
 
       - name: Install LLVM/Clang 21, Vulkan + lavapipe, spirv-tools
