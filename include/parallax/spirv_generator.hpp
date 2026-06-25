@@ -37,6 +37,17 @@ public:
     std::vector<uint32_t> generate_from_lambda(
         llvm::Function* lambda_func,
         const std::vector<std::string>& param_types);
+
+    // Phase 3: the kernel's scalar element kind for fixed-skeleton primitives
+    // (reduce/scan/…). SPIR-V types are emitted directly, so no LLVM type/context
+    // is needed — just the element's width and float/int-ness.
+    enum class ReduceElemType { F32, F64, I32, I64 };
+
+    // Emit a workgroup tree-reduction kernel (the '+' reduce primitive) for the
+    // given element type. Mirrors shaders/reduce.comp: shared memory + barriers,
+    // one partial per workgroup, fully unrolled (no loop/OpPhi). Logical GLSL450
+    // memory model. The runtime dispatches it iteratively (see launch_reduce).
+    std::vector<uint32_t> generate_reduce_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);

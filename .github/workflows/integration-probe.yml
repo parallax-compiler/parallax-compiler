@@ -303,6 +303,56 @@ jobs:
             || { echo "::error::pointer-chasing produced wrong result (relocation/deref bug)"; exit 1; }
           echo "PASS: GPU dereferenced a host pointer stored in unified memory (pointer-chasing)"
 
+      - name: "GATE (reduce): std::reduce(par) offloads a workgroup reduction"
+        run: |
+          # First Phase 3 primitive end-to-end from user code: the plugin detects
+          # std::reduce, emits a workgroup tree-reduction kernel (shared memory +
+          # OpControlBarrier, fully unrolled), and replaces the call with a value-
+          # yielding statement-expression that runs the iterative GPU reduction.
+          cat > probe_reduce.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(4096);
+              for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(i % 8);
+              // 4096/8 cycles * (0+..+7) = 512 * 28 = 14336, exact in float.
+              float s = std::reduce(std::execution::par, v.begin(), v.end(), 0.0f);
+              std::printf("reduce result=%.1f expected=14336.0\n", s);
+              return (s == 14336.0f) ? 0 : 1;
+          }
+          EOF
+          # Rewrite in place + dump the emitted reduce kernel; validate it.
+          PARALLAX_DUMP_SPIRV="$PWD/red.spv" "$CLANGXX" -std=c++20 \
+            -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_reduce.cpp -o /dev/null 2> reduce.log || true
+          if [ -f red.spv ]; then
+            echo "===== spirv-val ====="; spirv-val red.spv \
+              || { echo "::error::reduce SPIR-V failed validation"; exit 1; }
+            echo "===== reduce kernel (barrier/shared-mem) ====="
+            spirv-dis red.spv 2>/dev/null | grep -iE "OpControlBarrier|Workgroup|OpExecutionMode|OpTypeRuntimeArray" | head -12 || true
+            spirv-dis red.spv 2>/dev/null | grep -q "OpControlBarrier" \
+              || { echo "::error::no OpControlBarrier — reduction not emitted"; exit 1; }
+          else
+            echo "::error::no reduce SPIR-V produced (std::reduce not detected/generated)"; exit 1
+          fi
+          echo "===== rewritten std::reduce site ====="
+          grep -n "parallax_reduce\|GPU reduce" probe_reduce.cpp | head -3 || true
+          # Compile the rewritten source + link runtime, then run on lavapipe.
+          "$CLANGXX" -std=c++20 -O2 probe_reduce.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out \
+            -lparallax-runtime -o probe_reduce 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_reduce 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::reduce kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "reduce result=14336.0" \
+            || { echo "::error::reduce produced wrong result"; exit 1; }
+          echo "PASS: std::reduce(par) offloaded a GPU workgroup reduction (result=14336)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

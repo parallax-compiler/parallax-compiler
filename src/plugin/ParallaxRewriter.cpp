@@ -42,6 +42,13 @@ struct TransformInfo {
     std::string kernel_name;
     std::vector<uint32_t> spirv;
 
+    // Phase 3: reduce. is_reduce selects the value-yielding replacement; init_expr
+    // is the optional std::reduce init argument; elem_type_str is the C++ element
+    // type spelling used to declare the accumulator in the generated code.
+    bool is_reduce = false;
+    clang::Expr* init_expr = nullptr;
+    std::string elem_type_str;
+
     // NEW V2: Class context for function objects
     ClassContext class_context;
     bool is_function_object = false;
@@ -231,6 +238,37 @@ void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
 
 std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) {
     std::ostringstream ss;
+
+    // Phase 3: std::reduce yields a value, so it is replaced by a GNU statement-
+    // expression ({ ...; result; }) that loads the reduction kernel, runs the GPU
+    // reduction over the range, and combines the init on the host. The kernel uses
+    // the '+' identity 0; the accumulator type is the element's C++ spelling.
+    if (transform.is_reduce) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        std::string init = transform.init_expr
+            ? getSourceText(transform.init_expr->getSourceRange())
+            : (et + "()");
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU reduce (" << et << ") */\n";
+        rs << generateSPIRVArray(k, transform.spirv);
+        rs << "  static parallax_kernel_t " << k << " = nullptr;\n";
+        rs << "  if (!" << k << ") " << k << " = parallax_kernel_load("
+           << k << "_spirv, sizeof(" << k << "_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_count = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  " << et << " __plx_gpu = " << et << "();\n";
+        rs << "  parallax_reduce(" << k << ", (void*)&(*__plx_first), __plx_count, sizeof("
+           << et << "), &__plx_gpu);\n";
+        rs << "  " << et << " __plx_result = (" << init << ") + __plx_gpu;\n";
+        rs << "  __plx_result;\n";
+        rs << "})";
+        return rs.str();
+    }
 
     // NEW: For now, we'll still skip kernels with class reference captures
     // TODO: In the future, we could extract individual members from the class
@@ -728,6 +766,63 @@ public:
         TransformInfo info;
         info.call_expr = call;
         info.algorithm_name = extractAlgorithmName(call);
+
+        // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
+        // it takes a dedicated path: generate the fixed reduction kernel and a
+        // value-producing replacement.
+        if (info.algorithm_name == "reduce") {
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            if (!info.first_iterator || !info.last_iterator) {
+                llvm::errs() << "[ParallaxCollector] reduce: missing iterators; leaving on CPU\n";
+                return true;
+            }
+            info.init_expr = (call->getNumArgs() >= 4) ? call->getArg(3) : nullptr;
+
+            // Determine the element type from the source container (and mark it for
+            // arena allocation); fall back to the init argument's type.
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) {
+                    rewriter_.markContainerForAllocation(c);
+                }
+            }
+            if (elemQT.isNull() && info.init_expr) elemQT = info.init_expr->getType();
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] reduce: element type undetermined; leaving on CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            SPIRVGenerator::ReduceElemType ek;
+            if (elemQT->isRealFloatingType()) {
+                ek = context_.getTypeSize(elemQT) >= 64 ? SPIRVGenerator::ReduceElemType::F64
+                                                        : SPIRVGenerator::ReduceElemType::F32;
+            } else if (elemQT->isIntegerType()) {
+                ek = context_.getTypeSize(elemQT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
+                                                        : SPIRVGenerator::ReduceElemType::I32;
+            } else {
+                llvm::errs() << "[ParallaxCollector] reduce: unsupported element type "
+                             << info.elem_type_str << "; leaving on CPU\n";
+                return true;
+            }
+
+            info.is_reduce = true;
+            info.kernel_name = generateKernelName(info);
+
+            SPIRVGenerator spirv_gen;
+            spirv_gen.set_target_vulkan_version(1, 2);
+            info.spirv = spirv_gen.generate_reduce_kernel(ek);
+            if (info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] reduce: SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] reduce: generated " << info.spirv.size()
+                         << " SPIR-V words for element " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
 
         // Skip unsupported algorithms gracefully (leave them as CPU code)
         if (info.algorithm_name != "for_each" && info.algorithm_name != "for_each_n" &&
