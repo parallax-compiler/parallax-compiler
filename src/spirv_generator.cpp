@@ -46,6 +46,7 @@ enum class SPIRVOp : uint32_t {
     OpConstantFalse = 42,
     OpConstant = 43,
     OpConstantComposite = 44,
+    OpConstantNull = 46,
     OpFunction = 54,
     OpFunctionParameter = 55,
     OpFunctionEnd = 56,
@@ -700,15 +701,29 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
     builder.set_section(SPIRVBuilder::Section::Types);
     
     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c)) {
-        uint32_t val = (uint32_t)ci->getZExtValue();
-        builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
+        uint64_t v = ci->getZExtValue();
+        if (ci->getBitWidth() > 32) {
+            // A 64-bit OpConstant value occupies two words (low, high).
+            builder.emit_op(SPIRVOp::OpConstant,
+                            {ty, id, (uint32_t)(v & 0xFFFFFFFFu), (uint32_t)(v >> 32)});
+        } else {
+            builder.emit_op(SPIRVOp::OpConstant, {ty, id, (uint32_t)v});
+        }
     } else if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c)) {
-        float fval = cf->getValueAPF().convertToFloat();
-        uint32_t val;
-        std::memcpy(&val, &fval, sizeof(float));
-        builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
+        if (c->getType()->isDoubleTy()) {
+            double dval = cf->getValueAPF().convertToDouble();
+            uint64_t bits;
+            std::memcpy(&bits, &dval, sizeof(double));
+            builder.emit_op(SPIRVOp::OpConstant,
+                            {ty, id, (uint32_t)(bits & 0xFFFFFFFFu), (uint32_t)(bits >> 32)});
+        } else {
+            float fval = cf->getValueAPF().convertToFloat();
+            uint32_t val;
+            std::memcpy(&val, &fval, sizeof(float));
+            builder.emit_op(SPIRVOp::OpConstant, {ty, id, val});
+        }
     } else if (llvm::isa<llvm::ConstantPointerNull>(c)) {
-        builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0});
+        builder.emit_op(SPIRVOp::OpConstantNull, {ty, id});
     } else {
         builder.emit_op(SPIRVOp::OpConstant, {ty, id, 0}); // Fallback
     }
