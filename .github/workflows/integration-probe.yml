@@ -214,6 +214,37 @@ jobs:
             || { echo "::error::double produced wrong result"; exit 1; }
           echo "PASS: double for_each executed correctly end-to-end on the GPU"
 
+      - name: "GATE (zero-copy): arena-backed for_each binds without a copy"
+        run: |
+          cat > probe_zc.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> d(64, 1.0f);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("zc result=%.1f expected=3.0\n", d[0]);
+              return d[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_zc.cpp -o /dev/null 2>/dev/null || true
+          # Link the interposition lib so std::vector storage is arena-backed.
+          "$CLANGXX" -std=c++20 -O2 probe_zc.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out \
+            -lparallax-interpose -lparallax-runtime -o probe_zc 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_zc 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Zero-copy arena bind" \
+            || { echo "::error::data was NOT zero-copy arena-bound"; exit 1; }
+          echo "$out" | grep -q "zc result=3.0" \
+            || { echo "::error::zero-copy kernel produced wrong result"; exit 1; }
+          echo "PASS: arena-backed for_each ran zero-copy (no memcpy) and is correct"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
