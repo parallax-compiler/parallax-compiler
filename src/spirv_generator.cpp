@@ -980,10 +980,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     auto U = [&](uint32_t v) -> uint32_t {
         auto it = uconst.find(v);
         if (it != uconst.end()) return it->second;
+        // Constants live in the Types section; restore the caller's section so
+        // body instructions emitted after a U() call stay inside their block.
+        SPIRVBuilder::Section prev = B.get_current_section();
         B.set_section(SPIRVBuilder::Section::Types);
         uint32_t id = B.get_next_id();
         B.emit_op(SPIRVOp::OpConstant, {uint_t, id, v});
         uconst[v] = id;
+        B.set_section(prev);
         return id;
     };
 
