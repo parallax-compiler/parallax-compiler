@@ -235,7 +235,7 @@ jobs:
           # Link the interposition lib so std::vector storage is arena-backed.
           "$CLANGXX" -std=c++20 -O2 probe_zc.cpp \
             -I parallax-runtime/include -L parallax-runtime/out \
-            -lparallax-interpose -lparallax-runtime -o probe_zc 2>&1 | tail -3
+            -Wl,--no-as-needed -lparallax-interpose -lparallax-runtime -o probe_zc 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
           out="$(./probe_zc 2>&1)" || true
           echo "$out"
