@@ -33,7 +33,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: parallax-compiler/parallax-runtime
-          ref: main
+          # TEMP: Phase 2d needs the runtime's push-constant change (host_base/
+          # dev_base) which is on phase-2-physptr; restore to main before merge.
+          ref: phase-2-physptr
           path: parallax-runtime
 
       - name: Install LLVM/Clang 21, Vulkan + lavapipe, spirv-tools
@@ -250,6 +252,58 @@ jobs:
           echo "$out" | grep -q "zc result=3.0" \
             || { echo "::error::zero-copy kernel produced wrong result"; exit 1; }
           echo "PASS: arena for_each ran zero-copy (no memcpy) and is correct"
+
+      - name: "GATE (pointer-chasing): deref a host pointer stored in the data"
+        run: |
+          # The marquee software-unified-memory unlock: the data buffer stores
+          # raw host pointers (float*), and the lambda dereferences one. On the
+          # GPU each stored pointer is relocated gpu=dev_base+(p-host_base) and
+          # accessed via PhysicalStorageBuffer. ptrs[] and targets[] both live in
+          # the single arena so one (host_base,dev_base) pair relocates them all.
+          cat > probe_pc.cpp <<'EOF'
+          #include <algorithm>
+          #include <execution>
+          #include <cstddef>
+          #include <cstdio>
+          extern "C" void* parallax_arena_alloc(size_t size, size_t align);
+          int main() {
+              const int N = 64;
+              float*  targets = static_cast<float*>(parallax_arena_alloc(N * sizeof(float), 16));
+              float** ptrs    = static_cast<float**>(parallax_arena_alloc(N * sizeof(float*), 16));
+              if (!targets || !ptrs) { std::printf("SKIP: no arena\n"); return 0; }
+              for (int i = 0; i < N; ++i) { targets[i] = 1.0f; ptrs[i] = &targets[i]; }
+              // for_each over the pointer array; each element is a float* we deref.
+              std::for_each(std::execution::par, ptrs, ptrs + N,
+                            [](float*& p) { *p = *p * 2.0f + 1.0f; });
+              std::printf("pc result=%.1f expected=3.0\n", targets[0]);
+              return targets[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          # Dump + validate the emitted SPIR-V and confirm the relocation opcodes.
+          PARALLAX_DUMP_SPIRV="$PWD/pc.spv" "$CLANGXX" -std=c++20 \
+            -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_pc.cpp -o /dev/null 2> pc.log || true
+          if [ -f pc.spv ]; then
+            echo "===== spirv-val ====="; spirv-val pc.spv \
+              || { echo "::error::pointer-chasing SPIR-V failed validation"; exit 1; }
+            echo "===== spirv-dis (relocation) ====="
+            spirv-dis pc.spv 2>/dev/null | grep -iE "OpConvertUToPtr|PhysicalStorageBuffer|OpISub|OpIAdd" | head -20 || true
+            spirv-dis pc.spv 2>/dev/null | grep -q "OpConvertUToPtr" \
+              || { echo "::error::no OpConvertUToPtr — pointer relocation not emitted"; exit 1; }
+          else
+            echo "::error::no pc.spv produced (kernel not generated)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_pc.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out \
+            -lparallax-runtime -o probe_pc 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_pc 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "SKIP:" && { echo "skipped (no arena)"; exit 0; }
+          echo "$out" | grep -q "pc result=3.0" \
+            || { echo "::error::pointer-chasing produced wrong result (relocation/deref bug)"; exit 1; }
+          echo "PASS: GPU dereferenced a host pointer stored in unified memory (pointer-chasing)"
 
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |

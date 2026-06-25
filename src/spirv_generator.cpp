@@ -2,6 +2,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <iostream>
@@ -65,6 +66,7 @@ enum class SPIRVOp : uint32_t {
     OpCompositeInsert = 82,
     OpCopyObject = 83,
     OpTranspose = 84,
+    OpConvertUToPtr = 120,
     OpBitcast = 124,
     OpSNegate = 126,
     OpFNegate = 127,
@@ -360,13 +362,24 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
         value_map[&arg] = arg_id;
     }
     
+    // Pointer-chasing relocation bases are loaded lazily but must dominate every
+    // dereference; reset the per-function cache and load them at the entry block.
+    reloc_host_base_id_ = 0;
+    reloc_dev_base_id_ = 0;
+
     // Translate basic blocks
+    bool is_entry_block = true;
     for (auto& bb : *func) {
         // ... (label handling)
         uint32_t label_id = builder.get_next_id();
         value_map[&bb] = label_id;
         builder.emit_op(SPIRVOp::OpLabel, {label_id});
-        
+
+        if (is_entry_block && element_is_pointer_) {
+            ensure_reloc_bases(builder, func->getContext());
+        }
+        is_entry_block = false;
+
         // Translate instructions
         for (auto& inst : bb) {
             translate_instruction(builder, &inst, value_map);
@@ -374,6 +387,12 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     }
     
     builder.emit_op(SPIRVOp::OpFunctionEnd, {});
+}
+
+// Byte alignment for a PhysicalStorageBuffer access of `t` (Aligned operand).
+static uint32_t spirv_align_of(llvm::Type* t) {
+    uint32_t bytes = static_cast<uint32_t>(t->getPrimitiveSizeInBits() / 8);
+    return bytes < 4 ? 4 : bytes;
 }
 
 void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
@@ -441,15 +460,46 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         }
         
         case llvm::Instruction::Load: {
-            uint32_t ptr = get_value_id(builder, inst->getOperand(0), value_map);
-            builder.emit_op(SPIRVOp::OpLoad, {get_type_id(builder, inst->getType()), result_id, ptr});
+            llvm::Value* ptr_operand = inst->getOperand(0);
+            llvm::LLVMContext& ctx = inst->getType()->getContext();
+            if (relocatable_values_.count(ptr_operand)) {
+                // Dereference a chased host pointer: relocate it to a device
+                // PhysicalStorageBuffer pointer and load with an Aligned operand.
+                uint32_t host_addr = get_value_id(builder, ptr_operand, value_map);
+                uint32_t pp = emit_relocate(builder, host_addr, inst->getType(), ctx);
+                builder.emit_op(SPIRVOp::OpLoad,
+                                {get_type_id(builder, inst->getType()), result_id, pp,
+                                 0x2 /* Aligned */, spirv_align_of(inst->getType())});
+            } else if (element_is_pointer_ && inst->getType()->isPointerTy()) {
+                // Loading a stored pointer out of the data buffer yields a uint64
+                // host address that must be relocated before any dereference.
+                uint32_t ptr = get_value_id(builder, ptr_operand, value_map);
+                uint32_t u64 = get_type_id(builder, llvm::Type::getInt64Ty(ctx));
+                builder.emit_op(SPIRVOp::OpLoad, {u64, result_id, ptr});
+                relocatable_values_.insert(inst);
+            } else {
+                uint32_t ptr = get_value_id(builder, ptr_operand, value_map);
+                builder.emit_op(SPIRVOp::OpLoad, {get_type_id(builder, inst->getType()), result_id, ptr});
+            }
             break;
         }
-        
+
         case llvm::Instruction::Store: {
-            uint32_t value = get_value_id(builder, inst->getOperand(0), value_map);
-            uint32_t ptr = get_value_id(builder, inst->getOperand(1), value_map);
-            builder.emit_op(SPIRVOp::OpStore, {ptr, value});
+            llvm::Value* val_operand = inst->getOperand(0);
+            llvm::Value* ptr_operand = inst->getOperand(1);
+            if (relocatable_values_.count(ptr_operand)) {
+                // Store through a chased host pointer via PhysicalStorageBuffer.
+                llvm::LLVMContext& ctx = val_operand->getType()->getContext();
+                uint32_t value = get_value_id(builder, val_operand, value_map);
+                uint32_t host_addr = get_value_id(builder, ptr_operand, value_map);
+                uint32_t pp = emit_relocate(builder, host_addr, val_operand->getType(), ctx);
+                builder.emit_op(SPIRVOp::OpStore,
+                                {pp, value, 0x2 /* Aligned */, spirv_align_of(val_operand->getType())});
+            } else {
+                uint32_t value = get_value_id(builder, val_operand, value_map);
+                uint32_t ptr = get_value_id(builder, ptr_operand, value_map);
+                builder.emit_op(SPIRVOp::OpStore, {ptr, value});
+            }
             break;
         }
 
@@ -642,10 +692,17 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
     } else if (type->isPointerTy()) {
         // LLVM 21 opaque pointers carry no pointee type; use the kernel's active
         // element type (set per generate_from_lambda) instead of assuming float.
-        llvm::Type* element_type = active_element_type_
-                                       ? active_element_type_
-                                       : llvm::Type::getFloatTy(type->getContext());
-        uint32_t el_ty_id = get_type_id(builder, element_type);
+        // For a pointer-chasing kernel the data element is itself a pointer, so a
+        // descriptor-resident pointer addresses a uint64 (the stored host address).
+        uint32_t el_ty_id;
+        if (element_is_pointer_) {
+            el_ty_id = get_type_id(builder, llvm::Type::getInt64Ty(type->getContext()));
+        } else {
+            llvm::Type* element_type = active_element_type_
+                                           ? active_element_type_
+                                           : llvm::Type::getFloatTy(type->getContext());
+            el_ty_id = get_type_id(builder, element_type);
+        }
         // Use cached pointer type helper
         uint32_t ptr_ty = get_pointer_type_id(builder, el_ty_id, 12 /* StorageBuffer */);
         type_cache_[type] = ptr_ty;
@@ -820,6 +877,11 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     // parameter is the element pointer (recover its pointee). transform: the
     // first parameter is the element value.
     active_element_type_ = nullptr;
+    element_is_pointer_ = false;
+    relocatable_values_.clear();
+    pc_var_id_ = 0;
+    reloc_host_base_id_ = 0;
+    reloc_dev_base_id_ = 0;
     if (is_transform) {
         if (lambda_func->arg_size() > 0) {
             active_element_type_ = lambda_func->getArg(0)->getType();
@@ -832,13 +894,24 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
             }
         }
     }
-    if (active_element_type_ &&
-        (active_element_type_->isVoidTy() || active_element_type_->isPointerTy())) {
+    if (active_element_type_ && active_element_type_->isPointerTy()) {
+        // The kernel dereferences a pointer stored in the data (pointer-chasing /
+        // software unified memory). The data buffer holds uint64 host addresses;
+        // each dereference relocates to a device PhysicalStorageBuffer pointer.
+        element_is_pointer_ = true;
+        active_element_type_ = nullptr;
+        llvm::errs() << "[SPIRVGenerator] Kernel element is a pointer (pointer-chasing); "
+                        "data buffer holds uint64 host addresses\n";
+    } else if (active_element_type_ && active_element_type_->isVoidTy()) {
         active_element_type_ = nullptr;  // unsupported; fall back to float
     }
     if (active_element_type_) {
         llvm::errs() << "[SPIRVGenerator] Kernel element type: " << *active_element_type_ << "\n";
     }
+
+    // Create the push-constant block (count [+ host_base/dev_base for pointer
+    // kernels]) before translating the lambda, so the body can read the bases.
+    setup_push_constants(builder, lambda_func->getContext());
 
     translate_function(builder, lambda_func, lambda_id, buffer_param_indices);
 
@@ -879,7 +952,99 @@ uint32_t SPIRVGenerator::get_pointer_type_id(SPIRVBuilder& builder, uint32_t ele
     return type_id;
 }
 
-void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, 
+// The SPIR-V type id of one data-buffer element. For an ordinary kernel this is
+// the active element type (float/int/double); for a pointer-chasing kernel the
+// stored element is a 64-bit host address, so the buffer holds uint64.
+uint32_t SPIRVGenerator::data_element_type_id(SPIRVBuilder& builder, llvm::LLVMContext& ctx) {
+    if (element_is_pointer_) {
+        return get_type_id(builder, llvm::Type::getInt64Ty(ctx));
+    }
+    llvm::Type* t = active_element_type_ ? active_element_type_ : llvm::Type::getFloatTy(ctx);
+    return get_type_id(builder, t);
+}
+
+// Create the push-constant block and variable once, before the lambda body is
+// translated (so the body can read host_base/dev_base and the wrapper can read
+// count). Layout matches the runtime's push: { uint count @0 } for ordinary
+// kernels, extended to { uint count @0, uint64 host_base @8, uint64 dev_base @16 }
+// for pointer-chasing kernels. count stays at offset 0 in both, so ordinary
+// kernels are unaffected.
+void SPIRVGenerator::setup_push_constants(SPIRVBuilder& builder, llvm::LLVMContext& ctx) {
+    uint32_t int_id = get_type_id(builder, llvm::Type::getInt32Ty(ctx));
+    pc_int32_id_ = int_id;
+
+    builder.set_section(SPIRVBuilder::Section::Types);
+    uint32_t pc_struct_id = builder.get_next_id();
+    if (element_is_pointer_) {
+        uint32_t u64 = get_type_id(builder, llvm::Type::getInt64Ty(ctx));
+        builder.set_section(SPIRVBuilder::Section::Types);
+        builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id, u64, u64});
+        builder.set_section(SPIRVBuilder::Section::Decorations);
+        builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
+        builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 1, 35 /* Offset */, 8});
+        builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 2, 35 /* Offset */, 16});
+        builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
+    } else {
+        builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id});
+        builder.set_section(SPIRVBuilder::Section::Decorations);
+        builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
+        builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
+    }
+
+    uint32_t ptr_pc_id = get_pointer_type_id(builder, pc_struct_id, 9 /* PushConstant */);
+
+    builder.set_section(SPIRVBuilder::Section::Types);
+    pc_var_id_ = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpVariable, {ptr_pc_id, pc_var_id_, 9 /* PushConstant */});
+}
+
+// Load host_base/dev_base from the push-constant block once per lambda function
+// (cached in reloc_*_base_id_). Emitted at the lambda's entry block so the values
+// dominate every dereference site.
+void SPIRVGenerator::ensure_reloc_bases(SPIRVBuilder& builder, llvm::LLVMContext& ctx) {
+    if (reloc_host_base_id_ != 0) return;
+    uint32_t u64 = get_type_id(builder, llvm::Type::getInt64Ty(ctx));
+    llvm::Type* i32 = llvm::Type::getInt32Ty(ctx);
+    uint32_t ptr_u64_pc = get_pointer_type_id(builder, u64, 9 /* PushConstant */);
+    uint32_t one = get_constant_id(builder, llvm::ConstantInt::get(i32, 1));
+    uint32_t two = get_constant_id(builder, llvm::ConstantInt::get(i32, 2));
+
+    builder.set_section(SPIRVBuilder::Section::Code);
+    uint32_t p_host = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpAccessChain, {ptr_u64_pc, p_host, pc_var_id_, one});
+    reloc_host_base_id_ = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpLoad, {u64, reloc_host_base_id_, p_host});
+
+    uint32_t p_dev = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpAccessChain, {ptr_u64_pc, p_dev, pc_var_id_, two});
+    reloc_dev_base_id_ = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpLoad, {u64, reloc_dev_base_id_, p_dev});
+}
+
+// Relocate a loaded host address into a device PhysicalStorageBuffer pointer:
+//   gpu = dev_base + (host_addr - host_base)
+// then OpConvertUToPtr to a pointer to `pointee`. The caller issues the load/
+// store through the returned pointer with an Aligned memory operand.
+uint32_t SPIRVGenerator::emit_relocate(SPIRVBuilder& builder, uint32_t host_addr_id,
+                                       llvm::Type* pointee, llvm::LLVMContext& ctx) {
+    ensure_reloc_bases(builder, ctx);
+    uint32_t u64 = get_type_id(builder, llvm::Type::getInt64Ty(ctx));
+
+    builder.set_section(SPIRVBuilder::Section::Code);
+    uint32_t off = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpISub, {u64, off, host_addr_id, reloc_host_base_id_});
+    uint32_t gpu = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpIAdd, {u64, gpu, reloc_dev_base_id_, off});
+
+    uint32_t pelem = get_type_id(builder, pointee);
+    uint32_t pptr = get_pointer_type_id(builder, pelem, 5349 /* PhysicalStorageBuffer */);
+    uint32_t pp = builder.get_next_id();
+    builder.set_section(SPIRVBuilder::Section::Code);
+    builder.emit_op(SPIRVOp::OpConvertUToPtr, {pptr, pp, gpu});
+    return pp;
+}
+
+void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id,
                                             uint32_t lambda_func_id, llvm::Function* lambda_func) {
     // 1. Setup Types & Globals (in Types/Decorations Sections)
     
@@ -890,10 +1055,17 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     uint32_t int_id = get_type_id(builder, int32_ty);
 
     // The data buffer element type — the kernel's active element type, not float.
-    llvm::Type* data_elem_ty = active_element_type_ ? active_element_type_ : float_ty;
-    uint32_t data_elem_id = get_type_id(builder, data_elem_ty);
-    uint32_t data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
-    if (data_elem_stride < 4) data_elem_stride = 4;
+    // For a pointer-chasing kernel the stored element is a uint64 host address.
+    llvm::LLVMContext& ctx = lambda_func->getContext();
+    uint32_t data_elem_id = data_element_type_id(builder, ctx);
+    uint32_t data_elem_stride;
+    if (element_is_pointer_) {
+        data_elem_stride = 8;
+    } else {
+        llvm::Type* data_elem_ty = active_element_type_ ? active_element_type_ : float_ty;
+        data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
+        if (data_elem_stride < 4) data_elem_stride = 4;
+    }
 
     // RuntimeArray { element }
     builder.set_section(SPIRVBuilder::Section::Types);
@@ -1045,22 +1217,9 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         binding_idx++;
     }
 
-    // Push Constants now only contain count (no captures!)
-    builder.set_section(SPIRVBuilder::Section::Types);
-    uint32_t pc_struct_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpTypeStruct, {pc_struct_id, int_id});  // Just { uint count }
-
-    builder.set_section(SPIRVBuilder::Section::Decorations);
-    builder.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct_id, 0, 35 /* Offset */, 0});
-    builder.emit_op(SPIRVOp::OpDecorate, {pc_struct_id, 2 /* Block */});
-
-    // Pointer PushConstant Struct
-    uint32_t ptr_pc_id = get_pointer_type_id(builder, pc_struct_id, 9 /* PushConstant */);
-
-    // PC Variable
-    builder.set_section(SPIRVBuilder::Section::Types);
-    uint32_t pc_var_id = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpVariable, {ptr_pc_id, pc_var_id, 9});
+    // Push constants were created up front (setup_push_constants): { uint count }
+    // for ordinary kernels, extended with host_base/dev_base for pointer-chasing.
+    // count is at member 0 in both layouts.
 
     // GlobalInvocationID Builtin
     builder.set_section(SPIRVBuilder::Section::Types);
@@ -1085,7 +1244,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     builder.emit_word(0x00000000); // "\0..."
     builder.emit_word(gl_id_var_id);
     for (auto id : buffer_var_ids) builder.emit_word(id);
-    builder.emit_word(pc_var_id);
+    builder.emit_word(pc_var_id_);
     if (captures_var_id != 0) builder.emit_word(captures_var_id);
     
     builder.emit_op(SPIRVOp::OpExecutionMode, {entry_id, 17 /* LocalSize */, 256, 1, 1});
@@ -1111,7 +1270,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     uint32_t Zero = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, 0));
     uint32_t ptr_int_pc = get_pointer_type_id(builder, int_id, 9 /* PushConstant */);
     uint32_t ptr_count = builder.get_next_id();
-    builder.emit_op(SPIRVOp::OpAccessChain, {ptr_int_pc, ptr_count, pc_var_id, Zero});
+    builder.emit_op(SPIRVOp::OpAccessChain, {ptr_int_pc, ptr_count, pc_var_id_, Zero});
     uint32_t count = builder.get_next_id();
     builder.emit_op(SPIRVOp::OpLoad, {int_id, count, ptr_count});
     

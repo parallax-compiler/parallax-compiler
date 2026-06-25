@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 
 namespace parallax {
@@ -69,6 +70,19 @@ private:
     // Kernel generation helpers
     void generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t entry_id, uint32_t lambda_func_id, llvm::Function* lambda_func);
 
+    // Phase 2d (pointer-chasing / software unified memory). When the kernel's
+    // data element is itself a pointer (e.g. a stored float* / Node::next), it is
+    // a 64-bit HOST address that must be relocated before it can be dereferenced
+    // on the device: gpu = dev_base + (host_ptr - host_base). These helpers
+    // create the push-constant block carrying {count, host_base, dev_base}, treat
+    // the data element as uint64, and emit the relocation + PhysicalStorageBuffer
+    // load/store at each dereference of a loaded pointer.
+    void     setup_push_constants(SPIRVBuilder& builder, llvm::LLVMContext& ctx);
+    uint32_t data_element_type_id(SPIRVBuilder& builder, llvm::LLVMContext& ctx);
+    void     ensure_reloc_bases(SPIRVBuilder& builder, llvm::LLVMContext& ctx);
+    uint32_t emit_relocate(SPIRVBuilder& builder, uint32_t host_addr_id,
+                           llvm::Type* pointee, llvm::LLVMContext& ctx);
+
     // Emit an OpCapability into the Capabilities section exactly once. Used to
     // declare Int64 / Float64 lazily when those types appear, so we emit real
     // 64-bit types instead of silently truncating them.
@@ -88,6 +102,21 @@ private:
     // lambda's pointer parameters, and element loads/stores all use it. Set per
     // generate_from_lambda(); null falls back to float.
     llvm::Type* active_element_type_ = nullptr;
+
+    // Phase 2d state. element_is_pointer_ is set when the data element is a
+    // pointer: the data buffer then stores uint64 host addresses. pc_var_id_ /
+    // pc_int32_id_ are the push-constant variable and its uint32 type, created
+    // once up front so both the lambda body (relocation) and the wrapper (count)
+    // can reference them. reloc_*_base_id_ are the host_base/dev_base values
+    // loaded once at the lambda's entry block (reset per function).
+    // relocatable_values_ marks SSA values that are loaded host pointers and so
+    // must be relocated before any dereference.
+    bool        element_is_pointer_ = false;
+    uint32_t    pc_var_id_ = 0;
+    uint32_t    pc_int32_id_ = 0;
+    uint32_t    reloc_host_base_id_ = 0;
+    uint32_t    reloc_dev_base_id_ = 0;
+    std::unordered_set<llvm::Value*> relocatable_values_;
 };
 
 } // namespace parallax
