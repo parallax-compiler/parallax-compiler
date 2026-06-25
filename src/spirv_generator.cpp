@@ -770,13 +770,16 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     emitted_capabilities_.clear();
     require_capability(builder, 1);    // Shader
     require_capability(builder, 4441); // VariablePointersStorageBuffer
+    require_capability(builder, 5347); // PhysicalStorageBufferAddresses (Phase 2)
 
     builder.set_section(SPIRVBuilder::Section::Preamble);
-    std::string ext_name = "SPV_KHR_variable_pointers";
-    uint32_t ext_wc = 1 + (ext_name.length() + 4) / 4;
-    builder.emit_word((ext_wc << 16) | (uint32_t)SPIRVOp::OpExtension);
-    builder.emit_string(ext_name);
-    
+    for (const char* ext : {"SPV_KHR_variable_pointers", "SPV_KHR_physical_storage_buffer"}) {
+        std::string ext_name = ext;
+        uint32_t ext_wc = 1 + (ext_name.length() + 4) / 4;
+        builder.emit_word((ext_wc << 16) | (uint32_t)SPIRVOp::OpExtension);
+        builder.emit_string(ext_name);
+    }
+
     // Import GLSL.std.450 (MUST be before MemoryModel)
     glsl_std_id_ = builder.get_next_id();
     std::string glsl_name = "GLSL.std.450";
@@ -785,8 +788,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     builder.emit_word(glsl_std_id_);
     builder.emit_string(glsl_name);
     
-    builder.emit_op(SPIRVOp::OpMemoryModel, {0, 1}); // GLSL450
-    
+    builder.emit_op(SPIRVOp::OpMemoryModel, {5348, 1}); // PhysicalStorageBuffer64 GLSL450
+
     // Translate Lambda Helper
     builder.set_section(SPIRVBuilder::Section::Code);
     uint32_t lambda_id = builder.get_next_id();
