@@ -195,10 +195,13 @@ jobs:
               return (d[0] == 3.0) ? 0 : 1;
           }
           EOF
-          "$CLANGXX" -std=c++20 -O2 probe_f64.cpp \
+          "$CLANGXX" -std=c++20 \
             -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
-            -c probe_f64.cpp -o /dev/null 2>/dev/null || true
+            -c probe_f64.cpp -o /dev/null 2> f64.log || true
+          echo "--- double transform decision ---"
+          grep -inE "for_each|Transforming call|Generated [0-9]+|Kernel element type|spirv.*empty|Float64|operands: 10|CodeGen|Located operator|Unsupported|::error" f64.log | head -30 || true
+          echo "---------------------------------"
           "$CLANGXX" -std=c++20 -O2 probe_f64.cpp \
             -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
             -o probe_f64 2>&1 | tail -3
