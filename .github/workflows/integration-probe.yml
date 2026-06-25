@@ -237,7 +237,9 @@ jobs:
             -I parallax-runtime/include -L parallax-runtime/out \
             -Wl,--no-as-needed -lparallax-interpose -lparallax-runtime -o probe_zc 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          out="$(./probe_zc 2>&1)" || true
+          # LD_PRELOAD guarantees the interposed operator new overrides libstdc++'s
+          # (link-order interposition is unreliable for operator new).
+          out="$(LD_PRELOAD=$PWD/parallax-runtime/out/libparallax-interpose.so ./probe_zc 2>&1)" || true
           echo "$out"
           echo "$out" | grep -q "Zero-copy arena bind" \
             || { echo "::error::data was NOT zero-copy arena-bound"; exit 1; }
