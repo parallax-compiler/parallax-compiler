@@ -299,10 +299,10 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             }
         } else {
             std::string init = transform.init_expr
-                ? getSourceText(transform.init_expr->getSourceRange()) : (et + "()");
+                ? getSourceText(transform.init_expr->getSourceRange()) : (acc + "()");
             std::string rop = getSourceText(transform.reduce_op->getSourceRange());
             rs << "  auto __plx_rop = (" << rop << ");\n";
-            rs << "  " << et << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
+            rs << "  " << acc << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
             rs << "  __plx_result;\n";
         }
         rs << "});";
@@ -919,6 +919,24 @@ public:
             }
             SPIRVGenerator tgen; tgen.set_target_vulkan_version(1, 2);
             info.spirv_transform = tgen.generate_from_lambda(top_func, {"float", "float&"});
+
+            // Accumulator U = the transform op's return type (may differ from the
+            // element T, e.g. float -> int). The scratch + reduce work in U. Until
+            // the runtime supports differing in/out element byte sizes, restrict to
+            // sizeof(U) == sizeof(T).
+            clang::QualType accQT = top_lambda->getCallOperator()->getReturnType();
+            SPIRVGenerator::ReduceElemType ek_acc;
+            if (!elem_kind(accQT, ek_acc)) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: unsupported accumulator type; CPU\n";
+                return true;
+            }
+            if (context_.getTypeSize(accQT) != context_.getTypeSize(elemQT)) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: differing in/out element "
+                                "sizes not yet supported; CPU\n";
+                return true;
+            }
+            info.acc_type_str = accQT.getUnqualifiedType().getAsString();
+            ek = ek_acc;  // the reduce works in the accumulator type
 
             // Reduce kernel from the binary reduce_op: a lambda is compiled and
             // called; std::plus uses the baked-in '+'; other functors are unsupported.

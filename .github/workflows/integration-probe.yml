@@ -461,6 +461,39 @@ jobs:
             || { echo "::error::transform_reduce wrong result (transform or reduce failed)"; exit 1; }
           echo "PASS: std::transform_reduce offloaded (map then reduce composed on GPU)"
 
+      - name: "GATE (transform_reduce T!=U): float elements -> int accumulator"
+        run: |
+          # Type-changing transform_reduce: map float -> int (FPToSI cast), reduce
+          # in int. (int)2.5 = 2 over 256 elements -> 512. Exercises the T!=U output
+          # buffer + the FP->int conversion op.
+          cat > probe_tri.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(256, 2.5f);
+              int r = std::transform_reduce(std::execution::par, v.begin(), v.end(), 0,
+                                            [](int a, int b){ return a + b; },
+                                            [](float x){ return (int)x; });
+              std::printf("tri result=%d expected=512\n", r);
+              return (r == 512) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/tri.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_tri.cpp -o /dev/null 2>/dev/null || true
+          [ -f tri.spv ] && { spirv-val tri.spv || { echo "::error::transform_reduce T!=U SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_tri.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_tri 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_tri 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "tri result=512" \
+            || { echo "::error::transform_reduce float->int produced wrong result"; exit 1; }
+          echo "PASS: type-changing transform_reduce (float->int) offloaded"
+
       - name: "GATE (count_if): predicate count on the GPU"
         run: |
           # count_if = (predicate -> 0/1 transform) then '+' reduce. v[i]=i over

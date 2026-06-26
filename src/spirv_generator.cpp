@@ -66,6 +66,13 @@ enum class SPIRVOp : uint32_t {
     OpCompositeInsert = 82,
     OpCopyObject = 83,
     OpTranspose = 84,
+    OpConvertFToU = 109,
+    OpConvertFToS = 110,
+    OpConvertSToF = 111,
+    OpConvertUToF = 112,
+    OpUConvert = 113,
+    OpSConvert = 114,
+    OpFConvert = 115,
     OpConvertUToPtr = 120,
     OpBitcast = 124,
     OpSNegate = 126,
@@ -668,20 +675,66 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
 
         case llvm::Instruction::ZExt:
         case llvm::Instruction::SExt: {
-            // Widening integer cast (e.g. i1 -> i32). SPIR-V has no direct zext/sext
-            // of a bool, so select between 1 and 0 of the target type.
+            // Integer widening (e.g. i1 -> i32, i32 -> i64). SPIR-V has no direct
+            // zext/sext of a bool, so select between 1 and 0; otherwise S/UConvert.
             llvm::Type* dst = inst->getType();
             uint32_t dst_id = get_type_id(builder, dst);
             llvm::Value* src = inst->getOperand(0);
+            uint32_t src_id = get_value_id(builder, src, value_map);
             if (src->getType()->isIntegerTy(1)) {
-                uint32_t cond = get_value_id(builder, src, value_map);
                 uint32_t one = get_constant_id(builder, llvm::ConstantInt::get(dst, 1));
                 uint32_t zero = get_constant_id(builder, llvm::ConstantInt::get(dst, 0));
-                builder.emit_op(SPIRVOp::OpSelect, {dst_id, result_id, cond, one, zero});
+                builder.emit_op(SPIRVOp::OpSelect, {dst_id, result_id, src_id, one, zero});
+            } else if (dst->getPrimitiveSizeInBits() != src->getType()->getPrimitiveSizeInBits()) {
+                SPIRVOp cv = (inst->getOpcode() == llvm::Instruction::SExt)
+                                 ? SPIRVOp::OpSConvert : SPIRVOp::OpUConvert;
+                builder.emit_op(cv, {dst_id, result_id, src_id});
             } else {
-                // Same-width or wider integer: alias (SPIR-V ints are sign-agnostic).
-                value_map[inst] = get_value_id(builder, src, value_map);
+                value_map[inst] = src_id;  // same width: alias
             }
+            break;
+        }
+
+        case llvm::Instruction::Trunc: {
+            // Integer narrowing (e.g. i64 -> i32, or -> i1).
+            llvm::Type* dst = inst->getType();
+            uint32_t src_id = get_value_id(builder, inst->getOperand(0), value_map);
+            if (dst->isIntegerTy(1)) {
+                // To bool: compare low bit != 0.
+                uint32_t one = get_constant_id(
+                    builder, llvm::ConstantInt::get(inst->getOperand(0)->getType(), 1));
+                uint32_t masked = builder.get_next_id();
+                builder.emit_op(SPIRVOp::OpBitwiseAnd,
+                                {get_type_id(builder, inst->getOperand(0)->getType()), masked, src_id, one});
+                uint32_t zero = get_constant_id(
+                    builder, llvm::ConstantInt::get(inst->getOperand(0)->getType(), 0));
+                builder.emit_op(SPIRVOp::OpINotEqual, {get_type_id(builder, dst), result_id, masked, zero});
+            } else {
+                builder.emit_op(SPIRVOp::OpUConvert, {get_type_id(builder, dst), result_id, src_id});
+            }
+            break;
+        }
+
+        case llvm::Instruction::FPExt:
+        case llvm::Instruction::FPTrunc: {
+            uint32_t src_id = get_value_id(builder, inst->getOperand(0), value_map);
+            builder.emit_op(SPIRVOp::OpFConvert, {get_type_id(builder, inst->getType()), result_id, src_id});
+            break;
+        }
+
+        case llvm::Instruction::SIToFP:
+        case llvm::Instruction::UIToFP:
+        case llvm::Instruction::FPToSI:
+        case llvm::Instruction::FPToUI: {
+            uint32_t src_id = get_value_id(builder, inst->getOperand(0), value_map);
+            SPIRVOp cv;
+            switch (inst->getOpcode()) {
+                case llvm::Instruction::SIToFP: cv = SPIRVOp::OpConvertSToF; break;
+                case llvm::Instruction::UIToFP: cv = SPIRVOp::OpConvertUToF; break;
+                case llvm::Instruction::FPToSI: cv = SPIRVOp::OpConvertFToS; break;
+                default:                        cv = SPIRVOp::OpConvertFToU; break;
+            }
+            builder.emit_op(cv, {get_type_id(builder, inst->getType()), result_id, src_id});
             break;
         }
 
