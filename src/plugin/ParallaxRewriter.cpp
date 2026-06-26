@@ -266,7 +266,9 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
            << et << "), &__plx_gpu);\n";
         rs << "  " << et << " __plx_result = (" << init << ") + __plx_gpu;\n";
         rs << "  __plx_result;\n";
-        rs << "})";
+        // Terminate the declaration: the call is consumed up to and including its
+        // trailing ';', so the value-yielding statement-expression supplies its own.
+        rs << "});";
         return rs.str();
     }
 
