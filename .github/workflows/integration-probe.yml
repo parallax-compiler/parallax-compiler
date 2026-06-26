@@ -351,6 +351,51 @@ jobs:
             || { echo "::error::reduce produced wrong result"; exit 1; }
           echo "PASS: std::reduce(par) offloaded a GPU workgroup reduction (result=14336)"
 
+      - name: "GATE (reduce+op): std::reduce with a user binary op (keystone)"
+        run: |
+          # The keystone: the reduction skeleton CALLS the user's compiled binary op
+          # (OpFunctionCall) instead of a baked-in '+'. Product over 300 ones = 1.0,
+          # which is distinct from the sum (300) — so a wrong (baked-in +) path is
+          # caught. Exercises the guarded reduction (partial last block, 2 levels).
+          cat > probe_reduceop.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(300, 1.0f);
+              float p = std::reduce(std::execution::par, v.begin(), v.end(), 1.0f,
+                                    [](float a, float b){ return a * b; });
+              std::printf("reduceop result=%.1f expected=1.0\n", p);
+              return (p == 1.0f) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/redop.spv" "$CLANGXX" -std=c++20 \
+            -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_reduceop.cpp -o /dev/null 2> reduceop.log || true
+          if [ -f redop.spv ]; then
+            echo "===== spirv-val ====="; spirv-val redop.spv \
+              || { echo "::error::reduce+op SPIR-V failed validation"; exit 1; }
+            echo "===== op call + functions ====="
+            spirv-dis redop.spv 2>/dev/null | grep -iE "OpFunctionCall|OpFMul|OpFunction " | head -12 || true
+            spirv-dis redop.spv 2>/dev/null | grep -q "OpFunctionCall" \
+              || { echo "::error::no OpFunctionCall — user op not called by the skeleton"; exit 1; }
+          else
+            echo "::error::no reduce+op SPIR-V produced"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_reduceop.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out \
+            -lparallax-runtime -o probe_reduceop 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_reduceop 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::reduce+op kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "reduceop result=1.0" \
+            || { echo "::error::reduce+op wrong result (user op not applied / identity bug)"; exit 1; }
+          echo "PASS: std::reduce with a user binary op offloaded (skeleton calls compiled op)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

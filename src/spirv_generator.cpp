@@ -936,11 +936,21 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     return spirv;
 }
 
-std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem) {
+std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem,
+                                                             llvm::Function* user_op) {
     // Element kind specifics.
     const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
     const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
     const uint32_t stride = is_wide ? 8 : 4;
+
+    // The user-op body is translated via the shared translate_instruction path,
+    // which uses these member caches/state — start clean (and not pointer-chasing).
+    type_cache_.clear();
+    constant_cache_.clear();
+    pointer_type_cache_.clear();
+    active_element_type_ = nullptr;
+    element_is_pointer_ = false;
+    relocatable_values_.clear();
 
     SPIRVBuilder B;
     B.set_section(SPIRVBuilder::Section::Header);
@@ -1042,6 +1052,38 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17 /*LocalSize*/, 256, 1, 1});
 
+    // ---- Optional user binary op as a callable SPIR-V function ----
+    // Translated through the shared translate_instruction path; its element/int/
+    // bool types are primed to reuse the kernel's so no duplicate types appear.
+    uint32_t op_fn_id = 0;
+    if (user_op) {
+        llvm::LLVMContext& ctx = user_op->getContext();
+        type_cache_[user_op->getReturnType()] = elem_t;
+        type_cache_[llvm::Type::getInt32Ty(ctx)] = uint_t;
+        type_cache_[llvm::Type::getInt1Ty(ctx)]  = bool_t;
+
+        B.set_section(SPIRVBuilder::Section::Types);
+        uint32_t op_fntype = B.get_next_id();
+        B.emit_op(SPIRVOp::OpTypeFunction, {op_fntype, elem_t, elem_t, elem_t});
+
+        B.set_section(SPIRVBuilder::Section::Code);
+        op_fn_id = B.get_next_id();
+        B.emit_op(SPIRVOp::OpFunction, {elem_t, op_fn_id, 0, op_fntype});
+        std::unordered_map<llvm::Value*, uint32_t> op_vmap;
+        for (auto& arg : user_op->args()) {
+            uint32_t pid = B.get_next_id();
+            B.emit_op(SPIRVOp::OpFunctionParameter, {elem_t, pid});
+            op_vmap[&arg] = pid;
+        }
+        // Pre-assign block labels so forward branches resolve.
+        for (auto& bb : *user_op) op_vmap[&bb] = B.get_next_id();
+        for (auto& bb : *user_op) {
+            B.emit_op(SPIRVOp::OpLabel, {op_vmap[&bb]});
+            for (auto& inst : bb) translate_instruction(B, &inst, op_vmap);
+        }
+        B.emit_op(SPIRVOp::OpFunctionEnd, {});
+    }
+
     // ---- Function body ----
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
@@ -1123,7 +1165,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
             uint32_t b = B.get_next_id();
             B.emit_op(SPIRVOp::OpLoad, {elem_t, b, p_b});
             uint32_t sum = B.get_next_id();
-            B.emit_op(add_op, {elem_t, sum, a, b});
+            if (user_op) B.emit_op(SPIRVOp::OpFunctionCall, {elem_t, sum, op_fn_id, a, b});
+            else         B.emit_op(add_op, {elem_t, sum, a, b});
             B.emit_op(SPIRVOp::OpStore, {p_a, sum});
             B.emit_op(SPIRVOp::OpBranch, {ms});
         }

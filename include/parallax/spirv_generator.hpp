@@ -43,11 +43,14 @@ public:
     // is needed — just the element's width and float/int-ness.
     enum class ReduceElemType { F32, F64, I32, I64 };
 
-    // Emit a workgroup tree-reduction kernel (the '+' reduce primitive) for the
-    // given element type. Mirrors shaders/reduce.comp: shared memory + barriers,
-    // one partial per workgroup, fully unrolled (no loop/OpPhi). Logical GLSL450
-    // memory model. The runtime dispatches it iteratively (see launch_reduce).
-    std::vector<uint32_t> generate_reduce_kernel(ReduceElemType elem);
+    // Emit a workgroup tree-reduction kernel for the given element type. Shared
+    // memory + barriers, one partial per workgroup, fully unrolled, guarded (no
+    // identity element). Logical GLSL450; the runtime dispatches it iteratively
+    // (see launch_reduce). If user_op is non-null it is a compiled binary op
+    // (T(T,T)); the kernel emits it as a SPIR-V function and calls it at each
+    // combine step (the user op path). Null = baked-in '+'.
+    std::vector<uint32_t> generate_reduce_kernel(ReduceElemType elem,
+                                                 llvm::Function* user_op = nullptr);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);

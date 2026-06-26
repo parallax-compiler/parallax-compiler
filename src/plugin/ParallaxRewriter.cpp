@@ -47,6 +47,7 @@ struct TransformInfo {
     // type spelling used to declare the accumulator in the generated code.
     bool is_reduce = false;
     clang::Expr* init_expr = nullptr;
+    clang::Expr* reduce_op = nullptr;  // optional binary op for std::reduce(...,binary_op)
     std::string elem_type_str;
 
     // NEW V2: Class context for function objects
@@ -264,7 +265,15 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  " << et << " __plx_gpu = " << et << "();\n";
         rs << "  parallax_reduce(" << k << ", (void*)&(*__plx_first), __plx_count, sizeof("
            << et << "), &__plx_gpu);\n";
-        rs << "  " << et << " __plx_result = (" << init << ") + __plx_gpu;\n";
+        // Combine the init on the host using the SAME op (a plain C++ callable):
+        //   reduce(b,e,init,op) = op(init, gpu_reduction). Default op is '+'.
+        if (transform.reduce_op) {
+            std::string op_src = getSourceText(transform.reduce_op->getSourceRange());
+            rs << "  auto __plx_op = (" << op_src << ");\n";
+            rs << "  " << et << " __plx_result = __plx_op((" << init << "), __plx_gpu);\n";
+        } else {
+            rs << "  " << et << " __plx_result = (" << init << ") + __plx_gpu;\n";
+        }
         rs << "  __plx_result;\n";
         // Terminate the declaration: the call is consumed up to and including its
         // trailing ';', so the value-yielding statement-expression supplies its own.
@@ -813,9 +822,33 @@ public:
             info.is_reduce = true;
             info.kernel_name = generateKernelName(info);
 
+            // std::reduce(par, first, last, init, binary_op): compile the user op to
+            // a SPIR-V function the reduction calls at each combine step. Without it,
+            // the kernel uses the baked-in '+'. op_module must outlive the codegen.
+            llvm::Function* op_func = nullptr;
+            std::unique_ptr<llvm::Module> op_module;
+            if (call->getNumArgs() >= 5) {
+                clang::LambdaExpr* op_lambda = extractLambda(call);
+                if (!op_lambda) {
+                    llvm::errs() << "[ParallaxCollector] reduce: non-lambda binary op unsupported; leaving on CPU\n";
+                    return true;
+                }
+                info.reduce_op = call->getArg(call->getNumArgs() - 1);
+                op_module = ir_generator_.generateIR(op_lambda, context_);
+                if (op_module) {
+                    for (auto& f : *op_module) {
+                        if (!f.isDeclaration()) { op_func = &f; break; }
+                    }
+                }
+                if (!op_func) {
+                    llvm::errs() << "[ParallaxCollector] reduce: failed to compile binary op; leaving on CPU\n";
+                    return true;
+                }
+            }
+
             SPIRVGenerator spirv_gen;
             spirv_gen.set_target_vulkan_version(1, 2);
-            info.spirv = spirv_gen.generate_reduce_kernel(ek);
+            info.spirv = spirv_gen.generate_reduce_kernel(ek, op_func);
             if (info.spirv.empty()) {
                 llvm::errs() << "[ParallaxCollector] reduce: SPIR-V generation failed\n";
                 return true;
