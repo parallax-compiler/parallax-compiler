@@ -1141,9 +1141,12 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     uint32_t op_fn_id = 0;
     if (user_op) {
         llvm::LLVMContext& ctx = user_op->getContext();
-        type_cache_[user_op->getReturnType()] = elem_t;
         type_cache_[llvm::Type::getInt32Ty(ctx)] = uint_t;
         type_cache_[llvm::Type::getInt1Ty(ctx)]  = bool_t;
+        // Prime the element type LAST so it wins: when the element is i32, the op's
+        // i32 must map to elem_t (the function's return/param type), not uint_t —
+        // otherwise OpIAdd produces uint while the function returns int (mismatch).
+        type_cache_[user_op->getReturnType()] = elem_t;
 
         B.set_section(SPIRVBuilder::Section::Types);
         uint32_t op_fntype = B.get_next_id();
