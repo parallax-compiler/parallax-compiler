@@ -558,7 +558,11 @@ jobs:
           EOF
           "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
-            -c probe_mc.cpp -o /dev/null 2>/dev/null || true
+            -c probe_mc.cpp -o /dev/null 2> mc_compile.log || true
+          echo "===== operator() resolutions (mangled names per lambda) ====="
+          grep -E "Located operator|Could not locate|Kernel element type|predicate" mc_compile.log | head -20 || true
+          echo "===== float OpConstant operands in emitted kernels (predicate constants) ====="
+          grep -E "emit_op 43 operands" mc_compile.log | head -20 || true
           "$CLANGXX" -std=c++20 -O2 probe_mc.cpp \
             -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
             -o probe_mc 2>&1 | tail -3
