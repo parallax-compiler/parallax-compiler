@@ -1379,8 +1379,18 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         llvm::Type* arg_type = arg.getType();
         llvm::errs() << "  Param " << arg.getArgNo() << " type: " << *arg_type;
 
-        // Only the first num_data_params parameters can be buffers, and only if they're pointers
-        if (arg.getArgNo() < num_data_params && arg_type->isPointerTy()) {
+        if (is_transform) {
+            // Transform: the in/out data buffers are synthesized (binding 0/1), not
+            // lambda args. arg0 is the element value loaded from in[gid] and passed
+            // to the call; any further args are captures. (A unary transform lambda
+            // takes the element BY VALUE, so it has no pointer data-buffer arg.)
+            if (arg.getArgNo() == 0) {
+                llvm::errs() << " -> TRANSFORM INPUT VALUE\n";
+            } else {
+                llvm::errs() << " -> SCALAR/CAPTURE (push constant)\n";
+                scalar_params.push_back(&arg);
+            }
+        } else if (arg.getArgNo() < num_data_params && arg_type->isPointerTy()) {
             llvm::errs() << " -> BUFFER (data array pointer)\n";
             buffer_params.push_back(&arg);
         } else {
@@ -1388,6 +1398,10 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
             scalar_params.push_back(&arg);
         }
     }
+
+    // Number of data buffers: 1 for for_each (the element), 2 for transform (in,
+    // out). For transform these are synthesized — no backing lambda argument.
+    const size_t num_data_buffers = is_transform ? 2 : buffer_params.size();
 
     // Further classify scalar_params into captured buffers vs true scalars
     std::vector<llvm::Argument*> captured_buffers;
@@ -1403,9 +1417,9 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     }
 
     // Total number of buffer bindings = data buffers + captured buffers
-    size_t num_buffers = buffer_params.size() + captured_buffers.size();
+    size_t num_buffers = num_data_buffers + captured_buffers.size();
 
-    llvm::errs() << "[SPIRVGenerator] Creating " << buffer_params.size()
+    llvm::errs() << "[SPIRVGenerator] Creating " << num_data_buffers
                  << " data buffers, " << captured_buffers.size()
                  << " captured buffer bindings, and " << true_scalars.size()
                  << " scalar captures\n";
@@ -1415,7 +1429,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     size_t binding_idx = 0;
 
     // Data buffers first
-    for (size_t i = 0; i < buffer_params.size(); ++i) {
+    for (size_t i = 0; i < num_data_buffers; ++i) {
         builder.set_section(SPIRVBuilder::Section::Types);
         uint32_t buffer_var_id = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
@@ -1561,7 +1575,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     std::vector<uint32_t> data_buffer_ptrs;
 
     uint32_t ptr_elem_sb = get_pointer_type_id(builder, data_elem_id, 12 /* StorageBuffer */);
-    for (size_t i = 0; i < buffer_params.size(); ++i) {
+    for (size_t i = 0; i < num_data_buffers; ++i) {
         uint32_t var_id = buffer_var_ids[i];
         uint32_t element_ptr = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpAccessChain, {ptr_elem_sb, element_ptr, var_id, Zero, id_x});
@@ -1572,7 +1586,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Access captured buffer pointers (these are separate buffer bindings!)
     std::vector<uint32_t> captured_buffer_ptrs;
     for (size_t i = 0; i < captured_buffers.size(); ++i) {
-        uint32_t var_id = buffer_var_ids[buffer_params.size() + i];
+        uint32_t var_id = buffer_var_ids[num_data_buffers + i];
         uint32_t array_ptr = builder.get_next_id();
         uint32_t ptr_rarray_sb = get_pointer_type_id(builder, rarray_id, 12 /* StorageBuffer */);
         builder.emit_op(SPIRVOp::OpAccessChain, {ptr_rarray_sb, array_ptr, var_id, Zero});

@@ -396,6 +396,37 @@ jobs:
             || { echo "::error::reduce+op wrong result (user op not applied / identity bug)"; exit 1; }
           echo "PASS: std::reduce with a user binary op offloaded (skeleton calls compiled op)"
 
+      - name: "GATE (transform): elementwise map in@0 -> out@1"
+        run: |
+          # std::transform with a by-value unary lambda: the kernel synthesizes the
+          # in/out data buffers (binding 0/1), loads in[gid], calls the lambda with
+          # the value, and stores the result to out[gid].
+          cat > probe_xf.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> in(64, 3.0f), out(64, 0.0f);
+              std::transform(std::execution::par, in.begin(), in.end(), out.begin(),
+                             [](float x){ return x * x + 1.0f; });
+              std::printf("xform result=%.1f expected=10.0\n", out[0]);
+              return (out[0] == 10.0f) ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_xf.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_xf.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_xf 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_xf 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "xform result=10.0" \
+            || { echo "::error::std::transform produced wrong result"; exit 1; }
+          echo "PASS: std::transform offloaded (synthesized in/out buffers)"
+
       - name: "GATE (transform_reduce): map then reduce on the GPU"
         run: |
           # transform_reduce = transform(top) into scratch, then reduce(rop). Sum of
