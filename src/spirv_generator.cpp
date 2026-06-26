@@ -1390,6 +1390,35 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Determine if this is a transform (returns non-void)
     bool is_transform = !lambda_func->getReturnType()->isVoidTy();
 
+    // Output buffer element type for transform kernels. The input element is T
+    // (data_elem_id); the output element U may differ: U = the lambda's return
+    // type (e.g. float->double map), or the int count accumulator for count_if's
+    // predicate-count mode. When U != T we emit a second Block-decorated struct
+    // for binding 1; otherwise binding 1 reuses the input struct.
+    uint32_t out_elem_id = data_elem_id;
+    uint32_t out_ptr_struct_id = ptr_struct_id;
+    if (is_transform) {
+        llvm::Type* out_ty = predicate_count_ ? int32_ty : lambda_func->getReturnType();
+        uint32_t oe = get_type_id(builder, out_ty);
+        if (oe != data_elem_id) {
+            out_elem_id = oe;
+            uint32_t out_stride = static_cast<uint32_t>(out_ty->getPrimitiveSizeInBits() / 8);
+            if (out_stride < 4) out_stride = 4;
+            builder.set_section(SPIRVBuilder::Section::Types);
+            uint32_t o_rarray = builder.get_next_id();
+            builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {o_rarray, out_elem_id});
+            builder.set_section(SPIRVBuilder::Section::Decorations);
+            builder.emit_op(SPIRVOp::OpDecorate, {o_rarray, 6 /* ArrayStride */, out_stride});
+            builder.set_section(SPIRVBuilder::Section::Types);
+            uint32_t o_struct = builder.get_next_id();
+            builder.emit_op(SPIRVOp::OpTypeStruct, {o_struct, o_rarray});
+            builder.set_section(SPIRVBuilder::Section::Decorations);
+            builder.emit_op(SPIRVOp::OpMemberDecorate, {o_struct, 0, 35 /* Offset */, 0});
+            builder.emit_op(SPIRVOp::OpDecorate, {o_struct, 2 /* Block */});
+            out_ptr_struct_id = get_pointer_type_id(builder, o_struct, 12 /* StorageBuffer */);
+        }
+    }
+
     // Classify parameters into data buffer params and scalar/capture params
     // IMPORTANT: Only the FIRST parameter(s) are data buffers
     // For transform: params 0-1 are input/output buffers
@@ -1458,11 +1487,13 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     std::vector<uint32_t> buffer_var_ids;
     size_t binding_idx = 0;
 
-    // Data buffers first
+    // Data buffers first. For a transform, binding 1 is the output buffer and may
+    // use a different element struct (U) than the input (T) at binding 0.
     for (size_t i = 0; i < num_data_buffers; ++i) {
         builder.set_section(SPIRVBuilder::Section::Types);
         uint32_t buffer_var_id = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpVariable, {ptr_struct_id, buffer_var_id, 12});
+        uint32_t this_struct_ptr = (is_transform && i == 1) ? out_ptr_struct_id : ptr_struct_id;
+        builder.emit_op(SPIRVOp::OpVariable, {this_struct_ptr, buffer_var_id, 12});
         builder.set_section(SPIRVBuilder::Section::Decorations);
         builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
         builder.emit_op(SPIRVOp::OpDecorate, {buffer_var_id, 34 /* DescriptorSet */, 0});
@@ -1605,10 +1636,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     std::vector<uint32_t> data_buffer_ptrs;
 
     uint32_t ptr_elem_sb = get_pointer_type_id(builder, data_elem_id, 12 /* StorageBuffer */);
+    uint32_t ptr_out_elem_sb = (out_elem_id == data_elem_id)
+        ? ptr_elem_sb
+        : get_pointer_type_id(builder, out_elem_id, 12 /* StorageBuffer */);
     for (size_t i = 0; i < num_data_buffers; ++i) {
         uint32_t var_id = buffer_var_ids[i];
+        uint32_t this_ptr_elem = (is_transform && i == 1) ? ptr_out_elem_sb : ptr_elem_sb;
         uint32_t element_ptr = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpAccessChain, {ptr_elem_sb, element_ptr, var_id, Zero, id_x});
+        builder.emit_op(SPIRVOp::OpAccessChain, {this_ptr_elem, element_ptr, var_id, Zero, id_x});
         data_buffer_ptrs.push_back(element_ptr);
         llvm::errs() << "[SPIRVGenerator] Data buffer param " << i << " -> element ptr\n";
     }
@@ -1670,18 +1705,11 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
         if (predicate_count_) {
             // count_if: the lambda is a predicate (returns bool); store 1/0 of the
-            // element type as this element's contribution to the count.
-            llvm::Type* t = active_element_type_ ? active_element_type_ : float_ty;
-            llvm::Constant* c_one = t->isFloatingPointTy()
-                ? (llvm::Constant*)llvm::ConstantFP::get(t, 1.0)
-                : (llvm::Constant*)llvm::ConstantInt::get(t, 1);
-            llvm::Constant* c_zero = t->isFloatingPointTy()
-                ? (llvm::Constant*)llvm::ConstantFP::get(t, 0.0)
-                : (llvm::Constant*)llvm::ConstantInt::get(t, 0);
-            uint32_t one = get_constant_id(builder, c_one);
-            uint32_t zero = get_constant_id(builder, c_zero);
+            // integer accumulator type (out element) as this element's contribution.
+            uint32_t one = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, 1));
+            uint32_t zero = get_constant_id(builder, llvm::ConstantInt::get(int32_ty, 0));
             uint32_t cnt = builder.get_next_id();
-            builder.emit_op(SPIRVOp::OpSelect, {data_elem_id, cnt, result_id, one, zero});
+            builder.emit_op(SPIRVOp::OpSelect, {out_elem_id, cnt, result_id, one, zero});
             builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], cnt});
         } else {
             // Store result to output buffer[1]

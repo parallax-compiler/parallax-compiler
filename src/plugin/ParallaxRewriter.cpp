@@ -61,6 +61,10 @@ struct TransformInfo {
     // 0 = count (long), 1 = any_of (>0), 2 = all_of (==n), 3 = none_of (==0).
     bool is_count = false;
     int count_yield = 0;
+    // Accumulator type (U): the scratch/reduce element. Differs from the container
+    // element (T) for count_if (int) and type-changing transform_reduce. Empty =>
+    // same as elem_type_str.
+    std::string acc_type_str;
 
     // NEW V2: Class context for function objects
     ClassContext class_context;
@@ -259,12 +263,16 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
         std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
         const std::string& et = transform.elem_type_str;
+        // Accumulator (U): the transform's output / scratch / reduce element. May
+        // differ from the container element T (count_if -> int; type-changing
+        // transform_reduce). The scratch and reduce work in U.
+        std::string acc = transform.acc_type_str.empty() ? et : transform.acc_type_str;
         const std::string& k = transform.kernel_name;
 
         std::ostringstream rs;
         rs << "({\n";
         rs << "  /* Parallax GPU " << (transform.is_count ? "count_if" : "transform_reduce")
-           << " (" << et << ") */\n";
+           << " (" << et << " -> " << acc << ") */\n";
         rs << generateSPIRVArray(k + "_t", transform.spirv_transform);
         rs << generateSPIRVArray(k + "_r", transform.spirv);
         rs << "  static parallax_kernel_t " << k << "_t = nullptr, " << k << "_r = nullptr;\n";
@@ -274,12 +282,12 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
            << "_r_spirv, sizeof(" << k << "_r_spirv)/sizeof(uint32_t));\n";
         rs << "  auto __plx_first = (" << first_it << ");\n";
         rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
-        rs << "  std::vector<" << et << "> __plx_scratch(__plx_n);\n";
+        rs << "  std::vector<" << acc << "> __plx_scratch(__plx_n);\n";
         rs << "  parallax_kernel_launch_transform(" << k << "_t, (void*)&(*__plx_first), "
-           << "__plx_scratch.data(), __plx_n, sizeof(" << et << "));\n";
-        rs << "  " << et << " __plx_gpu = " << et << "();\n";
+           << "__plx_scratch.data(), __plx_n, sizeof(" << acc << "));\n";
+        rs << "  " << acc << " __plx_gpu = " << acc << "();\n";
         rs << "  parallax_reduce(" << k << "_r, __plx_scratch.data(), __plx_n, sizeof("
-           << et << "), &__plx_gpu);\n";
+           << acc << "), &__plx_gpu);\n";
         if (transform.is_count) {
             // The reduction summed 1/0 predicate contributions. Yield the count, or
             // the corresponding boolean for any_of/all_of/none_of.
@@ -993,16 +1001,20 @@ public:
                 llvm::errs() << "[ParallaxCollector] count_if: failed to compile predicate; CPU\n";
                 return true;
             }
+            // count_if accumulates in a true int (exact to ~2^31), independent of
+            // the element type T: the predicate transform stores int 1/0, the reduce
+            // sums int. sizeof(int)==4 matches sizeof(float) for the common path.
             SPIRVGenerator tgen; tgen.set_target_vulkan_version(1, 2);
             tgen.set_predicate_count(true);
             info.spirv_transform = tgen.generate_from_lambda(pred_func, {"float", "float&"});
 
             SPIRVGenerator rgen; rgen.set_target_vulkan_version(1, 2);
-            info.spirv = rgen.generate_reduce_kernel(ek);  // '+' reduce
+            info.spirv = rgen.generate_reduce_kernel(SPIRVGenerator::ReduceElemType::I32);
             if (info.spirv.empty() || info.spirv_transform.empty()) {
                 llvm::errs() << "[ParallaxCollector] count_if: SPIR-V generation failed\n";
                 return true;
             }
+            info.acc_type_str = "int";
 
             info.is_count = true;
             info.is_reduce = true;  // value-yielding replacement
