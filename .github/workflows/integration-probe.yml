@@ -625,6 +625,38 @@ jobs:
             || { echo "::error::helper-call produced wrong result (not inlined?)"; exit 1; }
           echo "PASS: lambda calling a helper function offloaded (recursive inline)"
 
+      - name: "GATE (math): std::sqrt in a kernel (libcall -> GLSL.std.450)"
+        run: |
+          # std::math is a libcall (sqrtf) at -O0, not an intrinsic; the generator
+          # maps the common math names to GLSL.std.450 ext-insts. sqrt(4)=2.
+          cat > probe_m.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cmath>
+          #include <cstdio>
+          int main() {
+              std::vector<float> d(64, 4.0f);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [](float& x) { x = std::sqrt(x); });
+              std::printf("math result=%.1f expected=2.0\n", d[0]);
+              return (d[0] == 2.0f) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/m.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_m.cpp -o /dev/null 2>/dev/null || true
+          [ -f m.spv ] && { spirv-val m.spv || { echo "::error::math SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_m.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_m 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_m 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "math result=2.0" \
+            || { echo "::error::std::sqrt kernel produced wrong result"; exit 1; }
+          echo "PASS: std::sqrt offloaded (math libcall mapped to GLSL.std.450)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

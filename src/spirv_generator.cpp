@@ -630,13 +630,28 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
                 case llvm::Intrinsic::fabs:    extinst(4,  {arg(0)}); break;
                 case llvm::Intrinsic::floor:   extinst(8,  {arg(0)}); break;
                 case llvm::Intrinsic::ceil:    extinst(9,  {arg(0)}); break;
+                case llvm::Intrinsic::trunc:   extinst(3,  {arg(0)}); break;  // Trunc
+                case llvm::Intrinsic::round:   extinst(1,  {arg(0)}); break;  // Round
+                case llvm::Intrinsic::rint:
+                case llvm::Intrinsic::nearbyint: extinst(2, {arg(0)}); break; // RoundEven
                 case llvm::Intrinsic::sin:     extinst(13, {arg(0)}); break;
                 case llvm::Intrinsic::cos:     extinst(14, {arg(0)}); break;
+                case llvm::Intrinsic::tan:     extinst(15, {arg(0)}); break;
+                case llvm::Intrinsic::asin:    extinst(16, {arg(0)}); break;
+                case llvm::Intrinsic::acos:    extinst(17, {arg(0)}); break;
+                case llvm::Intrinsic::atan:    extinst(18, {arg(0)}); break;
+                case llvm::Intrinsic::sinh:    extinst(19, {arg(0)}); break;
+                case llvm::Intrinsic::cosh:    extinst(20, {arg(0)}); break;
+                case llvm::Intrinsic::tanh:    extinst(21, {arg(0)}); break;
                 case llvm::Intrinsic::exp:     extinst(27, {arg(0)}); break;
+                case llvm::Intrinsic::exp2:    extinst(29, {arg(0)}); break;
                 case llvm::Intrinsic::log:     extinst(28, {arg(0)}); break;
+                case llvm::Intrinsic::log2:    extinst(30, {arg(0)}); break;
                 case llvm::Intrinsic::pow:     extinst(26, {arg(0), arg(1)}); break;
-                case llvm::Intrinsic::minnum:  extinst(37, {arg(0), arg(1)}); break;
-                case llvm::Intrinsic::maxnum:  extinst(40, {arg(0), arg(1)}); break;
+                case llvm::Intrinsic::minnum:
+                case llvm::Intrinsic::minimum: extinst(37, {arg(0), arg(1)}); break;  // FMin
+                case llvm::Intrinsic::maxnum:
+                case llvm::Intrinsic::maximum: extinst(40, {arg(0), arg(1)}); break;  // FMax
                 case llvm::Intrinsic::fma:
                 case llvm::Intrinsic::fmuladd: extinst(50 /* Fma */, {arg(0), arg(1), arg(2)}); break;
                 // No-op intrinsics carry no SPIR-V meaning; emit nothing.
@@ -647,17 +662,50 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
                 case llvm::Intrinsic::assume:
                 case llvm::Intrinsic::donothing:
                     break;
-                default:
-                    // Unsupported call: alias the result to the first argument rather
-                    // than emit an OpFunctionCall with id 0 (invalid SPIR-V). This is
-                    // a graceful degradation until call-graph compilation (Phase 4).
-                    llvm::errs() << "[SPIRVGenerator] Unsupported call '"
-                                 << (func ? func->getName() : "<indirect>")
-                                 << "'; aliasing result to first argument\n";
-                    if (call->arg_size() > 0) {
-                        value_map[inst] = arg(0);
+                default: {
+                    // At -O0 std::math is emitted as a libcall (sqrtf, sinf, ...),
+                    // not an intrinsic. Map the common ones by name to GLSL.std.450.
+                    llvm::StringRef nm = func ? func->getName() : "";
+                    auto base = [&](llvm::StringRef s) {
+                        return nm == s || nm == (s.str() + "f") || nm == (s.str() + "l");
+                    };
+                    uint32_t g = 0; int nargs = 1;
+                    if      (base("sqrt"))  g = 31;
+                    else if (base("fabs"))  g = 4;
+                    else if (base("floor")) g = 8;
+                    else if (base("ceil"))  g = 9;
+                    else if (base("trunc")) g = 3;
+                    else if (base("round")) g = 1;
+                    else if (base("sin"))   g = 13;
+                    else if (base("cos"))   g = 14;
+                    else if (base("tan"))   g = 15;
+                    else if (base("asin"))  g = 16;
+                    else if (base("acos"))  g = 17;
+                    else if (base("atan"))  g = 18;
+                    else if (base("sinh"))  g = 19;
+                    else if (base("cosh"))  g = 20;
+                    else if (base("tanh"))  g = 21;
+                    else if (base("exp"))   g = 27;
+                    else if (base("exp2"))  g = 29;
+                    else if (base("log"))   g = 28;
+                    else if (base("log2"))  g = 30;
+                    else if (base("pow"))  { g = 26; nargs = 2; }
+                    else if (base("atan2")){ g = 25; nargs = 2; }
+                    else if (base("fmin")) { g = 37; nargs = 2; }
+                    else if (base("fmax")) { g = 40; nargs = 2; }
+
+                    if (g != 0 && call->arg_size() >= (unsigned)nargs) {
+                        if (nargs == 2) extinst(g, {arg(0), arg(1)});
+                        else            extinst(g, {arg(0)});
+                    } else {
+                        // Unknown call: alias to the first argument (graceful degrade)
+                        // rather than emit an OpFunctionCall id 0 (invalid SPIR-V).
+                        llvm::errs() << "[SPIRVGenerator] Unsupported call '" << nm
+                                     << "'; aliasing result to first argument\n";
+                        if (call->arg_size() > 0) value_map[inst] = arg(0);
                     }
                     break;
+                }
             }
             break;
         }
