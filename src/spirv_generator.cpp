@@ -1000,11 +1000,6 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     uint32_t ptr_pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_struct, 9 /*PushConstant*/, pc_struct});
     uint32_t ptr_pc_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_uint, 9, uint_t});
 
-    // Zero of the element type (identity for '+').
-    uint32_t elem_zero = B.get_next_id();
-    if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, elem_zero, 0u, 0u});
-    else         B.emit_op(SPIRVOp::OpConstant, {elem_t, elem_zero, 0u});
-
     // Global variables.
     uint32_t gid_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_in_v3, gid_var, 1});
     uint32_t lid_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_in_v3, lid_var, 1});
@@ -1069,10 +1064,18 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     uint32_t count = B.get_next_id();
     B.emit_op(SPIRVOp::OpLoad, {uint_t, count, pc_count_ptr});
 
-    // sdata[tid] = 0; if (gid < count) sdata[tid] = indata[gid];
+    // blockActive = count - wgid*256: the number of valid elements this workgroup
+    // owns. The reduction combines only in-range lanes (tid+s < blockActive), so it
+    // needs no identity padding and works for any associative op. Full blocks have
+    // blockActive >= 256 > any (tid+s), so the guard is a no-op there.
+    uint32_t base = B.get_next_id();
+    B.emit_op(SPIRVOp::OpIMul, {uint_t, base, wgid, U(256)});
+    uint32_t block_active = B.get_next_id();
+    B.emit_op(SPIRVOp::OpISub, {uint_t, block_active, count, base});
+
+    // if (gid < count) sdata[tid] = indata[gid];  (lanes tid>=blockActive are never read)
     uint32_t p_sd_tid = B.get_next_id();
     B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_elem, p_sd_tid, sdata_var, tid});
-    B.emit_op(SPIRVOp::OpStore, {p_sd_tid, elem_zero});
 
     uint32_t inb = B.get_next_id();
     B.emit_op(SPIRVOp::OpULessThan, {bool_t, inb, gid, count});
@@ -1093,11 +1096,18 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     B.emit_op(SPIRVOp::OpControlBarrier, {scope_wg, scope_wg, sem});
 
     // Unrolled tree reduction: for (s = 128; s > 0; s >>= 1)
+    //   if (tid < s && tid + s < blockActive) sdata[tid] = op(sdata[tid], sdata[tid+s]);
     SPIRVOp add_op = is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd;
     for (uint32_t s = 128; s > 0; s >>= 1) {
         uint32_t cs = U(s);
+        uint32_t c1 = B.get_next_id();
+        B.emit_op(SPIRVOp::OpULessThan, {bool_t, c1, tid, cs});
+        uint32_t idx2 = B.get_next_id();
+        B.emit_op(SPIRVOp::OpIAdd, {uint_t, idx2, tid, cs});
+        uint32_t c2 = B.get_next_id();
+        B.emit_op(SPIRVOp::OpULessThan, {bool_t, c2, idx2, block_active});
         uint32_t doit = B.get_next_id();
-        B.emit_op(SPIRVOp::OpULessThan, {bool_t, doit, tid, cs});
+        B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, doit, c1, c2});
         uint32_t thens = B.get_next_id();
         uint32_t ms = B.get_next_id();
         B.emit_op(SPIRVOp::OpSelectionMerge, {ms, 0});
@@ -1108,8 +1118,6 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
             B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_elem, p_a, sdata_var, tid});
             uint32_t a = B.get_next_id();
             B.emit_op(SPIRVOp::OpLoad, {elem_t, a, p_a});
-            uint32_t idx2 = B.get_next_id();
-            B.emit_op(SPIRVOp::OpIAdd, {uint_t, idx2, tid, cs});
             uint32_t p_b = B.get_next_id();
             B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_elem, p_b, sdata_var, idx2});
             uint32_t b = B.get_next_id();
