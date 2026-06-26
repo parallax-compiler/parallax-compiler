@@ -496,12 +496,11 @@ jobs:
 
       - name: "GATE (any/all/none_of): predicate quantifiers on the GPU"
         run: |
-          # Derived from count_if: any_of = count>0, all_of = count==n, none_of =
-          # count==0. Each quantifier is verified in its own single-call program:
-          # multiple reduce-family orchestrations in one binary currently crash in
-          # the runtime (known issue; the per-call codegen is what we gate here).
-          run_one () {  # $1 = name, $2 = call expr, $3 = expected (0/1)
-            cat > probe_$1.cpp <<EOF
+          # any_of=count>0, all_of=count==n, none_of=count==0. All four quantifier
+          # calls live in ONE binary (multiple reduce-family orchestrations per
+          # program). v[i]=i over [0,100): a(any x>98.5)=1 b(all x>=0)=1
+          # c(none x>200)=1 d(all x>50)=0.
+          cat > probe_of.cpp <<'EOF'
           #include <vector>
           #include <algorithm>
           #include <execution>
@@ -509,32 +508,31 @@ jobs:
           int main() {
               std::vector<float> v(100);
               for (int i = 0; i < 100; ++i) v[i] = static_cast<float>(i);
-              bool r = $2;
-              std::printf("$1 result=%d expected=$3\n", r);
-              return (r == $3) ? 0 : 1;
+              bool a = std::any_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 98.5f; });
+              bool b = std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x >= 0.0f; });
+              bool c = std::none_of(std::execution::par, v.begin(), v.end(), [](float x){ return x > 200.0f; });
+              bool d = std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 50.0f; });
+              std::printf("of a=%d b=%d c=%d d=%d expected=1 1 1 0\n", a, b, c, d);
+              return (a && b && c && !d) ? 0 : 1;
           }
           EOF
-            "$CLANGXX" -std=c++20 -I parallax-runtime/include \
-              -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
-              -c probe_$1.cpp -o /dev/null 2>/dev/null || true
-            "$CLANGXX" -std=c++20 -O2 probe_$1.cpp \
-              -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
-              -o probe_$1 2>&1 | tail -2
-            out="$(./probe_$1 2>&1)" || true
-            echo "$out" | grep -v "^\[" | head -3
-            echo "$out" | grep -q "$1 result=$3" \
-              || { echo "::error::$1 produced wrong result"; exit 1; }
-          }
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_of.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_of.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_of 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          run_one anyof  "std::any_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 98.5f; })"  1
-          run_one allof  "std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x >= 0.0f; })"  1
-          run_one allof2 "std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 50.0f; })"  0
-          run_one noneof "std::none_of(std::execution::par, v.begin(), v.end(), [](float x){ return x > 200.0f; })" 1
-          echo "PASS: std::any_of/all_of/none_of offloaded (predicate quantifiers)"
+          out="$(./probe_of 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "of a=1 b=1 c=1 d=0" \
+            || { echo "::error::any/all/none_of produced wrong result"; exit 1; }
+          echo "PASS: std::any_of/all_of/none_of offloaded (4 calls, one binary)"
 
-      - name: "DIAG: two reduce-family calls in one binary (localize crash)"
-        continue-on-error: true
+      - name: "GATE (multi-call): distinct reduce-family calls don't alias"
         run: |
+          # Regression for the mangled-name aliasing bug: two count_if with DIFFERENT
+          # predicates in one TU must give different counts (x>49.5->50, x>9.5->90).
           cat > probe_mc.cpp <<'EOF'
           #include <vector>
           #include <algorithm>
@@ -543,35 +541,24 @@ jobs:
           int main() {
               std::vector<float> v(100);
               for (int i = 0; i < 100; ++i) v[i] = static_cast<float>(i);
-              std::fprintf(stderr, "MARK A any_of begin\n");
-              bool a = std::any_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 98.5f; });
-              std::fprintf(stderr, "MARK A done a=%d\n", a);
-              std::fprintf(stderr, "MARK B all_of begin\n");
-              bool b = std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x >= 0.0f; });
-              std::fprintf(stderr, "MARK B done b=%d\n", b);
-              std::fprintf(stderr, "MARK C none_of begin\n");
-              bool c = std::none_of(std::execution::par, v.begin(), v.end(), [](float x){ return x > 200.0f; });
-              std::fprintf(stderr, "MARK C done c=%d\n", c);
-              std::printf("mc a=%d b=%d c=%d\n", a, b, c);
-              return 0;
+              long c1 = std::count_if(std::execution::par, v.begin(), v.end(), [](float x){ return x > 49.5f; });
+              long c2 = std::count_if(std::execution::par, v.begin(), v.end(), [](float x){ return x > 9.5f;  });
+              std::printf("mc c1=%ld c2=%ld expected=50 90\n", c1, c2);
+              return (c1 == 50 && c2 == 90) ? 0 : 1;
           }
           EOF
           "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
-            -c probe_mc.cpp -o /dev/null 2> mc_compile.log || true
-          echo "===== operator() resolutions (mangled names per lambda) ====="
-          grep -E "Located operator|Could not locate|Kernel element type|predicate" mc_compile.log | head -20 || true
-          echo "===== float OpConstant operands in emitted kernels (predicate constants) ====="
-          grep -E "emit_op 43 operands" mc_compile.log | head -20 || true
+            -c probe_mc.cpp -o /dev/null 2>/dev/null || true
           "$CLANGXX" -std=c++20 -O2 probe_mc.cpp \
             -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
             -o probe_mc 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          set +e
-          ./probe_mc; echo "MARK exit=$?"
-          echo "--- under gdb ---"
-          sudo apt-get install -y gdb >/dev/null 2>&1 || true
-          gdb -batch -ex run -ex bt --args ./probe_mc 2>&1 | grep -iE "MARK|signal|#[0-9]|in (launch|dispatch|vk|parallax|KernelLauncher)" | head -40 || true
+          out="$(./probe_mc 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "mc c1=50 c2=90" \
+            || { echo "::error::distinct lambdas aliased (mangled-name bug)"; exit 1; }
+          echo "PASS: distinct reduce-family calls resolve to distinct lambdas"
 
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
