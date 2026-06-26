@@ -654,7 +654,37 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             }
             break;
         }
-        
+
+        case llvm::Instruction::Select: {
+            // cond ? a : b  — predicates/ternaries (e.g. min/max, pred?1:0).
+            auto* sel = llvm::cast<llvm::SelectInst>(inst);
+            uint32_t cond = get_value_id(builder, sel->getCondition(), value_map);
+            uint32_t tval = get_value_id(builder, sel->getTrueValue(), value_map);
+            uint32_t fval = get_value_id(builder, sel->getFalseValue(), value_map);
+            builder.emit_op(SPIRVOp::OpSelect,
+                            {get_type_id(builder, inst->getType()), result_id, cond, tval, fval});
+            break;
+        }
+
+        case llvm::Instruction::ZExt:
+        case llvm::Instruction::SExt: {
+            // Widening integer cast (e.g. i1 -> i32). SPIR-V has no direct zext/sext
+            // of a bool, so select between 1 and 0 of the target type.
+            llvm::Type* dst = inst->getType();
+            uint32_t dst_id = get_type_id(builder, dst);
+            llvm::Value* src = inst->getOperand(0);
+            if (src->getType()->isIntegerTy(1)) {
+                uint32_t cond = get_value_id(builder, src, value_map);
+                uint32_t one = get_constant_id(builder, llvm::ConstantInt::get(dst, 1));
+                uint32_t zero = get_constant_id(builder, llvm::ConstantInt::get(dst, 0));
+                builder.emit_op(SPIRVOp::OpSelect, {dst_id, result_id, cond, one, zero});
+            } else {
+                // Same-width or wider integer: alias (SPIR-V ints are sign-agnostic).
+                value_map[inst] = get_value_id(builder, src, value_map);
+            }
+            break;
+        }
+
         default:
             // Handle other instructions as needed
             break;
@@ -1638,8 +1668,25 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         call_ops.insert(call_ops.end(), scalar_values.begin(), scalar_values.end());
         builder.emit_op(SPIRVOp::OpFunctionCall, call_ops);
 
-        // Store result to output buffer[1]
-        builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], result_id});
+        if (predicate_count_) {
+            // count_if: the lambda is a predicate (returns bool); store 1/0 of the
+            // element type as this element's contribution to the count.
+            llvm::Type* t = active_element_type_ ? active_element_type_ : float_ty;
+            llvm::Constant* c_one = t->isFloatingPointTy()
+                ? (llvm::Constant*)llvm::ConstantFP::get(t, 1.0)
+                : (llvm::Constant*)llvm::ConstantInt::get(t, 1);
+            llvm::Constant* c_zero = t->isFloatingPointTy()
+                ? (llvm::Constant*)llvm::ConstantFP::get(t, 0.0)
+                : (llvm::Constant*)llvm::ConstantInt::get(t, 0);
+            uint32_t one = get_constant_id(builder, c_one);
+            uint32_t zero = get_constant_id(builder, c_zero);
+            uint32_t cnt = builder.get_next_id();
+            builder.emit_op(SPIRVOp::OpSelect, {data_elem_id, cnt, result_id, one, zero});
+            builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], cnt});
+        } else {
+            // Store result to output buffer[1]
+            builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], result_id});
+        }
     } else {
         // For_each: lambda modifies in-place via pointer
         // Get the actual return type of the lambda function

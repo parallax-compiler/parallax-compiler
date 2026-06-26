@@ -461,6 +461,39 @@ jobs:
             || { echo "::error::transform_reduce wrong result (transform or reduce failed)"; exit 1; }
           echo "PASS: std::transform_reduce offloaded (map then reduce composed on GPU)"
 
+      - name: "GATE (count_if): predicate count on the GPU"
+        run: |
+          # count_if = (predicate -> 0/1 transform) then '+' reduce. v[i]=i over
+          # [0,100); count x>49.5 -> elements 50..99 = 50. Exercises OpSelect (the
+          # predicate->count conversion) and the orchestration's integer cast.
+          cat > probe_ci.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(100);
+              for (int i = 0; i < 100; ++i) v[i] = static_cast<float>(i);
+              long c = std::count_if(std::execution::par, v.begin(), v.end(),
+                                     [](float x){ return x > 49.5f; });
+              std::printf("countif result=%ld expected=50\n", c);
+              return (c == 50) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/ci.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_ci.cpp -o /dev/null 2>/dev/null || true
+          [ -f ci.spv ] && { spirv-val ci.spv || { echo "::error::count_if SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_ci.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_ci 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_ci 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "countif result=50" \
+            || { echo "::error::count_if produced wrong result"; exit 1; }
+          echo "PASS: std::count_if offloaded (predicate -> count -> reduce)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

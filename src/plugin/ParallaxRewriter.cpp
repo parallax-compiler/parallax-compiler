@@ -55,6 +55,10 @@ struct TransformInfo {
     bool is_transform_reduce = false;
     std::vector<uint32_t> spirv_transform;
 
+    // Phase 3: count_if = (predicate->0/1 transform) then '+' reduce, yielding an
+    // integer count. Reuses the transform_reduce orchestration with a count cast.
+    bool is_count = false;
+
     // NEW V2: Class context for function objects
     ClassContext class_context;
     bool is_function_object = false;
@@ -245,20 +249,19 @@ void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
 std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) {
     std::ostringstream ss;
 
-    // Phase 3: transform_reduce = transform(top) into scratch, then reduce(rop),
-    // combine init on the host. Composes the existing transform + reduce kernels.
-    if (transform.is_transform_reduce) {
+    // Phase 3: transform_reduce / count_if both = transform into scratch, then '+'
+    // (or rop) reduce. Composes the existing transform + reduce kernels. count_if
+    // yields an integer count; transform_reduce combines init via rop on the host.
+    if (transform.is_transform_reduce || transform.is_count) {
         std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
         std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
         const std::string& et = transform.elem_type_str;
-        std::string init = transform.init_expr
-            ? getSourceText(transform.init_expr->getSourceRange()) : (et + "()");
-        std::string rop = getSourceText(transform.reduce_op->getSourceRange());
         const std::string& k = transform.kernel_name;
 
         std::ostringstream rs;
         rs << "({\n";
-        rs << "  /* Parallax GPU transform_reduce (" << et << ") */\n";
+        rs << "  /* Parallax GPU " << (transform.is_count ? "count_if" : "transform_reduce")
+           << " (" << et << ") */\n";
         rs << generateSPIRVArray(k + "_t", transform.spirv_transform);
         rs << generateSPIRVArray(k + "_r", transform.spirv);
         rs << "  static parallax_kernel_t " << k << "_t = nullptr, " << k << "_r = nullptr;\n";
@@ -274,9 +277,17 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  " << et << " __plx_gpu = " << et << "();\n";
         rs << "  parallax_reduce(" << k << "_r, __plx_scratch.data(), __plx_n, sizeof("
            << et << "), &__plx_gpu);\n";
-        rs << "  auto __plx_rop = (" << rop << ");\n";
-        rs << "  " << et << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
-        rs << "  __plx_result;\n";
+        if (transform.is_count) {
+            // count_if: the reduction summed 1/0 contributions; yield an integer count.
+            rs << "  (long)__plx_gpu;\n";
+        } else {
+            std::string init = transform.init_expr
+                ? getSourceText(transform.init_expr->getSourceRange()) : (et + "()");
+            std::string rop = getSourceText(transform.reduce_op->getSourceRange());
+            rs << "  auto __plx_rop = (" << rop << ");\n";
+            rs << "  " << et << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
+            rs << "  __plx_result;\n";
+        }
         rs << "});";
         return rs.str();
     }
@@ -926,6 +937,70 @@ public:
             return true;
         }
 
+        // Phase 3: count_if(par, first, last, pred) = (predicate -> 0/1 transform)
+        // then '+' reduce. Reuses the transform_reduce orchestration; the transform
+        // kernel is built from the predicate in "predicate count" mode, the reduce
+        // kernel is the baked-in '+', and the result is cast to an integer count.
+        if (info.algorithm_name == "count_if") {
+            if (call->getNumArgs() != 4) {
+                llvm::errs() << "[ParallaxCollector] count_if: expected 4 args; CPU\n";
+                return true;
+            }
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            if (!info.first_iterator || !info.last_iterator) return true;
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] count_if: element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] count_if: unsupported element type; CPU\n";
+                return true;
+            }
+
+            clang::LambdaExpr* pred_lambda = as_lambda(call->getArg(3));
+            if (!pred_lambda) {
+                llvm::errs() << "[ParallaxCollector] count_if: non-lambda predicate; CPU\n";
+                return true;
+            }
+            auto pred_module = ir_generator_.generateIR(pred_lambda, context_);
+            llvm::Function* pred_func = nullptr;
+            if (pred_module)
+                for (auto& f : *pred_module)
+                    if (!f.isDeclaration()) { pred_func = &f; break; }
+            if (!pred_func) {
+                llvm::errs() << "[ParallaxCollector] count_if: failed to compile predicate; CPU\n";
+                return true;
+            }
+            SPIRVGenerator tgen; tgen.set_target_vulkan_version(1, 2);
+            tgen.set_predicate_count(true);
+            info.spirv_transform = tgen.generate_from_lambda(pred_func, {"float", "float&"});
+
+            SPIRVGenerator rgen; rgen.set_target_vulkan_version(1, 2);
+            info.spirv = rgen.generate_reduce_kernel(ek);  // '+' reduce
+            if (info.spirv.empty() || info.spirv_transform.empty()) {
+                llvm::errs() << "[ParallaxCollector] count_if: SPIR-V generation failed\n";
+                return true;
+            }
+
+            info.is_count = true;
+            info.is_reduce = true;  // value-yielding replacement
+            info.kernel_name = generateKernelName(info);
+            llvm::errs() << "[ParallaxCollector] count_if: generated predicate("
+                         << info.spirv_transform.size() << ") + reduce(" << info.spirv.size()
+                         << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -1260,7 +1335,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
     // Check for parallel algorithms
     if (name != "std::for_each" && name != "std::for_each_n" &&
         name != "std::transform" && name != "std::reduce" &&
-        name != "std::transform_reduce" &&
+        name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::fill" && name != "std::copy" && name != "std::any_of") {
         return false;
     }
