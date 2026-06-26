@@ -50,6 +50,11 @@ struct TransformInfo {
     clang::Expr* reduce_op = nullptr;  // optional binary op for std::reduce(...,binary_op)
     std::string elem_type_str;
 
+    // Phase 3: transform_reduce = transform(top) into scratch, then reduce(rop).
+    // spirv_transform holds the transform kernel; spirv holds the reduce kernel.
+    bool is_transform_reduce = false;
+    std::vector<uint32_t> spirv_transform;
+
     // NEW V2: Class context for function objects
     ClassContext class_context;
     bool is_function_object = false;
@@ -239,6 +244,42 @@ void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
 
 std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) {
     std::ostringstream ss;
+
+    // Phase 3: transform_reduce = transform(top) into scratch, then reduce(rop),
+    // combine init on the host. Composes the existing transform + reduce kernels.
+    if (transform.is_transform_reduce) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        std::string init = transform.init_expr
+            ? getSourceText(transform.init_expr->getSourceRange()) : (et + "()");
+        std::string rop = getSourceText(transform.reduce_op->getSourceRange());
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU transform_reduce (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_t", transform.spirv_transform);
+        rs << generateSPIRVArray(k + "_r", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_t = nullptr, " << k << "_r = nullptr;\n";
+        rs << "  if (!" << k << "_t) " << k << "_t = parallax_kernel_load(" << k
+           << "_t_spirv, sizeof(" << k << "_t_spirv)/sizeof(uint32_t));\n";
+        rs << "  if (!" << k << "_r) " << k << "_r = parallax_kernel_load(" << k
+           << "_r_spirv, sizeof(" << k << "_r_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  std::vector<" << et << "> __plx_scratch(__plx_n);\n";
+        rs << "  parallax_kernel_launch_transform(" << k << "_t, (void*)&(*__plx_first), "
+           << "__plx_scratch.data(), __plx_n, sizeof(" << et << "));\n";
+        rs << "  " << et << " __plx_gpu = " << et << "();\n";
+        rs << "  parallax_reduce(" << k << "_r, __plx_scratch.data(), __plx_n, sizeof("
+           << et << "), &__plx_gpu);\n";
+        rs << "  auto __plx_rop = (" << rop << ");\n";
+        rs << "  " << et << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
+        rs << "  __plx_result;\n";
+        rs << "});";
+        return rs.str();
+    }
 
     // Phase 3: std::reduce yields a value, so it is replaced by a GNU statement-
     // expression ({ ...; result; }) that loads the reduction kernel, runs the GPU
@@ -778,6 +819,113 @@ public:
         info.call_expr = call;
         info.algorithm_name = extractAlgorithmName(call);
 
+        // Small helper: unwrap an argument expression to a LambdaExpr if it is one.
+        auto as_lambda = [](clang::Expr* e) -> clang::LambdaExpr* {
+            e = e->IgnoreImplicit();
+            if (auto* l = llvm::dyn_cast<clang::LambdaExpr>(e)) return l;
+            if (auto* m = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
+                return llvm::dyn_cast<clang::LambdaExpr>(m->getSubExpr()->IgnoreImplicit());
+            return nullptr;
+        };
+        // Map a scalar element QualType to the SPIR-V reduce element kind.
+        auto elem_kind = [&](clang::QualType qt, SPIRVGenerator::ReduceElemType& out) -> bool {
+            if (qt->isRealFloatingType()) {
+                out = context_.getTypeSize(qt) >= 64 ? SPIRVGenerator::ReduceElemType::F64
+                                                     : SPIRVGenerator::ReduceElemType::F32;
+                return true;
+            }
+            if (qt->isIntegerType()) {
+                out = context_.getTypeSize(qt) >= 64 ? SPIRVGenerator::ReduceElemType::I64
+                                                     : SPIRVGenerator::ReduceElemType::I32;
+                return true;
+            }
+            return false;
+        };
+
+        // Phase 3: transform_reduce(par, first, last, init, reduce_op, transform_op)
+        // = transform(top) into scratch, then reduce(rop). Reuses the existing
+        // transform and reduce kernel generators; the runtime does no new work.
+        if (info.algorithm_name == "transform_reduce") {
+            if (call->getNumArgs() != 6) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: only the unary 6-arg form "
+                                "is supported; leaving on CPU\n";
+                return true;
+            }
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            if (!info.first_iterator || !info.last_iterator) return true;
+            info.init_expr = call->getArg(3);
+            info.reduce_op = call->getArg(4);
+            clang::Expr* transform_op_expr = call->getArg(5);
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: unsupported element type; CPU\n";
+                return true;
+            }
+
+            // Transform kernel from the unary transform_op (top: T -> T).
+            clang::LambdaExpr* top_lambda = as_lambda(transform_op_expr);
+            if (!top_lambda) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: non-lambda transform op; CPU\n";
+                return true;
+            }
+            auto top_module = ir_generator_.generateIR(top_lambda, context_);
+            llvm::Function* top_func = nullptr;
+            if (top_module)
+                for (auto& f : *top_module)
+                    if (!f.isDeclaration()) { top_func = &f; break; }
+            if (!top_func) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: failed to compile transform op; CPU\n";
+                return true;
+            }
+            SPIRVGenerator tgen; tgen.set_target_vulkan_version(1, 2);
+            info.spirv_transform = tgen.generate_from_lambda(top_func, {"float", "float&"});
+
+            // Reduce kernel from the binary reduce_op: a lambda is compiled and
+            // called; std::plus uses the baked-in '+'; other functors are unsupported.
+            llvm::Function* rop_func = nullptr;
+            std::unique_ptr<llvm::Module> rop_module;
+            if (clang::LambdaExpr* rop_lambda = as_lambda(info.reduce_op)) {
+                rop_module = ir_generator_.generateIR(rop_lambda, context_);
+                if (rop_module)
+                    for (auto& f : *rop_module)
+                        if (!f.isDeclaration()) { rop_func = &f; break; }
+                if (!rop_func) {
+                    llvm::errs() << "[ParallaxCollector] transform_reduce: failed to compile reduce op; CPU\n";
+                    return true;
+                }
+            } else if (info.reduce_op->getType().getAsString().find("plus") == std::string::npos) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: unsupported reduce functor; CPU\n";
+                return true;
+            }
+            SPIRVGenerator rgen; rgen.set_target_vulkan_version(1, 2);
+            info.spirv = rgen.generate_reduce_kernel(ek, rop_func);
+            if (info.spirv.empty() || info.spirv_transform.empty()) {
+                llvm::errs() << "[ParallaxCollector] transform_reduce: SPIR-V generation failed\n";
+                return true;
+            }
+
+            info.is_transform_reduce = true;
+            info.is_reduce = true;  // value-yielding replacement
+            info.kernel_name = generateKernelName(info);
+            llvm::errs() << "[ParallaxCollector] transform_reduce: generated transform("
+                         << info.spirv_transform.size() << ") + reduce(" << info.spirv.size()
+                         << ") words for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -1112,6 +1260,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
     // Check for parallel algorithms
     if (name != "std::for_each" && name != "std::for_each_n" &&
         name != "std::transform" && name != "std::reduce" &&
+        name != "std::transform_reduce" &&
         name != "std::fill" && name != "std::copy" && name != "std::any_of") {
         return false;
     }
