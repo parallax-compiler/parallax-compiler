@@ -2001,6 +2001,33 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
                      << ir.getFailureReason() << "\n";
         return nullptr;
     }
+
+    // Recursively inline any further calls to user-defined functions (helper
+    // functions the lambda calls), so the kernel body is fully self-contained.
+    // Declarations (math libcalls / intrinsics) are left for intrinsic mapping.
+    for (int guard = 0; guard < 256; ++guard) {
+        llvm::CallInst* next = nullptr;
+        for (llvm::BasicBlock& bb : *wrapper) {
+            for (llvm::Instruction& inst : bb) {
+                auto* ci = llvm::dyn_cast<llvm::CallInst>(&inst);
+                if (!ci) continue;
+                llvm::Function* callee = ci->getCalledFunction();
+                if (callee && !callee->isDeclaration() && !callee->isIntrinsic()) {
+                    next = ci;
+                    break;
+                }
+            }
+            if (next) break;
+        }
+        if (!next) break;
+        llvm::InlineFunctionInfo ifi2;
+        if (!llvm::InlineFunction(*next, ifi2).isSuccess()) {
+            llvm::errs() << "[CodeGen] Could not inline helper call '"
+                         << next->getCalledFunction()->getName() << "'\n";
+            break;
+        }
+    }
+
     for (llvm::Function& f : *module) {
         if (&f != wrapper && !f.isDeclaration()) {
             f.deleteBody();
