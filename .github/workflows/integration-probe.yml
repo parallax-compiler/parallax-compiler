@@ -483,7 +483,9 @@ jobs:
           PARALLAX_DUMP_SPIRV="$PWD/tri.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
             -c probe_tri.cpp -o /dev/null 2>/dev/null || true
-          [ -f tri.spv ] && { spirv-val tri.spv || { echo "::error::transform_reduce T!=U SPIR-V invalid"; exit 1; }; }
+          if [ -f tri.spv ]; then
+            spirv-val tri.spv || { echo "=== transform kernel disasm ==="; spirv-dis tri.spv 2>/dev/null | sed -n '40,75p'; echo "::error::transform_reduce T!=U SPIR-V invalid"; exit 1; }
+          fi
           "$CLANGXX" -std=c++20 -O2 probe_tri.cpp \
             -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
             -o probe_tri 2>&1 | tail -3
