@@ -338,13 +338,10 @@ jobs:
           else
             echo "::error::no reduce SPIR-V produced (std::reduce not detected/generated)"; exit 1
           fi
-          echo "===== rewritten std::reduce site ====="
-          sed -n '/Parallax GPU reduce/,/__plx_result;/p' probe_reduce.cpp | head -20 || true
           # Compile the rewritten source + link runtime, then run on lavapipe.
           "$CLANGXX" -std=c++20 -O2 probe_reduce.cpp \
             -I parallax-runtime/include -L parallax-runtime/out \
-            -lparallax-runtime -o probe_reduce 2>compile_reduce.log || true
-          echo "----- compile log -----"; cat compile_reduce.log | head -30
+            -lparallax-runtime -o probe_reduce 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
           out="$(./probe_reduce 2>&1)" || true
           echo "$out"
