@@ -494,6 +494,40 @@ jobs:
             || { echo "::error::count_if produced wrong result"; exit 1; }
           echo "PASS: std::count_if offloaded (predicate -> count -> reduce)"
 
+      - name: "GATE (any/all/none_of): predicate quantifiers on the GPU"
+        run: |
+          # Derived from count_if: any_of = count>0, all_of = count==n, none_of =
+          # count==0. v[i]=i over [0,100). a(any x>98.5)=1, b(all x>=0)=1,
+          # c(none x>200)=1, d(all x>50)=0.
+          cat > probe_of.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(100);
+              for (int i = 0; i < 100; ++i) v[i] = static_cast<float>(i);
+              bool a = std::any_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 98.5f; });
+              bool b = std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x >= 0.0f; });
+              bool c = std::none_of(std::execution::par, v.begin(), v.end(), [](float x){ return x > 200.0f; });
+              bool d = std::all_of (std::execution::par, v.begin(), v.end(), [](float x){ return x > 50.0f; });
+              std::printf("of a=%d b=%d c=%d d=%d expected=1 1 1 0\n", a, b, c, d);
+              return (a && b && c && !d) ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_of.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_of.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_of 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_of 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "of a=1 b=1 c=1 d=0" \
+            || { echo "::error::any/all/none_of produced wrong result"; exit 1; }
+          echo "PASS: std::any_of/all_of/none_of offloaded (predicate quantifiers)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

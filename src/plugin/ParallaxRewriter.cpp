@@ -57,7 +57,10 @@ struct TransformInfo {
 
     // Phase 3: count_if = (predicate->0/1 transform) then '+' reduce, yielding an
     // integer count. Reuses the transform_reduce orchestration with a count cast.
+    // count_yield selects the final host expression over the GPU count:
+    // 0 = count (long), 1 = any_of (>0), 2 = all_of (==n), 3 = none_of (==0).
     bool is_count = false;
+    int count_yield = 0;
 
     // NEW V2: Class context for function objects
     ClassContext class_context;
@@ -278,8 +281,14 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  parallax_reduce(" << k << "_r, __plx_scratch.data(), __plx_n, sizeof("
            << et << "), &__plx_gpu);\n";
         if (transform.is_count) {
-            // count_if: the reduction summed 1/0 contributions; yield an integer count.
-            rs << "  (long)__plx_gpu;\n";
+            // The reduction summed 1/0 predicate contributions. Yield the count, or
+            // the corresponding boolean for any_of/all_of/none_of.
+            switch (transform.count_yield) {
+                case 1: rs << "  ((long)__plx_gpu > 0);\n"; break;              // any_of
+                case 2: rs << "  ((long)__plx_gpu == (long)__plx_n);\n"; break; // all_of
+                case 3: rs << "  ((long)__plx_gpu == 0);\n"; break;            // none_of
+                default: rs << "  (long)__plx_gpu;\n"; break;                  // count_if
+            }
         } else {
             std::string init = transform.init_expr
                 ? getSourceText(transform.init_expr->getSourceRange()) : (et + "()");
@@ -941,9 +950,13 @@ public:
         // then '+' reduce. Reuses the transform_reduce orchestration; the transform
         // kernel is built from the predicate in "predicate count" mode, the reduce
         // kernel is the baked-in '+', and the result is cast to an integer count.
-        if (info.algorithm_name == "count_if") {
+        if (info.algorithm_name == "count_if" || info.algorithm_name == "any_of" ||
+            info.algorithm_name == "all_of" || info.algorithm_name == "none_of") {
+            const std::string& an = info.algorithm_name;
+            info.count_yield = (an == "any_of") ? 1 : (an == "all_of") ? 2
+                             : (an == "none_of") ? 3 : 0;
             if (call->getNumArgs() != 4) {
-                llvm::errs() << "[ParallaxCollector] count_if: expected 4 args; CPU\n";
+                llvm::errs() << "[ParallaxCollector] " << an << ": expected 4 args; CPU\n";
                 return true;
             }
             extractIterators(call, info.first_iterator, info.last_iterator);
@@ -1336,7 +1349,8 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
     if (name != "std::for_each" && name != "std::for_each_n" &&
         name != "std::transform" && name != "std::reduce" &&
         name != "std::transform_reduce" && name != "std::count_if" &&
-        name != "std::fill" && name != "std::copy" && name != "std::any_of") {
+        name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
+        name != "std::fill" && name != "std::copy") {
         return false;
     }
 
