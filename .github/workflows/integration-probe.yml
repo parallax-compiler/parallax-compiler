@@ -532,6 +532,40 @@ jobs:
           run_one noneof "std::none_of(std::execution::par, v.begin(), v.end(), [](float x){ return x > 200.0f; })" 1
           echo "PASS: std::any_of/all_of/none_of offloaded (predicate quantifiers)"
 
+      - name: "DIAG: two reduce-family calls in one binary (localize crash)"
+        continue-on-error: true
+        run: |
+          cat > probe_mc.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(100);
+              for (int i = 0; i < 100; ++i) v[i] = static_cast<float>(i);
+              std::fprintf(stderr, "MARK call1 begin\n");
+              long c1 = std::count_if(std::execution::par, v.begin(), v.end(), [](float x){ return x > 49.5f; });
+              std::fprintf(stderr, "MARK call1 done c1=%ld\n", c1);
+              std::fprintf(stderr, "MARK call2 begin\n");
+              long c2 = std::count_if(std::execution::par, v.begin(), v.end(), [](float x){ return x > 9.5f; });
+              std::fprintf(stderr, "MARK call2 done c2=%ld\n", c2);
+              std::printf("mc c1=%ld c2=%ld\n", c1, c2);
+              return 0;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_mc.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_mc.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_mc 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          set +e
+          ./probe_mc; echo "MARK exit=$?"
+          echo "--- under gdb ---"
+          sudo apt-get install -y gdb >/dev/null 2>&1 || true
+          gdb -batch -ex run -ex bt --args ./probe_mc 2>&1 | grep -iE "MARK|signal|#[0-9]|in (launch|dispatch|vk|parallax|KernelLauncher)" | head -40 || true
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
