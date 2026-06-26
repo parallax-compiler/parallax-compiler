@@ -9,6 +9,8 @@
 #include <clang/Frontend/CompilerInvocation.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -1888,6 +1890,10 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     inv->getFrontendOpts().Inputs.emplace_back(
         source_path, clang::InputKind(clang::Language::CXX));
     inv->getCodeGenOpts().OptimizationLevel = 0;
+    // Emit line-table debug info so each emitted operator() carries its source line.
+    // We select the target lambda by source location (robust), because mangled-name
+    // lookup is ambiguous: same-signature lambdas in a TU can share a discriminator.
+    inv->getCodeGenOpts().setDebugInfo(llvm::codegenoptions::DebugLineTablesOnly);
     // Disable FP contraction so a*b+c stays as separate fmul/fadd instead of
     // llvm.fmuladd (kept simple for the SPIR-V translator; fmuladd is also handled).
     inv->getLangOpts().setDefaultFPContractMode(clang::LangOptions::FPM_Off);
@@ -1911,7 +1917,7 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         return nullptr;
     }
 
-    // Locate operator() by its mangled name in the freshly emitted module.
+    // Compute the mangled name (used as a fallback and for logging).
     std::unique_ptr<clang::MangleContext> mangler(ast_context.createMangleContext());
     std::string mangled;
     {
@@ -1923,14 +1929,36 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         }
     }
 
-    llvm::Function* target = module->getFunction(mangled);
+    // Primary lookup: match the emitted operator() by SOURCE LINE. Mangled-name
+    // lookup is ambiguous — same-signature lambdas in one TU can all mangle to
+    // '$_0' (no Sema-assigned discriminator), so getFunction() would return the
+    // first lambda for every call. The source line is unique per lambda.
+    unsigned target_line =
+        ast_context.getSourceManager().getExpansionLineNumber(method->getLocation());
+    llvm::Function* target = nullptr;
+    unsigned matches = 0;
+    for (llvm::Function& f : *module) {
+        if (f.isDeclaration()) continue;
+        llvm::DISubprogram* sp = f.getSubprogram();
+        if (sp && sp->getLine() == target_line) { target = &f; ++matches; }
+    }
+    if (matches != 1) {
+        // Ambiguous or no line match — fall back to the mangled name.
+        llvm::Function* byname = module->getFunction(mangled);
+        if (byname && !byname->isDeclaration()) target = byname;
+        else if (matches == 0) target = nullptr;
+    }
     if (!target || target->isDeclaration()) {
-        llvm::errs() << "[CodeGen] Could not locate emitted operator() '"
-                     << mangled << "' in module\n";
+        llvm::errs() << "[CodeGen] Could not locate emitted operator() '" << mangled
+                     << "' (line " << target_line << ", " << matches << " line matches)\n";
         return nullptr;
     }
-    llvm::errs() << "[CodeGen] Located operator(): " << mangled
-                 << " (" << target->arg_size() << " args)\n";
+    llvm::errs() << "[CodeGen] Located operator(): " << target->getName().str()
+                 << " (line " << target_line << ", " << target->arg_size() << " args)\n";
+
+    // Done selecting; strip debug info so the wrapper/inline/mem2reg/SPIR-V path
+    // sees clean IR (no DILocations on a wrapper that has no DISubprogram).
+    llvm::StripDebugInfo(*module);
 
     // The member operator() has an implicit leading 'this' (the closure object).
     // Downstream SPIR-V codegen expects a plain kernel whose first parameter is the
