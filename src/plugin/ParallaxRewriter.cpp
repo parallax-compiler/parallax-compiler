@@ -274,10 +274,7 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
            << "_r_spirv, sizeof(" << k << "_r_spirv)/sizeof(uint32_t));\n";
         rs << "  auto __plx_first = (" << first_it << ");\n";
         rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
-        // Static (per call site) so the scratch keeps a stable, unique host address:
-        // a fresh local vector would be freed each call and its address reused, and
-        // the runtime caches device buffers by host pointer (stale-buffer crash).
-        rs << "  static std::vector<" << et << "> __plx_scratch; __plx_scratch.resize(__plx_n);\n";
+        rs << "  std::vector<" << et << "> __plx_scratch(__plx_n);\n";
         rs << "  parallax_kernel_launch_transform(" << k << "_t, (void*)&(*__plx_first), "
            << "__plx_scratch.data(), __plx_n, sizeof(" << et << "));\n";
         rs << "  " << et << " __plx_gpu = " << et << "();\n";
