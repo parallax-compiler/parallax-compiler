@@ -14,6 +14,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
+#include <functional>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
@@ -2005,16 +2006,41 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     std::vector<llvm::Type*> wrapper_params(target_fty->param_begin() + 1,
                                             target_fty->param_end());
     size_t num_data_params = wrapper_params.size();
-    if (closure_ty)
-        for (llvm::Type* ft : closure_ty->elements()) wrapper_params.push_back(ft);
+
+    // Flatten the closure into LEAF scalars (recursively through nested structs and
+    // arrays). Each leaf becomes one wrapper arg; since the runtime packs the captured
+    // values contiguously, a captured POD struct's fields line up by byte offset.
+    std::vector<std::vector<unsigned>> leaf_paths;  // GEP indices after the leading 0
+    std::vector<llvm::Type*> leaf_types;
+    if (closure_ty) {
+        std::function<void(llvm::Type*, std::vector<unsigned>)> flatten =
+            [&](llvm::Type* t, std::vector<unsigned> path) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(t)) {
+                    for (unsigned i = 0; i < st->getNumElements(); ++i) {
+                        auto p = path; p.push_back(i);
+                        flatten(st->getElementType(i), p);
+                    }
+                } else if (auto* at = llvm::dyn_cast<llvm::ArrayType>(t)) {
+                    for (unsigned i = 0; i < at->getNumElements(); ++i) {
+                        auto p = path; p.push_back(i);
+                        flatten(at->getElementType(), p);
+                    }
+                } else {
+                    leaf_paths.push_back(std::move(path));
+                    leaf_types.push_back(t);
+                }
+            };
+        flatten(closure_ty, {});
+        for (llvm::Type* lt : leaf_types) wrapper_params.push_back(lt);
+    }
 
     llvm::FunctionType* wrapper_fty =
         llvm::FunctionType::get(target_fty->getReturnType(), wrapper_params, false);
     llvm::Function* wrapper = llvm::Function::Create(
         wrapper_fty, llvm::Function::ExternalLinkage, "__parallax_kernel_body", module.get());
     if (closure_ty)
-        llvm::errs() << "[CodeGen] Lambda captures " << closure_ty->getNumElements()
-                     << " value(s); reconstructing closure in the kernel\n";
+        llvm::errs() << "[CodeGen] Lambda captures " << leaf_types.size()
+                     << " leaf value(s); reconstructing closure in the kernel\n";
 
     llvm::BasicBlock* entry =
         llvm::BasicBlock::Create(*llvm_context_, "entry", wrapper);
@@ -2025,9 +2051,13 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     llvm::Value* this_val;
     if (closure_ty) {
         llvm::Value* clo = builder.CreateAlloca(closure_ty);
-        for (unsigned i = 0; i < closure_ty->getNumElements(); ++i) {
-            llvm::Value* field = builder.CreateStructGEP(closure_ty, clo, i);
-            builder.CreateStore(wrapper->getArg(num_data_params + i), field);
+        llvm::Type* i32 = llvm::Type::getInt32Ty(*llvm_context_);
+        for (size_t li = 0; li < leaf_paths.size(); ++li) {
+            std::vector<llvm::Value*> idxs;
+            idxs.push_back(llvm::ConstantInt::get(i32, 0));  // deref the closure pointer
+            for (unsigned ix : leaf_paths[li]) idxs.push_back(llvm::ConstantInt::get(i32, ix));
+            llvm::Value* field = builder.CreateGEP(closure_ty, clo, idxs);
+            builder.CreateStore(wrapper->getArg(num_data_params + li), field);
         }
         this_val = clo;
     } else {

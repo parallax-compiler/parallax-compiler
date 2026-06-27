@@ -758,6 +758,41 @@ jobs:
             || { echo "::error::8-byte capture produced wrong result (member alignment)"; exit 1; }
           echo "PASS: 8-byte (double) captures aligned correctly"
 
+      - name: "GATE (capture struct): capture a POD struct by value"
+        run: |
+          # The lambda captures a struct by value; CodeGen flattens the closure
+          # (recursively) into the struct's scalar fields, which line up by byte
+          # offset with the runtime's packing. x*p.a + p.b with p={2,1} over 3 -> 7.
+          cat > probe_caps.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          struct Params { float a; float b; };
+          int main() {
+              Params p{2.0f, 1.0f};
+              std::vector<float> d(64, 3.0f);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [p](float& x) { x = x * p.a + p.b; });
+              std::printf("caps result=%.1f expected=7.0\n", d[0]);
+              return (d[0] == 7.0f) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/caps.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_caps.cpp -o /dev/null 2> caps.log || true
+          grep -E "captures [0-9]+ leaf" caps.log | head -1 || true
+          [ -f caps.spv ] && { spirv-val caps.spv || { echo "::error::struct-capture SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_caps.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_caps 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_caps 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "caps result=7.0" \
+            || { echo "::error::struct-by-value capture produced wrong result"; exit 1; }
+          echo "PASS: struct-by-value capture offloaded (closure flattened)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
