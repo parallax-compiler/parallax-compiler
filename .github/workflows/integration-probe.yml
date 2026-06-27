@@ -692,6 +692,39 @@ jobs:
             || { echo "::error::by-value capture produced wrong result"; exit 1; }
           echo "PASS: by-value lambda captures offloaded (closure reconstructed in kernel)"
 
+      - name: "GATE (capture 8-byte): two double captures (member alignment)"
+        run: |
+          # Two 8-byte captures: the captures-struct member offsets must align to 8
+          # (a@0, b@8). The old fixed +4 stride put b@4, overlapping a. x*a+b with
+          # a=2, b=1 over x=3 -> 7.
+          cat > probe_cap8.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              double a = 2.0, b = 1.0;
+              std::vector<double> d(64, 3.0);
+              std::for_each(std::execution::par, d.begin(), d.end(),
+                            [a, b](double& x) { x = x * a + b; });
+              std::printf("cap8 result=%.1f expected=7.0\n", d[0]);
+              return (d[0] == 7.0) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/cap8.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_cap8.cpp -o /dev/null 2>/dev/null || true
+          [ -f cap8.spv ] && { spirv-val cap8.spv || { echo "::error::8-byte capture SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_cap8.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_cap8 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_cap8 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "cap8 result=7.0" \
+            || { echo "::error::8-byte capture produced wrong result (member alignment)"; exit 1; }
+          echo "PASS: 8-byte (double) captures aligned correctly"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

@@ -1644,12 +1644,17 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         struct_ops.insert(struct_ops.end(), capture_member_types.begin(), capture_member_types.end());
         builder.emit_op(SPIRVOp::OpTypeStruct, struct_ops);
 
-        // Add member decorations for offsets
+        // Member offsets follow each scalar's natural alignment (size), matching the
+        // host C struct the runtime packs: a double/int64 is 8-byte aligned, so the
+        // offset must round up to 8 — a fixed +4 corrupted 8-byte captures.
         builder.set_section(SPIRVBuilder::Section::Decorations);
         uint32_t offset = 0;
-        for (uint32_t i = 0; i < capture_member_types.size(); ++i) {
+        for (uint32_t i = 0; i < true_scalars.size(); ++i) {
+            uint32_t sz = static_cast<uint32_t>(true_scalars[i]->getType()->getPrimitiveSizeInBits() / 8);
+            if (sz < 4) sz = 4;
+            offset = (offset + (sz - 1)) & ~(sz - 1);  // align up to the member size
             builder.emit_op(SPIRVOp::OpMemberDecorate, {captures_struct_id, i, 35 /* Offset */, offset});
-            offset += 4;  // Each member is 4 bytes (float or uint32)
+            offset += sz;
         }
         builder.emit_op(SPIRVOp::OpDecorate, {captures_struct_id, 2 /* Block */});
 
