@@ -494,6 +494,39 @@ jobs:
             || { echo "::error::transform_reduce float->int produced wrong result"; exit 1; }
           echo "PASS: type-changing transform_reduce (float->int) offloaded"
 
+      - name: "GATE (transform_reduce widen): float elements -> double accumulator"
+        run: |
+          # Differing in/out element BYTE sizes (float 4 -> double 8): transform2
+          # sizes the in/out buffers separately. 256 * 2.5 = 640.0, accumulated in
+          # double. Exercises FPExt + the runtime out_elem_size path.
+          cat > probe_trw.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(256, 2.5f);
+              double r = std::transform_reduce(std::execution::par, v.begin(), v.end(), 0.0,
+                                               [](double a, double b){ return a + b; },
+                                               [](float x){ return (double)x; });
+              std::printf("trw result=%.1f expected=640.0\n", r);
+              return (r == 640.0) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/trw.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_trw.cpp -o /dev/null 2>/dev/null || true
+          [ -f trw.spv ] && { spirv-val trw.spv || { echo "::error::widen SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_trw.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_trw 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_trw 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "trw result=640.0" \
+            || { echo "::error::float->double transform_reduce produced wrong result"; exit 1; }
+          echo "PASS: widening transform_reduce (float->double) offloaded"
+
       - name: "GATE (count_if): predicate count on the GPU"
         run: |
           # count_if = (predicate -> 0/1 transform) then '+' reduce. v[i]=i over

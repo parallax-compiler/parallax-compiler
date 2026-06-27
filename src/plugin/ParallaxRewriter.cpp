@@ -283,8 +283,10 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  auto __plx_first = (" << first_it << ");\n";
         rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
         rs << "  std::vector<" << acc << "> __plx_scratch(__plx_n);\n";
-        rs << "  parallax_kernel_launch_transform(" << k << "_t, (void*)&(*__plx_first), "
-           << "__plx_scratch.data(), __plx_n, sizeof(" << acc << "));\n";
+        // transform2 takes separate in/out element sizes: the input is the element
+        // type T, the scratch/output is the accumulator type U (may differ in size).
+        rs << "  parallax_kernel_launch_transform2(" << k << "_t, (void*)&(*__plx_first), "
+           << "__plx_scratch.data(), __plx_n, sizeof(" << et << "), sizeof(" << acc << "));\n";
         rs << "  " << acc << " __plx_gpu = " << acc << "();\n";
         rs << "  parallax_reduce(" << k << "_r, __plx_scratch.data(), __plx_n, sizeof("
            << acc << "), &__plx_gpu);\n";
@@ -921,18 +923,13 @@ public:
             info.spirv_transform = tgen.generate_from_lambda(top_func, {"float", "float&"});
 
             // Accumulator U = the transform op's return type (may differ from the
-            // element T, e.g. float -> int). The scratch + reduce work in U. Until
-            // the runtime supports differing in/out element byte sizes, restrict to
-            // sizeof(U) == sizeof(T).
+            // element T, e.g. float -> int or float -> double). The transform reads T
+            // / writes U (transform2 sizes them separately); the scratch + reduce work
+            // in U.
             clang::QualType accQT = top_lambda->getCallOperator()->getReturnType();
             SPIRVGenerator::ReduceElemType ek_acc;
             if (!elem_kind(accQT, ek_acc)) {
                 llvm::errs() << "[ParallaxCollector] transform_reduce: unsupported accumulator type; CPU\n";
-                return true;
-            }
-            if (context_.getTypeSize(accQT) != context_.getTypeSize(elemQT)) {
-                llvm::errs() << "[ParallaxCollector] transform_reduce: differing in/out element "
-                                "sizes not yet supported; CPU\n";
                 return true;
             }
             info.acc_type_str = accQT.getUnqualifiedType().getAsString();
