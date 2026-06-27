@@ -1662,10 +1662,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         captures_var_id = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpVariable, {ptr_captures_storage, captures_var_id, 2 /* Uniform */});
         builder.set_section(SPIRVBuilder::Section::Decorations);
-        builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
+        // Captures are bound at the runtime's FIXED uniform slot (binding 2):
+        // launch_with_captures always binds the captures uniform there, regardless
+        // of how many data buffers (0=for_each, 0/1=transform) precede it.
+        const uint32_t kCapturesBinding = 2;
+        builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 33 /* Binding */, kCapturesBinding});
         builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 34 /* DescriptorSet */, 0});
 
-        llvm::errs() << "[SPIRVGenerator] Created captures storage buffer at binding " << binding_idx << "\n";
+        llvm::errs() << "[SPIRVGenerator] Created captures uniform block at binding " << kCapturesBinding << "\n";
         binding_idx++;
     }
 
