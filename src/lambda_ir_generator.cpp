@@ -13,6 +13,7 @@
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
@@ -1970,20 +1971,73 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         llvm::errs() << "[CodeGen] operator() has no 'this' parameter; unexpected\n";
         return nullptr;
     }
+
+    // Recover the closure struct type (= the by-value captures) from a GEP in
+    // operator() whose base traces to 'this' (arg 0). Captureless lambdas have none.
+    llvm::StructType* closure_ty = nullptr;
+    {
+        llvm::Value* this_arg = target->getArg(0);
+        auto from_gep = [](llvm::Value* base) -> llvm::StructType* {
+            for (llvm::User* u : base->users())
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(u))
+                    if (gep->getPointerOperand() == base)
+                        if (auto* st = llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType()))
+                            return st;
+            return nullptr;
+        };
+        closure_ty = from_gep(this_arg);
+        if (!closure_ty) {  // -O0: 'this' is stored to an alloca, loaded, then GEP'd.
+            for (llvm::User* u : this_arg->users()) {
+                auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+                if (!st || st->getValueOperand() != this_arg) continue;
+                auto* slot = llvm::dyn_cast<llvm::AllocaInst>(st->getPointerOperand());
+                if (!slot) continue;
+                for (llvm::User* su : slot->users())
+                    if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(su))
+                        if ((closure_ty = from_gep(ld))) break;
+                if (closure_ty) break;
+            }
+        }
+    }
+
+    // Wrapper params = operator()'s data args (after 'this'), then one scalar arg per
+    // capture (in closure-field order, matching the runtime's captures packing).
     std::vector<llvm::Type*> wrapper_params(target_fty->param_begin() + 1,
                                             target_fty->param_end());
+    size_t num_data_params = wrapper_params.size();
+    if (closure_ty)
+        for (llvm::Type* ft : closure_ty->elements()) wrapper_params.push_back(ft);
+
     llvm::FunctionType* wrapper_fty =
         llvm::FunctionType::get(target_fty->getReturnType(), wrapper_params, false);
     llvm::Function* wrapper = llvm::Function::Create(
         wrapper_fty, llvm::Function::ExternalLinkage, "__parallax_kernel_body", module.get());
+    if (closure_ty)
+        llvm::errs() << "[CodeGen] Lambda captures " << closure_ty->getNumElements()
+                     << " value(s); reconstructing closure in the kernel\n";
 
     llvm::BasicBlock* entry =
         llvm::BasicBlock::Create(*llvm_context_, "entry", wrapper);
     llvm::IRBuilder<> builder(entry);
+
+    // Build the 'this' operator() reads from: a stack closure filled from the capture
+    // args (SROA+mem2reg later promote it), or null for a captureless lambda.
+    llvm::Value* this_val;
+    if (closure_ty) {
+        llvm::Value* clo = builder.CreateAlloca(closure_ty);
+        for (unsigned i = 0; i < closure_ty->getNumElements(); ++i) {
+            llvm::Value* field = builder.CreateStructGEP(closure_ty, clo, i);
+            builder.CreateStore(wrapper->getArg(num_data_params + i), field);
+        }
+        this_val = clo;
+    } else {
+        this_val = llvm::ConstantPointerNull::get(
+            llvm::cast<llvm::PointerType>(target_fty->getParamType(0)));  // null 'this'
+    }
+
     std::vector<llvm::Value*> call_args;
-    call_args.push_back(llvm::ConstantPointerNull::get(
-        llvm::cast<llvm::PointerType>(target_fty->getParamType(0))));  // null 'this'
-    for (llvm::Argument& a : wrapper->args()) call_args.push_back(&a);
+    call_args.push_back(this_val);
+    for (size_t i = 0; i < num_data_params; ++i) call_args.push_back(wrapper->getArg(i));
     llvm::CallInst* fwd = builder.CreateCall(target, call_args);
     if (wrapper_fty->getReturnType()->isVoidTy()) {
         builder.CreateRetVoid();
@@ -2042,6 +2096,10 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         llvm::FunctionAnalysisManager FAM;
         PB.registerFunctionAnalyses(FAM);
         llvm::FunctionPassManager FPM;
+        // SROA splits the reconstructed closure struct into per-field SSA values
+        // (mem2reg alone can't promote an alloca that has GEP field accesses), then
+        // mem2reg promotes the remaining scalar stack slots.
+        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
         FPM.addPass(llvm::PromotePass());  // mem2reg
         FPM.run(*wrapper, FAM);
     }

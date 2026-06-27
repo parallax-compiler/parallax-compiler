@@ -1653,13 +1653,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         }
         builder.emit_op(SPIRVOp::OpDecorate, {captures_struct_id, 2 /* Block */});
 
-        // Create storage buffer pointer for captures (binding after all data/captured buffers)
-        uint32_t ptr_captures_storage = get_pointer_type_id(builder, captures_struct_id, 12 /* StorageBuffer */);
+        // Captures live in a UNIFORM block (binding 2) to match the runtime's
+        // launch_with_captures, which binds a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.
+        uint32_t ptr_captures_storage = get_pointer_type_id(builder, captures_struct_id, 2 /* Uniform */);
 
         // Create captures variable
         builder.set_section(SPIRVBuilder::Section::Types);
         captures_var_id = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpVariable, {ptr_captures_storage, captures_var_id, 12 /* StorageBuffer */});
+        builder.emit_op(SPIRVOp::OpVariable, {ptr_captures_storage, captures_var_id, 2 /* Uniform */});
         builder.set_section(SPIRVBuilder::Section::Decorations);
         builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 33 /* Binding */, static_cast<uint32_t>(binding_idx)});
         builder.emit_op(SPIRVOp::OpDecorate, {captures_var_id, 34 /* DescriptorSet */, 0});
@@ -1774,8 +1775,8 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
         uint32_t scalar_type_id = get_type_id(builder, scalar_type);
 
-        // Access chain to get pointer to this capture member in storage buffer
-        uint32_t ptr_scalar_sb = get_pointer_type_id(builder, scalar_type_id, 12 /* StorageBuffer */);
+        // Access chain to get pointer to this capture member in the uniform block.
+        uint32_t ptr_scalar_sb = get_pointer_type_id(builder, scalar_type_id, 2 /* Uniform */);
         uint32_t ptr_scalar = builder.get_next_id();
         builder.emit_op(SPIRVOp::OpAccessChain, {ptr_scalar_sb, ptr_scalar, captures_var_id, member_idx});
 
