@@ -343,10 +343,20 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "      parallax_sort(" << k << ", (void*)&(*__plx_first), __plx_n, sizeof(" << et << "));\n";
         rs << "    } else {\n";
         // Pad to the next power of two with max() so the padding sorts to the tail.
-        rs << "      std::vector<" << et << "> __plx_pad(__plx_m, std::numeric_limits<" << et << ">::max());\n";
-        rs << "      std::copy(__plx_first, std::next(__plx_first, __plx_n), __plx_pad.begin());\n";
-        rs << "      parallax_sort(" << k << ", __plx_pad.data(), __plx_m, sizeof(" << et << "));\n";
-        rs << "      std::copy(__plx_pad.begin(), std::next(__plx_pad.begin(), __plx_n), __plx_first);\n";
+        // The scratch comes from the arena so the sort uses the zero-copy GPU path
+        // (a default-allocator vector would take the slower register/sync path).
+        rs << "      " << et << "* __plx_pad = (" << et << "*)parallax_arena_alloc("
+           << "__plx_m * sizeof(" << et << "), 16);\n";
+        rs << "      if (__plx_pad) {\n";
+        rs << "        for (size_t __plx_i = 0; __plx_i < __plx_m; ++__plx_i) "
+           << "__plx_pad[__plx_i] = std::numeric_limits<" << et << ">::max();\n";
+        rs << "        std::copy(__plx_first, std::next(__plx_first, __plx_n), __plx_pad);\n";
+        rs << "        parallax_sort(" << k << ", __plx_pad, __plx_m, sizeof(" << et << "));\n";
+        rs << "        std::copy(__plx_pad, __plx_pad + __plx_n, __plx_first);\n";
+        rs << "        parallax_arena_free(__plx_pad);\n";
+        rs << "      } else {\n";  // arena unavailable: sort on the CPU as a fallback
+        rs << "        std::sort(__plx_first, std::next(__plx_first, __plx_n));\n";
+        rs << "      }\n";
         rs << "    }\n";
         rs << "  }\n";
         rs << "});";
