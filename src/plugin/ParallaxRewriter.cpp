@@ -1122,15 +1122,14 @@ public:
         // the range to a power of two, sorts in place, and copies the prefix back. A
         // custom comparator (3rd arg) is not yet supported and falls back to the CPU.
         if (info.algorithm_name == "sort") {
-            extractIterators(call, info.first_iterator, info.last_iterator);
-            if (!info.first_iterator || !info.last_iterator) {
-                llvm::errs() << "[ParallaxCollector] sort: missing iterators; CPU\n";
-                return true;
-            }
-            if (call->getNumArgs() >= 4) {
+            // std::sort(par, first, last) is exactly 3 args; extractIterators' 3-arg
+            // path assumes no policy, so take first/last directly (arg1/arg2).
+            if (call->getNumArgs() != 3) {
                 llvm::errs() << "[ParallaxCollector] sort: custom comparator unsupported; CPU\n";
                 return true;
             }
+            info.first_iterator = call->getArg(1);
+            info.last_iterator = call->getArg(2);
 
             clang::QualType elemQT;
             if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
