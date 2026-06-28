@@ -740,6 +740,94 @@ jobs:
             || { echo "::error::bitwise/shift/mod produced a wrong result"; exit 1; }
           echo "PASS: integer bitwise/shift/modulo offloaded and matches the CPU reference"
 
+      - name: "GATE (branch): if/else in a kernel (OpSelectionMerge)"
+        run: |
+          # Hardening: a real two-way branch in the callable must lower to structured
+          # SPIR-V (OpSelectionMerge before the conditional branch), not invalid code.
+          # Values are integer-valued floats so the GPU result is bit-exact vs CPU.
+          cat > probe_branch.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 128;
+              std::vector<float> v(N), ref(N);
+              for (int i = 0; i < N; ++i) { v[i] = (float)i; ref[i] = (i > 5) ? i * 2.0f : i + 1.0f; }
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { if (x > 5.0f) x = x * 2.0f; else x = x + 1.0f; });
+              bool ok = std::equal(v.begin(), v.end(), ref.begin());
+              std::printf("branch ok=%d v[0]=%.1f v[10]=%.1f\n", ok ? 1 : 0, v[0], v[10]);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/br.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_branch.cpp -o /dev/null 2> br.log || true
+          if [ -f br.spv ]; then
+            spirv-val br.spv || { echo "::error::branch SPIR-V failed validation"; exit 1; }
+            spirv-dis br.spv 2>/dev/null | grep -q "OpSelectionMerge" \
+              || { echo "::error::no OpSelectionMerge — branch not structured"; exit 1; }
+          else
+            echo "::error::no branch SPIR-V (kernel not generated — if/else bailed)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_branch.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_branch 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_branch 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::branch kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "branch ok=1" \
+            || { echo "::error::if/else produced a wrong result"; exit 1; }
+          echo "PASS: if/else offloaded with structured control flow (OpSelectionMerge)"
+
+      - name: "GATE (loop): a for-loop in a kernel (OpLoopMerge + OpPhi)"
+        run: |
+          # Hardening: a counted loop with a carried accumulator must lower to a
+          # structured SPIR-V loop (OpLoopMerge) with OpPhi for the loop variables.
+          # acc += x four times == 4*x (exact for these integer-valued floats).
+          cat > probe_loop.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 128;
+              std::vector<float> v(N), ref(N);
+              for (int i = 0; i < N; ++i) { v[i] = (float)i; ref[i] = 4.0f * i; }
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { float acc = 0.0f; for (int k = 0; k < 4; ++k) acc += x; x = acc; });
+              bool ok = std::equal(v.begin(), v.end(), ref.begin());
+              std::printf("loop ok=%d v[1]=%.1f v[10]=%.1f\n", ok ? 1 : 0, v[1], v[10]);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/lp.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_loop.cpp -o /dev/null 2> lp.log || true
+          if [ -f lp.spv ]; then
+            spirv-val lp.spv || { echo "::error::loop SPIR-V failed validation"; exit 1; }
+            spirv-dis lp.spv 2>/dev/null | grep -q "OpLoopMerge" \
+              || { echo "::error::no OpLoopMerge — loop not structured"; exit 1; }
+            spirv-dis lp.spv 2>/dev/null | grep -q "OpPhi" \
+              || { echo "::error::no OpPhi — loop-carried variable not handled"; exit 1; }
+          else
+            echo "::error::no loop SPIR-V (kernel not generated — loop bailed)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_loop.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_loop 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_loop 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::loop kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "loop ok=1" \
+            || { echo "::error::loop produced a wrong result"; exit 1; }
+          echo "PASS: for-loop offloaded with structured control flow (OpLoopMerge + OpPhi)"
+
       - name: "GATE (cpu-fallback): an unsupported callable stays correct on the CPU"
         run: |
           # Hardening: a construct we can't lower (here std::cbrt, not in our GLSL map)

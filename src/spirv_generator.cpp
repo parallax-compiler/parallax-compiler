@@ -5,6 +5,9 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Analysis/PostDominators.h>
+#include <llvm/Analysis/LoopInfo.h>
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
@@ -138,6 +141,7 @@ enum class SPIRVOp : uint32_t {
     OpBitCount = 205,
     OpPhi = 245,
     OpControlBarrier = 224,
+    OpLoopMerge = 246,
     OpSelectionMerge = 247,
     OpLabel = 248,
     OpBranch = 249,
@@ -375,25 +379,76 @@ void SPIRVGenerator::translate_function(SPIRVBuilder& builder, llvm::Function* f
     reloc_host_base_id_ = 0;
     reloc_dev_base_id_ = 0;
 
-    // Translate basic blocks
+    // --- Structured control flow ---
+    // SPIR-V requires a structured CFG: every two-way branch must be preceded by an
+    // OpSelectionMerge (or OpLoopMerge for a loop header) naming its merge block, and
+    // forward references (loop PHIs, branch targets) need their result ids known up
+    // front. So: (1) pre-assign an id to every block and every instruction, then
+    // (2) use LLVM's dominator/loop analyses to emit the merge declarations. A CFG we
+    // can't structure (multiple loop exits/latches, no unique post-dominator merge,
+    // irreducible) sets translation_failed_ and the algorithm falls back to the CPU.
+    for (auto& bb : *func) {
+        if (!value_map.count(&bb)) value_map[&bb] = builder.get_next_id();
+        for (auto& inst : bb)
+            if (!value_map.count(&inst)) value_map[&inst] = builder.get_next_id();
+    }
+
+    llvm::DominatorTree DT(*func);
+    llvm::LoopInfo LI(DT);
+    llvm::PostDominatorTree PDT(*func);
+
+    // Emit the OpSelectionMerge / OpLoopMerge that must immediately precede a block's
+    // terminating conditional branch. Returns false (and flags failure) if the block
+    // heads a construct we can't give a single structured merge/continue target.
+    auto emit_merge = [&](llvm::BasicBlock* bb, llvm::Instruction* term) {
+        auto* br = llvm::dyn_cast_or_null<llvm::BranchInst>(term);
+        if (!br || br->isUnconditional()) return;  // no merge needed
+        llvm::Loop* L = LI.getLoopFor(bb);
+        if (L && L->getHeader() == bb) {
+            llvm::BasicBlock* exit  = L->getExitBlock();   // unique exit or null
+            llvm::BasicBlock* latch = L->getLoopLatch();   // unique latch or null
+            if (!exit || !latch) {
+                translation_failed_ = true;
+                llvm::errs() << "[SPIRVGenerator] loop without a unique exit/latch; "
+                                "leaving on CPU\n";
+                return;
+            }
+            builder.emit_op(SPIRVOp::OpLoopMerge,
+                            {value_map[exit], value_map[latch], 0 /* None */});
+        } else {
+            auto* node = PDT.getNode(bb);
+            llvm::BasicBlock* merge = (node && node->getIDom()) ? node->getIDom()->getBlock() : nullptr;
+            if (!merge || !value_map.count(merge)) {
+                translation_failed_ = true;
+                llvm::errs() << "[SPIRVGenerator] branch without a structured merge "
+                                "block (e.g. early return); leaving on CPU\n";
+                return;
+            }
+            builder.emit_op(SPIRVOp::OpSelectionMerge, {value_map[merge], 0 /* None */});
+        }
+    };
+
     bool is_entry_block = true;
     for (auto& bb : *func) {
-        // ... (label handling)
-        uint32_t label_id = builder.get_next_id();
-        value_map[&bb] = label_id;
-        builder.emit_op(SPIRVOp::OpLabel, {label_id});
+        builder.emit_op(SPIRVOp::OpLabel, {value_map[&bb]});
 
         if (is_entry_block && element_is_pointer_) {
             ensure_reloc_bases(builder, func->getContext());
         }
         is_entry_block = false;
 
-        // Translate instructions
+        // Body instructions, then the structured-merge declaration, then the
+        // terminator (the merge must be the second-to-last instruction in the block).
+        llvm::Instruction* term = bb.getTerminator();
         for (auto& inst : bb) {
+            if (&inst == term) break;
             translate_instruction(builder, &inst, value_map);
         }
+        emit_merge(&bb, term);
+        if (translation_failed_) { builder.emit_op(SPIRVOp::OpFunctionEnd, {}); return; }
+        if (term) translate_instruction(builder, term, value_map);
     }
-    
+
     builder.emit_op(SPIRVOp::OpFunctionEnd, {});
 }
 
@@ -405,9 +460,18 @@ static uint32_t spirv_align_of(llvm::Type* t) {
 
 void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
                                            std::unordered_map<llvm::Value*, uint32_t>& value_map) {
-    uint32_t result_id = builder.get_next_id();
-    value_map[inst] = result_id;
-    
+    // Use a result id pre-assigned by translate_function (so loop PHIs and other
+    // forward references already resolve); otherwise allocate one (e.g. the reduce
+    // user-op path, which does not pre-assign instruction ids).
+    uint32_t result_id;
+    auto pre = value_map.find(inst);
+    if (pre != value_map.end()) {
+        result_id = pre->second;
+    } else {
+        result_id = builder.get_next_id();
+        value_map[inst] = result_id;
+    }
+
     switch (inst->getOpcode()) {
         case llvm::Instruction::Add: {
              uint32_t op1_add = get_value_id(builder, inst->getOperand(0), value_map);
@@ -835,9 +899,23 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             break;
         }
 
+        case llvm::Instruction::PHI: {
+            // OpPhi <type> <result> (<value> <predecessor-label>)+. Incoming values
+            // may be defined later (loop back-edge) — pre-assigned ids make that
+            // forward reference valid. Predecessor labels are pre-assigned too.
+            auto* phi = llvm::cast<llvm::PHINode>(inst);
+            std::vector<uint32_t> ops = {get_type_id(builder, phi->getType()), result_id};
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+                ops.push_back(get_value_id(builder, phi->getIncomingValue(i), value_map));
+                ops.push_back(get_value_id(builder, phi->getIncomingBlock(i), value_map));
+            }
+            builder.emit_op(SPIRVOp::OpPhi, ops);
+            break;
+        }
+
         default:
-            // An LLVM instruction we don't lower yet (e.g. a PHI, an aggregate op,
-            // an unsupported intrinsic). Emitting nothing would leave a dangling SSA
+            // An LLVM instruction we don't lower yet (e.g. an aggregate op or an
+            // unsupported intrinsic). Emitting nothing would leave a dangling SSA
             // id and produce INVALID SPIR-V silently. Instead, flag the failure so
             // generate_from_lambda returns empty SPIR-V and the rewriter keeps the
             // algorithm on the CPU. Loud, not silent; correct, not broken.
