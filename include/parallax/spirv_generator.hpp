@@ -51,6 +51,15 @@ public:
     // combine step (the user op path). Null = baked-in '+'.
     std::vector<uint32_t> generate_reduce_kernel(ReduceElemType elem,
                                                  llvm::Function* user_op = nullptr);
+
+    // Phase 5: inclusive prefix scan. Two fixed kernels the runtime dispatches in 3
+    // passes (see launch_scan): generate_scan_kernel does a per-workgroup Hillis-
+    // Steele inclusive scan in place (data@0) and writes each chunk total to
+    // blocksums@1; generate_scan_add_kernel adds each block's exclusive offset back
+    // (data@0, offsets@1). Logical GLSL450, baked-in '+'. Bindings/push match
+    // dispatch_reduce_level so the runtime treats them like the reduce kernel.
+    std::vector<uint32_t> generate_scan_kernel(ReduceElemType elem);
+    std::vector<uint32_t> generate_scan_add_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);

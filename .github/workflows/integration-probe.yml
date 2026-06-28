@@ -793,6 +793,54 @@ jobs:
             || { echo "::error::struct-by-value capture produced wrong result"; exit 1; }
           echo "PASS: struct-by-value capture offloaded (closure flattened)"
 
+      - name: "GATE (inclusive_scan): multi-block prefix scan on the GPU"
+        run: |
+          # Phase 5: the plugin detects std::inclusive_scan, emits two kernels (a
+          # per-workgroup Hillis-Steele scan with OpControlBarrier + a Workgroup
+          # shared array, and an add-block-offsets kernel), and replaces the call
+          # with a parallax_scan over the range. 1000 ones span 4 blocks of 256, so
+          # element 256 (= 257) only equals 257 if block 0's offset (256) is added.
+          cat > probe_scan.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <algorithm>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(1000, 1.0f);
+              std::inclusive_scan(std::execution::par, v.begin(), v.end(), v.begin());
+              std::printf("scan v[0]=%.1f v[255]=%.1f v[256]=%.1f v[999]=%.1f exp 1/256/257/1000\n",
+                          v[0], v[255], v[256], v[999]);
+              bool ok = (v[0]==1.0f) && (v[255]==256.0f) && (v[256]==257.0f) && (v[999]==1000.0f);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/scan.spv" PARALLAX_DUMP_SPIRV_ADD="$PWD/scan_add.spv" \
+            "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_scan.cpp -o /dev/null 2> scan.log || true
+          grep -E "inclusive_scan: generated" scan.log | head -1 || true
+          if [ -f scan.spv ]; then
+            spirv-val scan.spv || { echo "::error::scan SPIR-V failed validation"; exit 1; }
+            spirv-dis scan.spv 2>/dev/null | grep -q "OpControlBarrier" \
+              || { echo "::error::scan kernel has no OpControlBarrier"; exit 1; }
+          else
+            echo "::error::no scan SPIR-V produced (std::inclusive_scan not detected)"; exit 1
+          fi
+          [ -f scan_add.spv ] && { spirv-val scan_add.spv || { echo "::error::scan_add SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_scan.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_scan 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_scan 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::scan kernels were not offloaded"; exit 1; }
+          echo "$out" | grep -q "v\[256\]=257.0" \
+            || { echo "::error::scan wrong result (block-offset add failed)"; exit 1; }
+          echo "PASS: std::inclusive_scan(par) offloaded a multi-block GPU prefix scan"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

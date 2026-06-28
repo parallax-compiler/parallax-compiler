@@ -55,6 +55,10 @@ struct TransformInfo {
     bool is_transform_reduce = false;
     std::vector<uint32_t> spirv_transform;
 
+    // Phase 5: inclusive_scan. spirv holds the per-block scan kernel; spirv_transform
+    // holds the add-offsets kernel. output_iterator is d_first (the output range).
+    bool is_scan = false;
+
     // Phase 3: count_if = (predicate->0/1 transform) then '+' reduce, yielding an
     // integer count. Reuses the transform_reduce orchestration with a count cast.
     // count_yield selects the final host expression over the GPU count:
@@ -307,6 +311,40 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             rs << "  " << acc << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
             rs << "  __plx_result;\n";
         }
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 5: std::inclusive_scan -> load the two scan kernels and run parallax_scan
+    // over the output range (copying input in first if out-of-place). Yields the
+    // output end iterator, like std::inclusive_scan. Default '+' only.
+    if (transform.is_scan) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        std::string out_it   = getSourceText(transform.output_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU inclusive_scan (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_s", transform.spirv);
+        rs << generateSPIRVArray(k + "_a", transform.spirv_transform);
+        rs << "  static parallax_kernel_t " << k << "_s = nullptr, " << k << "_a = nullptr;\n";
+        rs << "  if (!" << k << "_s) " << k << "_s = parallax_kernel_load(" << k
+           << "_s_spirv, sizeof(" << k << "_s_spirv)/sizeof(uint32_t));\n";
+        rs << "  if (!" << k << "_a) " << k << "_a = parallax_kernel_load(" << k
+           << "_a_spirv, sizeof(" << k << "_a_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  auto __plx_dfirst = (" << out_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        // Out-of-place: stage the input into the output range first (host copy); the
+        // scan then runs in place over the output. In-place (d_first==first) skips it.
+        rs << "  if ((void*)&(*__plx_dfirst) != (void*)&(*__plx_first))\n";
+        rs << "    std::copy(__plx_first, std::next(__plx_first, __plx_n), __plx_dfirst);\n";
+        rs << "  parallax_scan(" << k << "_s, " << k << "_a, (void*)&(*__plx_dfirst), "
+           << "__plx_n, sizeof(" << et << "));\n";
+        rs << "  std::next(__plx_dfirst, __plx_n);\n";  // returns the output end iterator
         rs << "});";
         return rs.str();
     }
@@ -1041,6 +1079,66 @@ public:
             return true;
         }
 
+        // Phase 5: std::inclusive_scan(par, first, last, d_first) with the default
+        // '+' op. Generates the two fixed scan kernels (per-block scan + add-offsets)
+        // for the element type; the replacement runs parallax_scan over d_first
+        // (copying input first if d_first != first). A custom binary op is not yet
+        // supported (the kernels bake in '+'), so those fall back to the CPU.
+        if (info.algorithm_name == "inclusive_scan") {
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            // d_first is the 4th positional arg (after policy, first, last).
+            info.output_iterator = (call->getNumArgs() >= 4) ? call->getArg(3) : nullptr;
+            if (!info.first_iterator || !info.last_iterator || !info.output_iterator) {
+                llvm::errs() << "[ParallaxCollector] inclusive_scan: missing iterators; CPU\n";
+                return true;
+            }
+            // A custom binary op (5th arg) is not supported yet — bake-in '+' only.
+            if (call->getNumArgs() >= 5) {
+                llvm::errs() << "[ParallaxCollector] inclusive_scan: custom op unsupported; CPU\n";
+                return true;
+            }
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            // Also mark the output container (where the scan is written / scanned in place).
+            if (const clang::VarDecl* oc = traceIteratorToContainer(info.output_iterator)) {
+                if (!hasParallaxAllocator(oc->getType())) rewriter_.markContainerForAllocation(oc);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] inclusive_scan: element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] inclusive_scan: unsupported element type "
+                             << info.elem_type_str << "; CPU\n";
+                return true;
+            }
+
+            info.is_scan = true;
+            info.kernel_name = generateKernelName(info);
+
+            SPIRVGenerator sgen;
+            sgen.set_target_vulkan_version(1, 2);
+            info.spirv = sgen.generate_scan_kernel(ek);             // per-block scan
+            info.spirv_transform = sgen.generate_scan_add_kernel(ek); // add offsets
+            if (info.spirv.empty() || info.spirv_transform.empty()) {
+                llvm::errs() << "[ParallaxCollector] inclusive_scan: SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] inclusive_scan: generated scan("
+                         << info.spirv.size() << ") + add(" << info.spirv_transform.size()
+                         << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -1377,6 +1475,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform" && name != "std::reduce" &&
         name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
+        name != "std::inclusive_scan" &&
         name != "std::fill" && name != "std::copy") {
         return false;
     }
