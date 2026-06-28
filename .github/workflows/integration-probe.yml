@@ -690,6 +690,101 @@ jobs:
             || { echo "::error::std::sqrt kernel produced wrong result"; exit 1; }
           echo "PASS: std::sqrt offloaded (math libcall mapped to GLSL.std.450)"
 
+      - name: "GATE (bitwise): integer &|^ << >> and % in a kernel"
+        run: |
+          # Hardening: integer bitwise, shift, and modulo ops must lower to real
+          # SPIR-V (OpBitwise*/OpShift*/OpSRem), not silently produce invalid SPIR-V.
+          # The reference array is computed by a plain CPU loop (not a parallel
+          # algorithm, so not offloaded); the GPU result must match it exactly.
+          cat > probe_bit.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 256;
+              std::vector<int> v(N), ref(N);
+              for (int i = 0; i < N; ++i) {
+                  int x = i * 7 + 1;
+                  v[i] = x;
+                  int y = x; y = (y << 1) ^ (y & 6); y = y % 7; y = y | 1; y = y >> 0;
+                  ref[i] = y;
+              }
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](int& x) { x = (x << 1) ^ (x & 6); x = x % 7; x = x | 1; x = x >> 0; });
+              bool ok = std::equal(v.begin(), v.end(), ref.begin());
+              std::printf("bit ok=%d v[0]=%d ref[0]=%d v[100]=%d ref[100]=%d\n",
+                          ok ? 1 : 0, v[0], ref[0], v[100], ref[100]);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/bit.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_bit.cpp -o /dev/null 2> bit.log || true
+          if [ -f bit.spv ]; then
+            spirv-val bit.spv || { echo "::error::bitwise SPIR-V failed validation"; exit 1; }
+            spirv-dis bit.spv 2>/dev/null | grep -qE "OpBitwiseXor|OpBitwiseAnd|OpShiftLeftLogical|OpSRem" \
+              || { echo "::error::bitwise/shift/mod ops not emitted"; exit 1; }
+          else
+            echo "::error::no bitwise SPIR-V (kernel not generated)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_bit.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_bit 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_bit 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::bitwise kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "bit ok=1" \
+            || { echo "::error::bitwise/shift/mod produced a wrong result"; exit 1; }
+          echo "PASS: integer bitwise/shift/modulo offloaded and matches the CPU reference"
+
+      - name: "GATE (cpu-fallback): an unsupported callable stays correct on the CPU"
+        run: |
+          # Hardening: a construct we can't lower (here std::cbrt, not in our GLSL map)
+          # must make codegen BAIL (empty SPIR-V) so the call stays on the CPU and
+          # still produces the right answer — never a silent miscompile (alias-to-arg0)
+          # nor invalid SPIR-V. cbrt(27)=3, so 3*2=6.
+          cat > probe_fallback.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cmath>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(64, 27.0f);
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = std::cbrt(x) * 2.0f; });
+              std::printf("fallback result=%.1f expected=6.0\n", v[0]);
+              return (v[0] == 6.0f) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/fb.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_fallback.cpp -o /dev/null 2> fb.log || true
+          # HARD assertions: codegen must have bailed — no SPIR-V emitted and the
+          # plugin must say so. This is what proves "no silent miscompile / no
+          # invalid SPIR-V" regardless of whether the CPU par-backend is present.
+          if [ -f fb.spv ]; then echo "::error::emitted SPIR-V for an unsupported callable (should have bailed)"; exit 1; fi
+          grep -iqE "leaving on CPU|unsupported" fb.log \
+            || { echo "::error::codegen did not report the unsupported construct"; exit 1; }
+          echo "[fallback] codegen bailed (no SPIR-V) as required:"; grep -iE "leaving on CPU|unsupported" fb.log | head -2
+          # BEST-EFFORT: if the CPU parallel backend links (TBB present), confirm the
+          # left-on-CPU call still computes the right answer (cbrt(27)*2 = 6).
+          if "$CLANGXX" -std=c++20 -O2 probe_fallback.cpp \
+               -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -ltbb \
+               -o probe_fallback 2>/dev/null; then
+            export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+            out="$(./probe_fallback 2>&1)" || true
+            echo "$out" | grep -v "^\[" | head
+            echo "$out" | grep -q "fallback result=6.0" \
+              || { echo "::error::unsupported callable produced a wrong result on CPU (silent miscompile)"; exit 1; }
+            echo "PASS: unsupported callable bailed AND ran correctly on the CPU (cbrt result=6.0)"
+          else
+            echo "PASS: unsupported callable bailed to CPU (no SPIR-V emitted); CPU par-backend not linkable here, runtime check skipped"
+          fi
+
       - name: "GATE (capture): by-value lambda captures"
         run: |
           # The lambda captures two scalars by value; the kernel reconstructs the

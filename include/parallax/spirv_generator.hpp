@@ -152,6 +152,13 @@ private:
     uint32_t    reloc_host_base_id_ = 0;
     uint32_t    reloc_dev_base_id_ = 0;
     std::unordered_set<llvm::Value*> relocatable_values_;
+
+    // Set true when translate_instruction hits an LLVM instruction it cannot lower
+    // (an unsupported construct in the user callable). generate_from_lambda checks
+    // this and returns EMPTY SPIR-V so the rewriter leaves the algorithm on the CPU,
+    // rather than emitting invalid SPIR-V silently. Reset at the start of each
+    // generate_from_lambda. The name of the offending opcode is logged.
+    bool        translation_failed_ = false;
 };
 
 } // namespace parallax

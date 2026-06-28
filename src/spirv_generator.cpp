@@ -466,7 +466,54 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
             builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, op1, op2});
             break;
         }
-        
+
+        // Integer remainder / modulo. SRem = signed remainder (C++ '%' on signed),
+        // URem = unsigned, FRem = float fmod.
+        case llvm::Instruction::SRem:
+        case llvm::Instruction::URem:
+        case llvm::Instruction::FRem: {
+            uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+            SPIRVOp op = (inst->getOpcode() == llvm::Instruction::SRem) ? SPIRVOp::OpSRem
+                       : (inst->getOpcode() == llvm::Instruction::URem) ? SPIRVOp::OpUMod
+                                                                        : SPIRVOp::OpFRem;
+            builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+            break;
+        }
+
+        // Bitwise and/or/xor. On i1 (bool) operands these are logical connectives
+        // (e.g. `xor i1 %c, true` is `!c`); SPIR-V bitwise ops require integers, so
+        // emit the OpLogical* form for bool to stay valid.
+        case llvm::Instruction::And:
+        case llvm::Instruction::Or:
+        case llvm::Instruction::Xor: {
+            uint32_t op1 = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t op2 = get_value_id(builder, inst->getOperand(1), value_map);
+            const bool is_bool = inst->getType()->isIntegerTy(1);
+            SPIRVOp op;
+            switch (inst->getOpcode()) {
+                case llvm::Instruction::And: op = is_bool ? SPIRVOp::OpLogicalAnd : SPIRVOp::OpBitwiseAnd; break;
+                case llvm::Instruction::Or:  op = is_bool ? SPIRVOp::OpLogicalOr  : SPIRVOp::OpBitwiseOr;  break;
+                default:                     op = is_bool ? SPIRVOp::OpLogicalNotEqual : SPIRVOp::OpBitwiseXor; break;
+            }
+            builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, op1, op2});
+            break;
+        }
+
+        // Shifts. Shl and logical/arithmetic right shift. SPIR-V shift ops take the
+        // base then the shift amount, like LLVM.
+        case llvm::Instruction::Shl:
+        case llvm::Instruction::LShr:
+        case llvm::Instruction::AShr: {
+            uint32_t base = get_value_id(builder, inst->getOperand(0), value_map);
+            uint32_t shamt = get_value_id(builder, inst->getOperand(1), value_map);
+            SPIRVOp op = (inst->getOpcode() == llvm::Instruction::Shl)  ? SPIRVOp::OpShiftLeftLogical
+                       : (inst->getOpcode() == llvm::Instruction::LShr) ? SPIRVOp::OpShiftRightLogical
+                                                                        : SPIRVOp::OpShiftRightArithmetic;
+            builder.emit_op(op, {get_type_id(builder, inst->getType()), result_id, base, shamt});
+            break;
+        }
+
         case llvm::Instruction::Load: {
             llvm::Value* ptr_operand = inst->getOperand(0);
             llvm::LLVMContext& ctx = inst->getType()->getContext();
@@ -698,11 +745,13 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
                         if (nargs == 2) extinst(g, {arg(0), arg(1)});
                         else            extinst(g, {arg(0)});
                     } else {
-                        // Unknown call: alias to the first argument (graceful degrade)
-                        // rather than emit an OpFunctionCall id 0 (invalid SPIR-V).
+                        // A call we can't lower and that survived inlining (an
+                        // unmapped library/math function, e.g. cbrt). Aliasing to
+                        // arg0 would silently compute the WRONG value, so flag the
+                        // failure and leave the algorithm on the CPU instead.
+                        translation_failed_ = true;
                         llvm::errs() << "[SPIRVGenerator] Unsupported call '" << nm
-                                     << "'; aliasing result to first argument\n";
-                        if (call->arg_size() > 0) value_map[inst] = arg(0);
+                                     << "' in callable; leaving on CPU\n";
                     }
                     break;
                 }
@@ -787,7 +836,14 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         }
 
         default:
-            // Handle other instructions as needed
+            // An LLVM instruction we don't lower yet (e.g. a PHI, an aggregate op,
+            // an unsupported intrinsic). Emitting nothing would leave a dangling SSA
+            // id and produce INVALID SPIR-V silently. Instead, flag the failure so
+            // generate_from_lambda returns empty SPIR-V and the rewriter keeps the
+            // algorithm on the CPU. Loud, not silent; correct, not broken.
+            translation_failed_ = true;
+            llvm::errs() << "[SPIRVGenerator] Unsupported instruction '"
+                         << inst->getOpcodeName() << "' in callable; leaving on CPU\n";
             break;
     }
 }
@@ -949,10 +1005,12 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     std::cerr << "=== SPIRV_GEN_DEBUG: About to emit capabilities: Shader and VariablePointersStorageBuffer ONLY ===" << std::endl;
     std::cerr << "=== SPIRV_GEN_DEBUG: NOT emitting Int64 capability! ===" << std::endl;
 
+    translation_failed_ = false;  // reset per kernel; set if an op can't be lowered
+
     SPIRVBuilder builder;
     builder.set_section(SPIRVBuilder::Section::Header);
     emit_header(builder.get_header());
-    
+
     // Base capabilities go into the dedicated Capabilities section so that the
     // Int64 / Float64 capabilities emitted lazily during type translation still
     // precede the memory model. Extensions / imports / memory model stay here.
@@ -1046,6 +1104,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     setup_push_constants(builder, lambda_func->getContext());
 
     translate_function(builder, lambda_func, lambda_id, buffer_param_indices);
+
+    // If the callable used a construct we can't lower, bail with empty SPIR-V so the
+    // rewriter leaves this algorithm on the CPU instead of shipping invalid SPIR-V.
+    if (translation_failed_) {
+        std::cerr << "[SPIRVGenerator] callable contains an unsupported construct; "
+                     "returning empty SPIR-V (algorithm stays on CPU)\n";
+        return {};
+    }
 
     // Generate Kernel Entry Point
     uint32_t entry_id = builder.get_next_id();
