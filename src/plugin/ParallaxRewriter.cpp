@@ -59,6 +59,10 @@ struct TransformInfo {
     // holds the add-offsets kernel. output_iterator is d_first (the output range).
     bool is_scan = false;
 
+    // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
+    // pads the range to a power of two, sorts in place, and copies back. '<' only.
+    bool is_sort = false;
+
     // Phase 3: count_if = (predicate->0/1 transform) then '+' reduce, yielding an
     // integer count. Reuses the transform_reduce orchestration with a count cast.
     // count_yield selects the final host expression over the GPU count:
@@ -311,6 +315,40 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             rs << "  " << acc << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
             rs << "  __plx_result;\n";
         }
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 5: std::sort -> load the bitonic kernel and sort the range in place.
+    // Bitonic needs a power-of-two count, so non-pow2 ranges are padded with the
+    // element's max() (sorts to the tail), sorted, and the prefix copied back.
+    if (transform.is_sort) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU sort (" << et << ") */\n";
+        rs << generateSPIRVArray(k, transform.spirv);
+        rs << "  static parallax_kernel_t " << k << " = nullptr;\n";
+        rs << "  if (!" << k << ") " << k << " = parallax_kernel_load(" << k
+           << "_spirv, sizeof(" << k << "_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_m = 1; while (__plx_m < __plx_n) __plx_m <<= 1;\n";
+        rs << "  if (__plx_n > 1) {\n";
+        rs << "    if (__plx_m == __plx_n) {\n";
+        rs << "      parallax_sort(" << k << ", (void*)&(*__plx_first), __plx_n, sizeof(" << et << "));\n";
+        rs << "    } else {\n";
+        // Pad to the next power of two with max() so the padding sorts to the tail.
+        rs << "      std::vector<" << et << "> __plx_pad(__plx_m, std::numeric_limits<" << et << ">::max());\n";
+        rs << "      std::copy(__plx_first, std::next(__plx_first, __plx_n), __plx_pad.begin());\n";
+        rs << "      parallax_sort(" << k << ", __plx_pad.data(), __plx_m, sizeof(" << et << "));\n";
+        rs << "      std::copy(__plx_pad.begin(), std::next(__plx_pad.begin(), __plx_n), __plx_first);\n";
+        rs << "    }\n";
+        rs << "  }\n";
         rs << "});";
         return rs.str();
     }
@@ -1079,6 +1117,56 @@ public:
             return true;
         }
 
+        // Phase 5: std::sort(par, first, last) ascending (default '<'). Generates the
+        // bitonic compare-exchange kernel for the element type; the replacement pads
+        // the range to a power of two, sorts in place, and copies the prefix back. A
+        // custom comparator (3rd arg) is not yet supported and falls back to the CPU.
+        if (info.algorithm_name == "sort") {
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            if (!info.first_iterator || !info.last_iterator) {
+                llvm::errs() << "[ParallaxCollector] sort: missing iterators; CPU\n";
+                return true;
+            }
+            if (call->getNumArgs() >= 4) {
+                llvm::errs() << "[ParallaxCollector] sort: custom comparator unsupported; CPU\n";
+                return true;
+            }
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] sort: element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] sort: unsupported element type "
+                             << info.elem_type_str << "; CPU\n";
+                return true;
+            }
+
+            info.is_sort = true;
+            info.kernel_name = generateKernelName(info);
+
+            SPIRVGenerator sgen;
+            sgen.set_target_vulkan_version(1, 2);
+            info.spirv = sgen.generate_sort_kernel(ek);
+            if (info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] sort: SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] sort: generated bitonic(" << info.spirv.size()
+                         << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 5: std::inclusive_scan(par, first, last, d_first) with the default
         // '+' op. Generates the two fixed scan kernels (per-block scan + add-offsets)
         // for the element type; the replacement runs parallax_scan over d_first
@@ -1475,7 +1563,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform" && name != "std::reduce" &&
         name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
-        name != "std::inclusive_scan" &&
+        name != "std::inclusive_scan" && name != "std::sort" &&
         name != "std::fill" && name != "std::copy") {
         return false;
     }

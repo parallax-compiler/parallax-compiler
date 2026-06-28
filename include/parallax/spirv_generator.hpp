@@ -60,6 +60,11 @@ public:
     // dispatch_reduce_level so the runtime treats them like the reduce kernel.
     std::vector<uint32_t> generate_scan_kernel(ReduceElemType elem);
     std::vector<uint32_t> generate_scan_add_kernel(ReduceElemType elem);
+
+    // Phase 5: one global bitonic compare-exchange stage (ascending). data@0, push
+    // { uint count, uint k, uint j }. The runtime (launch_sort) dispatches it over
+    // the O(log^2 n) (k,j) schedule. No shared memory or barriers. Default '<' only.
+    std::vector<uint32_t> generate_sort_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);
