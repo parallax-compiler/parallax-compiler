@@ -974,6 +974,17 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         type_cache_[type] = ptr_ty;
         return ptr_ty;
     } else {
+        // A type we don't model yet: vectors (floatN), structs/aggregates as values,
+        // fixed arrays, and 8/16-bit integers. Silently emitting i32 would miscompile
+        // (wrong width/semantics), so flag the failure — generate_from_lambda then
+        // returns empty SPIR-V and the algorithm stays on the CPU. The i32 below is
+        // just a placeholder to finish emitting the (discarded) module without a 0 id.
+        translation_failed_ = true;
+        std::string tn;
+        llvm::raw_string_ostream os(tn);
+        type->print(os);
+        llvm::errs() << "[SPIRVGenerator] Unsupported type '" << os.str()
+                     << "' in callable; leaving on CPU\n";
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     }
     
