@@ -63,6 +63,13 @@ struct TransformInfo {
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
     bool is_sort = false;
 
+    // Phase 5: copy_if. Four kernels: spirv_transform = predicate flags (T 1/0),
+    // spirv_scan + spirv_scan_add = inclusive scan, spirv = scatter. The replacement
+    // calls parallax_copy_if and returns d_first + kept. Float elements (MVP).
+    bool is_copy_if = false;
+    std::vector<uint32_t> spirv_scan;
+    std::vector<uint32_t> spirv_scan_add;
+
     // Phase 3: count_if = (predicate->0/1 transform) then '+' reduce, yielding an
     // integer count. Reuses the transform_reduce orchestration with a count cast.
     // count_yield selects the final host expression over the GPU count:
@@ -315,6 +322,40 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             rs << "  " << acc << " __plx_result = __plx_rop((" << init << "), __plx_gpu);\n";
             rs << "  __plx_result;\n";
         }
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 5: std::copy_if -> load the four compaction kernels and run
+    // parallax_copy_if, which returns the kept count. Yields the output end iterator.
+    if (transform.is_copy_if) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        std::string out_it   = getSourceText(transform.output_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU copy_if (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_f", transform.spirv_transform);
+        rs << generateSPIRVArray(k + "_s", transform.spirv_scan);
+        rs << generateSPIRVArray(k + "_a", transform.spirv_scan_add);
+        rs << generateSPIRVArray(k + "_x", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_f=nullptr," << k << "_s=nullptr,"
+           << k << "_a=nullptr," << k << "_x=nullptr;\n";
+        auto ld = [&](const char* sfx) {
+            rs << "  if (!" << k << sfx << ") " << k << sfx << " = parallax_kernel_load(" << k
+               << sfx << "_spirv, sizeof(" << k << sfx << "_spirv)/sizeof(uint32_t));\n";
+        };
+        ld("_f"); ld("_s"); ld("_a"); ld("_x");
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  auto __plx_dfirst = (" << out_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_kept = parallax_copy_if(" << k << "_f, " << k << "_s, " << k
+           << "_a, " << k << "_x, (void*)&(*__plx_first), (void*)&(*__plx_dfirst), "
+           << "__plx_n, sizeof(" << et << "));\n";
+        rs << "  std::next(__plx_dfirst, __plx_kept);\n";  // copy_if returns the output end
         rs << "});";
         return rs.str();
     }
@@ -1127,6 +1168,66 @@ public:
             return true;
         }
 
+        // Phase 5: std::copy_if(par, first, last, d_first, pred). flags(pred) -> scan
+        // -> scatter. MVP: float elements (flags/scan/positions stay type float so a
+        // single float scan/scatter applies). Returns d_first + kept.
+        if (info.algorithm_name == "copy_if") {
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            info.output_iterator = (call->getNumArgs() >= 5) ? call->getArg(3) : nullptr;
+            clang::LambdaExpr* pred_lambda = (call->getNumArgs() >= 5) ? as_lambda(call->getArg(4)) : nullptr;
+            if (!info.first_iterator || !info.last_iterator || !info.output_iterator || !pred_lambda) {
+                llvm::errs() << "[ParallaxCollector] copy_if: missing iterators/predicate (non-lambda?); CPU\n";
+                return true;
+            }
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (const clang::VarDecl* oc = traceIteratorToContainer(info.output_iterator)) {
+                if (!hasParallaxAllocator(oc->getType())) rewriter_.markContainerForAllocation(oc);
+            }
+            if (elemQT.isNull() || !elemQT->isRealFloatingType() || context_.getTypeSize(elemQT) != 32) {
+                llvm::errs() << "[ParallaxCollector] copy_if: MVP supports float elements only; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            auto pred_module = ir_generator_.generateIR(pred_lambda, context_);
+            llvm::Function* pred_func = nullptr;
+            if (pred_module)
+                for (auto& f : *pred_module)
+                    if (!f.isDeclaration()) { pred_func = &f; break; }
+            if (!pred_func) {
+                llvm::errs() << "[ParallaxCollector] copy_if: failed to compile predicate; CPU\n";
+                return true;
+            }
+
+            // flags kernel: predicate -> float 1.0/0.0 (set_predicate_flags).
+            SPIRVGenerator fgen; fgen.set_target_vulkan_version(1, 2);
+            fgen.set_predicate_flags(true);
+            info.spirv_transform = fgen.generate_from_lambda(pred_func, {"float", "float&"});
+            SPIRVGenerator sgen; sgen.set_target_vulkan_version(1, 2);
+            info.spirv_scan = sgen.generate_scan_kernel(SPIRVGenerator::ReduceElemType::F32);
+            info.spirv_scan_add = sgen.generate_scan_add_kernel(SPIRVGenerator::ReduceElemType::F32);
+            info.spirv = sgen.generate_scatter_kernel(SPIRVGenerator::ReduceElemType::F32);
+            if (info.spirv_transform.empty() || info.spirv_scan.empty() ||
+                info.spirv_scan_add.empty() || info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] copy_if: SPIR-V generation failed\n";
+                return true;
+            }
+
+            info.is_copy_if = true;
+            info.kernel_name = generateKernelName(info);
+            llvm::errs() << "[ParallaxCollector] copy_if: generated flags("
+                         << info.spirv_transform.size() << ") scan(" << info.spirv_scan.size()
+                         << ") scatter(" << info.spirv.size() << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 5: std::sort(par, first, last) ascending (default '<'). Generates the
         // bitonic compare-exchange kernel for the element type; the replacement pads
         // the range to a power of two, sorts in place, and copies the prefix back. A
@@ -1573,6 +1674,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
         name != "std::inclusive_scan" && name != "std::sort" &&
+        name != "std::copy_if" &&
         name != "std::fill" && name != "std::copy") {
         return false;
     }

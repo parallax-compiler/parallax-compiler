@@ -65,13 +65,23 @@ public:
     // { uint count, uint k, uint j }. The runtime (launch_sort) dispatches it over
     // the O(log^2 n) (k,j) schedule. No shared memory or barriers. Default '<' only.
     std::vector<uint32_t> generate_sort_kernel(ReduceElemType elem);
+
+    // Phase 5: compaction scatter. input@0, output@1, positions@3 (the inclusive scan
+    // of the 1/0 flags), push { uint count }. Each kept element (positions[i] differs
+    // from positions[i-1]) is written to output[positions[i]-1]. Pairs with the
+    // predicate-flags transform + scan to implement copy_if.
+    std::vector<uint32_t> generate_scatter_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);
 
     // count_if: build the next transform kernel from a predicate (T->bool), storing
-    // 1/0 of the element type per element so a '+' reduce yields the count.
+    // int 1/0 per element so a '+' reduce yields the count.
     void set_predicate_count(bool v) { predicate_count_ = v; }
+
+    // copy_if flags: like predicate_count but stores 1/0 in the ELEMENT type T (so a
+    // float scan can turn the flags into output positions for the scatter).
+    void set_predicate_flags(bool v) { predicate_flags_ = v; }
     
 private:
     uint32_t vulkan_major_;
@@ -147,6 +157,7 @@ private:
     // Phase 3 count_if: when set, a transform kernel built from a predicate (T->bool)
     // stores 1/0 of the element type (the per-element count) instead of the bool.
     bool        predicate_count_ = false;
+    bool        predicate_flags_ = false;
     uint32_t    pc_var_id_ = 0;
     uint32_t    pc_int32_id_ = 0;
     uint32_t    reloc_host_base_id_ = 0;

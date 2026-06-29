@@ -1075,6 +1075,51 @@ jobs:
             || { echo "::error::sort result not ascending / not a permutation"; exit 1; }
           echo "PASS: std::sort(par) offloaded a GPU bitonic sort (padded, ascending)"
 
+      - name: "GATE (copy_if): stream compaction on the GPU"
+        run: |
+          # Phase 5: the plugin detects std::copy_if, compiles the predicate into a
+          # flags kernel (1.0/0.0), and emits scan + scatter; the runtime runs
+          # flags -> inclusive scan -> scatter. Keep x>0.5 over [0..999] drops index 0,
+          # so kept=999 and the compacted output is [1,2,...,999].
+          cat > probe_copyif.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<float> v(N), out(N, -1.0f);
+              for (int i = 0; i < N; ++i) v[i] = (float)i;
+              auto end = std::copy_if(std::execution::par, v.begin(), v.end(), out.begin(),
+                                      [](float x){ return x > 0.5f; });
+              size_t kept = (size_t)std::distance(out.begin(), end);
+              std::printf("copy_if kept=%zu out[0]=%.1f out[998]=%.1f\n", kept, out[0], out[998]);
+              bool ok = (kept == 999) && (out[0] == 1.0f) && (out[998] == 999.0f);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_SCATTER="$PWD/scat.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_copyif.cpp -o /dev/null 2> ci.log || true
+          grep -E "copy_if: generated" ci.log | head -1 || true
+          if [ -f scat.spv ]; then
+            spirv-val scat.spv || { echo "::error::scatter SPIR-V failed validation"; exit 1; }
+          else
+            echo "::error::no scatter SPIR-V produced (std::copy_if not detected)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_copyif.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_copyif 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_copyif 2>&1)" || true
+          echo "$out" | grep -aE "copy_if kept=|parallax_copy_if|compact|scatter|Loaded kernel" | head -20
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::copy_if kernels were not offloaded"; exit 1; }
+          echo "$out" | grep -q "copy_if kept=999 out\[0\]=1.0 out\[998\]=999.0" \
+            || { echo "::error::copy_if produced a wrong result"; exit 1; }
+          echo "PASS: std::copy_if(par) offloaded GPU stream compaction (flags+scan+scatter)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
