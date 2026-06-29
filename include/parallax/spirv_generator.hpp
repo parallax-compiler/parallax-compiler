@@ -76,6 +76,12 @@ public:
     // element of each run of equal adjacent values: flag[i] = (i==0 || in[i]!=in[i-1]).
     // Pairs with scan + scatter to implement std::unique (in place).
     std::vector<uint32_t> generate_unique_flags_kernel(ReduceElemType elem);
+
+    // Phase 5: partition scatter. input@0, output@1, positions@3, push {count,num_true}.
+    // Writes EVERY element: a kept element (positions[i]!=positions[i-1]) goes to its
+    // rank among kept (positions[i]-1); a not-kept element goes after the kept block
+    // (num_true + i - positions[i]). Pairs with predicate-flags + scan for std::partition.
+    std::vector<uint32_t> generate_partition_scatter_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);

@@ -1234,6 +1234,47 @@ jobs:
             || { echo "::error::unique produced a wrong result"; exit 1; }
           echo "PASS: std::unique(par) offloaded GPU duplicate removal"
 
+      - name: "GATE (partition): reorder pred-true to the front on the GPU"
+        run: |
+          # std::partition: flags(pred) -> scan -> partition scatter (kept to the
+          # front at pos-1, the rest after at num_true + i - pos). Even numbers first
+          # over [0..999] -> partition point 500; first 500 even, last 500 odd.
+          cat > probe_partition.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<int> v(N);
+              for (int i = 0; i < N; ++i) v[i] = i;
+              auto pp = std::partition(std::execution::par, v.begin(), v.end(),
+                                       [](int x){ return x % 2 == 0; });
+              size_t nt = (size_t)std::distance(v.begin(), pp);
+              bool ok = (nt == 500);
+              for (int i = 0; i < 500 && ok; ++i) if (v[i] % 2 != 0) ok = false;
+              for (int i = 500; i < N && ok; ++i) if (v[i] % 2 == 0) ok = false;
+              std::printf("partition pp=%zu groups_ok=%d\n", nt, ok ? 1 : 0);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_PART="$PWD/part.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_partition.cpp -o /dev/null 2> pt.log || true
+          grep -E "partition: generated" pt.log | head -1 \
+            || { echo "::error::partition not detected"; exit 1; }
+          [ -f part.spv ] && { spirv-val part.spv || { echo "::error::partition scatter SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_partition.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_partition 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_partition 2>&1)" || true
+          echo "$out" | grep -aE "partition pp=" | head
+          echo "$out" | grep -q "partition pp=500 groups_ok=1" \
+            || { echo "::error::partition produced a wrong result"; exit 1; }
+          echo "PASS: std::partition(par) offloaded GPU partitioning"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

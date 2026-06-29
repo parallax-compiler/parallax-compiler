@@ -67,7 +67,8 @@ struct TransformInfo {
     // spirv_scan + spirv_scan_add = inclusive scan, spirv = scatter. The replacement
     // calls parallax_copy_if and returns d_first + kept. Float elements (MVP).
     bool is_copy_if = false;
-    bool is_inplace_compact = false;  // remove_if: compact in place (scratch + copy back)
+    bool is_inplace_compact = false;  // remove_if/unique/partition: compact in place
+    bool is_partition = false;        // partition: copy the WHOLE range back, not [0,kept)
     std::vector<uint32_t> spirv_scan;
     std::vector<uint32_t> spirv_scan_add;
 
@@ -367,7 +368,10 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
             rs << "    __plx_kept = parallax_copy_if(" << k << "_f, " << k << "_s, " << k
                << "_a, " << k << "_x, (void*)&(*__plx_first), __plx_sc, __plx_n, sizeof(" << et
                << "), " << isf << ");\n";
-            rs << "    std::copy(__plx_sc, __plx_sc + __plx_kept, __plx_first);\n";
+            // partition rearranges all elements (kept first, rest after) so copy the
+            // whole range back; remove_if/unique only keep the front kept prefix.
+            const char* copy_n = transform.is_partition ? "__plx_n" : "__plx_kept";
+            rs << "    std::copy(__plx_sc, __plx_sc + " << copy_n << ", __plx_first);\n";
             rs << "    parallax_arena_free(__plx_sc);\n";
             rs << "  }\n";
             rs << "  std::next(__plx_first, __plx_kept);\n";  // remove_if returns the new end
@@ -1242,12 +1246,15 @@ public:
         // kept elements to d_first; remove_if(par,first,last,pred) keeps the elements
         // where pred is FALSE, in place. Both = flags -> scan -> scatter. MVP: 32-bit
         // float/int elements.
-        if (info.algorithm_name == "copy_if" || info.algorithm_name == "remove_if") {
+        if (info.algorithm_name == "copy_if" || info.algorithm_name == "remove_if" ||
+            info.algorithm_name == "partition") {
             const bool is_remove = (info.algorithm_name == "remove_if");
+            const bool is_part = (info.algorithm_name == "partition");
+            const bool in_place = is_remove || is_part;  // remove_if/partition act in place
             extractIterators(call, info.first_iterator, info.last_iterator);
-            // copy_if: d_first @arg3, pred @arg4. remove_if: in place, pred @arg3.
+            // copy_if: d_first @arg3, pred @arg4. remove_if/partition: in place, pred @arg3.
             clang::LambdaExpr* pred_lambda = nullptr;
-            if (is_remove) {
+            if (in_place) {
                 info.output_iterator = info.first_iterator;  // in-place
                 pred_lambda = (call->getNumArgs() >= 4) ? as_lambda(call->getArg(3)) : nullptr;
             } else {
@@ -1265,7 +1272,7 @@ public:
                 elemQT = getContainerElementType(c->getType().getNonReferenceType());
                 if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
             }
-            if (!is_remove) {
+            if (!in_place) {
                 if (const clang::VarDecl* oc = traceIteratorToContainer(info.output_iterator)) {
                     if (!hasParallaxAllocator(oc->getType())) rewriter_.markContainerForAllocation(oc);
                 }
@@ -1302,7 +1309,10 @@ public:
             SPIRVGenerator sgen; sgen.set_target_vulkan_version(1, 2);
             info.spirv_scan = sgen.generate_scan_kernel(ek);
             info.spirv_scan_add = sgen.generate_scan_add_kernel(ek);
-            info.spirv = sgen.generate_scatter_kernel(ek);
+            // partition uses the partition scatter (writes every element: kept first,
+            // the rest after); copy_if/remove_if use the plain compacting scatter.
+            info.spirv = is_part ? sgen.generate_partition_scatter_kernel(ek)
+                                 : sgen.generate_scatter_kernel(ek);
             if (info.spirv_transform.empty() || info.spirv_scan.empty() ||
                 info.spirv_scan_add.empty() || info.spirv.empty()) {
                 llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": SPIR-V generation failed\n";
@@ -1310,7 +1320,8 @@ public:
             }
 
             info.is_copy_if = true;
-            info.is_inplace_compact = is_remove;
+            info.is_inplace_compact = in_place;
+            info.is_partition = is_part;
             info.kernel_name = generateKernelName(info);
             llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": generated flags("
                          << info.spirv_transform.size() << ") scan(" << info.spirv_scan.size()
@@ -1766,6 +1777,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
         name != "std::inclusive_scan" && name != "std::sort" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
+        name != "std::partition" &&
         name != "std::fill" && name != "std::copy") {
         return false;
     }
