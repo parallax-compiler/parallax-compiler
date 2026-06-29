@@ -1190,6 +1190,54 @@ public:
             return true;
         }
 
+        // Phase 5: std::unique(par, first, last) removes consecutive duplicates in
+        // place (default ==). flags(first-of-run) -> scan -> scatter, like remove_if
+        // but with the adjacent-difference flags kernel. MVP: 32-bit float/int.
+        if (info.algorithm_name == "unique") {
+            if (call->getNumArgs() != 3) {
+                llvm::errs() << "[ParallaxCollector] unique: custom predicate unsupported; CPU\n";
+                return true;
+            }
+            info.first_iterator = call->getArg(1);
+            info.last_iterator = call->getArg(2);
+            info.output_iterator = info.first_iterator;  // in-place
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            SPIRVGenerator::ReduceElemType ek;
+            if (elemQT.isNull() || context_.getTypeSize(elemQT) != 32 || !elem_kind(elemQT, ek) ||
+                (ek != SPIRVGenerator::ReduceElemType::F32 && ek != SPIRVGenerator::ReduceElemType::I32)) {
+                llvm::errs() << "[ParallaxCollector] unique: MVP supports 32-bit float/int only; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            SPIRVGenerator fgen; fgen.set_target_vulkan_version(1, 2);
+            info.spirv_transform = fgen.generate_unique_flags_kernel(ek);
+            SPIRVGenerator sgen; sgen.set_target_vulkan_version(1, 2);
+            info.spirv_scan = sgen.generate_scan_kernel(ek);
+            info.spirv_scan_add = sgen.generate_scan_add_kernel(ek);
+            info.spirv = sgen.generate_scatter_kernel(ek);
+            if (info.spirv_transform.empty() || info.spirv_scan.empty() ||
+                info.spirv_scan_add.empty() || info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] unique: SPIR-V generation failed\n";
+                return true;
+            }
+
+            info.is_copy_if = true;
+            info.is_inplace_compact = true;
+            info.kernel_name = generateKernelName(info);
+            llvm::errs() << "[ParallaxCollector] unique: generated flags("
+                         << info.spirv_transform.size() << ") scan(" << info.spirv_scan.size()
+                         << ") scatter(" << info.spirv.size() << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 5: stream compaction. copy_if(par,first,last,d_first,pred) writes the
         // kept elements to d_first; remove_if(par,first,last,pred) keeps the elements
         // where pred is FALSE, in place. Both = flags -> scan -> scatter. MVP: 32-bit
@@ -1717,7 +1765,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
         name != "std::inclusive_scan" && name != "std::sort" &&
-        name != "std::copy_if" && name != "std::remove_if" &&
+        name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::fill" && name != "std::copy") {
         return false;
     }

@@ -71,6 +71,11 @@ public:
     // from positions[i-1]) is written to output[positions[i]-1]. Pairs with the
     // predicate-flags transform + scan to implement copy_if.
     std::vector<uint32_t> generate_scatter_kernel(ReduceElemType elem);
+
+    // Phase 5: unique flags. input@0, flags@1, push { uint count }. Flags the first
+    // element of each run of equal adjacent values: flag[i] = (i==0 || in[i]!=in[i-1]).
+    // Pairs with scan + scatter to implement std::unique (in place).
+    std::vector<uint32_t> generate_unique_flags_kernel(ReduceElemType elem);
     
     // Set target Vulkan version
     void set_target_vulkan_version(uint32_t major, uint32_t minor);

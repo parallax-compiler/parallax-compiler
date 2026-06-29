@@ -1196,6 +1196,44 @@ jobs:
             || { echo "::error::int copy_if produced a wrong result"; exit 1; }
           echo "PASS: std::copy_if(par) over int elements offloaded (int flags/scan/scatter)"
 
+      - name: "GATE (unique): remove consecutive duplicates on the GPU"
+        run: |
+          # std::unique flags the first element of each equal-adjacent run
+          # (in[i]!=in[i-1]), scans, and scatters in place. v[i]=i/2 gives pairs
+          # [0,0,1,1,...,499,499] -> unique result [0,1,...,499], kept=500.
+          cat > probe_unique.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<int> v(N);
+              for (int i = 0; i < N; ++i) v[i] = i / 2;
+              auto end = std::unique(std::execution::par, v.begin(), v.end());
+              size_t kept = (size_t)std::distance(v.begin(), end);
+              std::printf("unique kept=%zu v[0]=%d v[499]=%d\n", kept, v[0], v[499]);
+              bool ok = (kept == 500) && (v[0] == 0) && (v[499] == 499);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_UNIQUE="$PWD/uniq.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_unique.cpp -o /dev/null 2> uq.log || true
+          grep -E "unique: generated" uq.log | head -1 \
+            || { echo "::error::unique not detected"; exit 1; }
+          [ -f uniq.spv ] && { spirv-val uniq.spv || { echo "::error::unique flags SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_unique.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_unique 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_unique 2>&1)" || true
+          echo "$out" | grep -aE "unique kept=" | head
+          echo "$out" | grep -q "unique kept=500 v\[0\]=0 v\[499\]=499" \
+            || { echo "::error::unique produced a wrong result"; exit 1; }
+          echo "PASS: std::unique(par) offloaded GPU duplicate removal"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
