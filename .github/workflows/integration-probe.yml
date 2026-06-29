@@ -1120,6 +1120,82 @@ jobs:
             || { echo "::error::copy_if produced a wrong result"; exit 1; }
           echo "PASS: std::copy_if(par) offloaded GPU stream compaction (flags+scan+scatter)"
 
+      - name: "GATE (remove_if): in-place compaction on the GPU"
+        run: |
+          # remove_if keeps elements where the predicate is FALSE, in place. Remove
+          # x>500 over [0..999] -> keep [0..500] (501 elements). Scatter goes through
+          # arena scratch then copies the kept prefix back over the input range.
+          cat > probe_removeif.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<float> v(N);
+              for (int i = 0; i < N; ++i) v[i] = (float)i;
+              auto end = std::remove_if(std::execution::par, v.begin(), v.end(),
+                                        [](float x){ return x > 500.0f; });
+              size_t kept = (size_t)std::distance(v.begin(), end);
+              std::printf("remove_if kept=%zu v[0]=%.1f v[500]=%.1f\n", kept, v[0], v[500]);
+              bool ok = (kept == 501) && (v[0] == 0.0f) && (v[500] == 500.0f);
+              return ok ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_removeif.cpp -o /dev/null 2> ri.log || true
+          grep -E "remove_if: generated" ri.log | head -1 \
+            || { echo "::error::remove_if not detected"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 probe_removeif.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_removeif 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_removeif 2>&1)" || true
+          echo "$out" | grep -aE "remove_if kept=" | head
+          echo "$out" | grep -q "remove_if kept=501 v\[0\]=0.0 v\[500\]=500.0" \
+            || { echo "::error::remove_if produced a wrong result"; exit 1; }
+          echo "PASS: std::remove_if(par) offloaded in-place GPU compaction"
+
+      - name: "GATE (copy_if int): compaction over int elements (% predicate)"
+        run: |
+          # Exercises the integer compaction path end to end: predicate uses modulo
+          # (OpSRem), flags/scan/scatter are all int. Keep multiples of 3 in [0..999]
+          # -> 334 kept, out=[0,3,6,...,999].
+          cat > probe_copyifi.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<int> v(N), out(N, -1);
+              for (int i = 0; i < N; ++i) v[i] = i;
+              auto end = std::copy_if(std::execution::par, v.begin(), v.end(), out.begin(),
+                                      [](int x){ return x % 3 == 0; });
+              size_t kept = (size_t)std::distance(out.begin(), end);
+              std::printf("copyif_int kept=%zu out[0]=%d out[333]=%d\n", kept, out[0], out[333]);
+              bool ok = (kept == 334) && (out[0] == 0) && (out[333] == 999);
+              return ok ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_copyifi.cpp -o /dev/null 2> cii.log || true
+          grep -E "copy_if: generated" cii.log | head -1 \
+            || { echo "::error::int copy_if not detected"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 probe_copyifi.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_copyifi 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_copyifi 2>&1)" || true
+          echo "$out" | grep -aE "copyif_int kept=" | head
+          echo "$out" | grep -q "copyif_int kept=334 out\[0\]=0 out\[333\]=999" \
+            || { echo "::error::int copy_if produced a wrong result"; exit 1; }
+          echo "PASS: std::copy_if(par) over int elements offloaded (int flags/scan/scatter)"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"

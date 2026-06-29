@@ -2761,7 +2761,10 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
                                 ? get_constant_id(builder, llvm::ConstantFP::get(et, 0.0))
                                 : get_constant_id(builder, llvm::ConstantInt::get(et, 0));
             uint32_t f = builder.get_next_id();
-            builder.emit_op(SPIRVOp::OpSelect, {out_elem_id, f, result_id, one, zero});
+            // remove_if keeps elements where the predicate is FALSE: swap the arms.
+            uint32_t t_arm = predicate_negate_ ? zero : one;
+            uint32_t f_arm = predicate_negate_ ? one : zero;
+            builder.emit_op(SPIRVOp::OpSelect, {out_elem_id, f, result_id, t_arm, f_arm});
             builder.emit_op(SPIRVOp::OpStore, {data_buffer_ptrs[1], f});
         } else {
             // Store result to output buffer[1]

@@ -82,6 +82,10 @@ public:
     // copy_if flags: like predicate_count but stores 1/0 in the ELEMENT type T (so a
     // float scan can turn the flags into output positions for the scatter).
     void set_predicate_flags(bool v) { predicate_flags_ = v; }
+
+    // remove_if: keep elements where the predicate is FALSE. Negates the flag so the
+    // same scatter compacts the not-removed elements.
+    void set_predicate_negate(bool v) { predicate_negate_ = v; }
     
 private:
     uint32_t vulkan_major_;
@@ -158,6 +162,7 @@ private:
     // stores 1/0 of the element type (the per-element count) instead of the bool.
     bool        predicate_count_ = false;
     bool        predicate_flags_ = false;
+    bool        predicate_negate_ = false;
     uint32_t    pc_var_id_ = 0;
     uint32_t    pc_int32_id_ = 0;
     uint32_t    reloc_host_base_id_ = 0;
