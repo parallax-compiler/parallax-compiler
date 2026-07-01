@@ -1275,6 +1275,87 @@ jobs:
             || { echo "::error::partition produced a wrong result"; exit 1; }
           echo "PASS: std::partition(par) offloaded GPU partitioning"
 
+      - name: "GATE (conformance): differential seq-vs-par over random data"
+        run: |
+          # CPU-oracle conformance: for each algorithm, compute a reference with the
+          # PLAIN serial std:: algorithm (no policy -> not offloaded, the CPU oracle)
+          # and the result with std::execution::par (offloaded), over deterministic
+          # pseudo-random int data, and assert they match exactly. This exercises the
+          # whole pipeline (detect -> codegen -> runtime -> migrating arena) across the
+          # algorithm surface with inputs the fixed-value gates don't cover.
+          cat > probe_conf.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <numeric>
+          #include <iterator>
+          #include <execution>
+          #include <cstdint>
+          #include <cstdio>
+          static uint32_t st = 2463534242u;
+          static int rng() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return (int)(st % 1000); }
+          int main() {
+              const int N = 3000;
+              int fails = 0;
+              // reduce (int sum is order-independent -> exact vs serial)
+              { std::vector<int> v(N); for (auto& x : v) x = rng();
+                long ref = 0; for (int x : v) ref += x;
+                long got = (long)std::reduce(std::execution::par, v.begin(), v.end(), 0);
+                if (got != ref) { std::printf("MISMATCH reduce: %ld vs %ld\n", got, ref); ++fails; }
+                else std::printf("ok reduce\n"); }
+              // sort
+              { std::vector<int> v(N); for (auto& x : v) x = rng();
+                std::vector<int> ref = v; std::sort(ref.begin(), ref.end());
+                std::sort(std::execution::par, v.begin(), v.end());
+                if (v != ref) { std::printf("MISMATCH sort\n"); ++fails; } else std::printf("ok sort\n"); }
+              // inclusive_scan (int -> exact)
+              { std::vector<int> v(N); for (auto& x : v) x = rng() % 4;
+                std::vector<int> ref(N), got(N);
+                std::inclusive_scan(v.begin(), v.end(), ref.begin());
+                std::inclusive_scan(std::execution::par, v.begin(), v.end(), got.begin());
+                if (got != ref) { std::printf("MISMATCH inclusive_scan\n"); ++fails; } else std::printf("ok inclusive_scan\n"); }
+              // copy_if
+              { std::vector<int> v(N); for (auto& x : v) x = rng();
+                std::vector<int> ref(N, -1), got(N, -1);
+                auto re = std::copy_if(v.begin(), v.end(), ref.begin(), [](int x){ return x % 3 == 0; });
+                auto ge = std::copy_if(std::execution::par, v.begin(), v.end(), got.begin(), [](int x){ return x % 3 == 0; });
+                if (std::distance(ref.begin(), re) != std::distance(got.begin(), ge) || got != ref) {
+                  std::printf("MISMATCH copy_if\n"); ++fails; } else std::printf("ok copy_if\n"); }
+              // remove_if (in place)
+              { std::vector<int> v(N); for (auto& x : v) x = rng(); std::vector<int> ref = v;
+                auto re = std::remove_if(ref.begin(), ref.end(), [](int x){ return x > 500; });
+                auto ge = std::remove_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 500; });
+                size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
+                bool eq = (rn == gn); for (size_t i = 0; i < rn && eq; ++i) if (v[i] != ref[i]) eq = false;
+                if (!eq) { std::printf("MISMATCH remove_if\n"); ++fails; } else std::printf("ok remove_if\n"); }
+              // unique (on data with runs)
+              { std::vector<int> v(N); for (int i = 0; i < N; ++i) v[i] = rng() % 50; std::sort(v.begin(), v.end());
+                std::vector<int> ref = v;
+                auto re = std::unique(ref.begin(), ref.end());
+                auto ge = std::unique(std::execution::par, v.begin(), v.end());
+                size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
+                bool eq = (rn == gn); for (size_t i = 0; i < rn && eq; ++i) if (v[i] != ref[i]) eq = false;
+                if (!eq) { std::printf("MISMATCH unique\n"); ++fails; } else std::printf("ok unique\n"); }
+              std::printf("conformance fails=%d\n", fails);
+              return fails == 0 ? 0 : 1;
+          }
+          EOF
+          # Step 1: the plugin rewrites probe_conf.cpp in place (par calls -> GPU).
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_conf.cpp -o /dev/null 2> conf.log || true
+          grep -cE ": generated|Generated [0-9]+ SPIR-V" conf.log | sed 's/^/rewritten algorithms: /' || true
+          # Step 2: compile the rewritten source + link the runtime.
+          "$CLANGXX" -std=c++20 -O2 probe_conf.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_conf 2>&1 | tail -5
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_conf 2>&1)" || true
+          echo "$out" | grep -aE "ok |MISMATCH|conformance fails=" | head -20
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::conformance: nothing was offloaded"; exit 1; }
+          echo "$out" | grep -q "conformance fails=0" \
+            || { echo "::error::conformance: par != serial for some algorithm"; exit 1; }
+          echo "PASS: par-offloaded results match the serial CPU oracle across the algorithm surface"
+
       - name: "GATE: assert end-to-end GPU offload correctness"
         run: |
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
