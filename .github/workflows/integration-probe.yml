@@ -1283,6 +1283,9 @@ jobs:
           # pseudo-random int data, and assert they match exactly. This exercises the
           # whole pipeline (detect -> codegen -> runtime -> migrating arena) across the
           # algorithm surface with inputs the fixed-value gates don't cover.
+          # NOTE: the rewriter turns par-used vectors into vector<int,parallax::allocator>,
+          # so references use range constructors and comparisons are element-wise loops
+          # (never vector::operator== / cross-allocator copies, which won't compile).
           cat > probe_conf.cpp <<'EOF'
           #include <vector>
           #include <algorithm>
@@ -1293,48 +1296,50 @@ jobs:
           #include <cstdio>
           static uint32_t st = 2463534242u;
           static int rng() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return (int)(st % 1000); }
+          template <class A, class B>
+          static bool eqn(const A& a, const B& b, size_t n) {
+              for (size_t i = 0; i < n; ++i) if (a[i] != b[i]) return false; return true; }
           int main() {
               const int N = 3000;
               int fails = 0;
               // reduce (int sum is order-independent -> exact vs serial)
               { std::vector<int> v(N); for (auto& x : v) x = rng();
-                long ref = 0; for (int x : v) ref += x;
+                long ref = 0; for (size_t i = 0; i < v.size(); ++i) ref += v[i];
                 long got = (long)std::reduce(std::execution::par, v.begin(), v.end(), 0);
-                if (got != ref) { std::printf("MISMATCH reduce: %ld vs %ld\n", got, ref); ++fails; }
-                else std::printf("ok reduce\n"); }
+                if (got != ref) { std::printf("MISMATCH reduce %ld %ld\n", got, ref); ++fails; } else std::printf("ok reduce\n"); }
               // sort
               { std::vector<int> v(N); for (auto& x : v) x = rng();
-                std::vector<int> ref = v; std::sort(ref.begin(), ref.end());
+                std::vector<int> ref(v.begin(), v.end()); std::sort(ref.begin(), ref.end());
                 std::sort(std::execution::par, v.begin(), v.end());
-                if (v != ref) { std::printf("MISMATCH sort\n"); ++fails; } else std::printf("ok sort\n"); }
+                if (!eqn(v, ref, N)) { std::printf("MISMATCH sort\n"); ++fails; } else std::printf("ok sort\n"); }
               // inclusive_scan (int -> exact)
               { std::vector<int> v(N); for (auto& x : v) x = rng() % 4;
-                std::vector<int> ref(N), got(N);
-                std::inclusive_scan(v.begin(), v.end(), ref.begin());
+                std::vector<int> ref(N); std::inclusive_scan(v.begin(), v.end(), ref.begin());
+                std::vector<int> got(N);
                 std::inclusive_scan(std::execution::par, v.begin(), v.end(), got.begin());
-                if (got != ref) { std::printf("MISMATCH inclusive_scan\n"); ++fails; } else std::printf("ok inclusive_scan\n"); }
+                if (!eqn(got, ref, N)) { std::printf("MISMATCH inclusive_scan\n"); ++fails; } else std::printf("ok inclusive_scan\n"); }
               // copy_if
               { std::vector<int> v(N); for (auto& x : v) x = rng();
-                std::vector<int> ref(N, -1), got(N, -1);
+                std::vector<int> ref(N, -1);
                 auto re = std::copy_if(v.begin(), v.end(), ref.begin(), [](int x){ return x % 3 == 0; });
+                std::vector<int> got(N, -1);
                 auto ge = std::copy_if(std::execution::par, v.begin(), v.end(), got.begin(), [](int x){ return x % 3 == 0; });
-                if (std::distance(ref.begin(), re) != std::distance(got.begin(), ge) || got != ref) {
-                  std::printf("MISMATCH copy_if\n"); ++fails; } else std::printf("ok copy_if\n"); }
+                size_t rn = std::distance(ref.begin(), re), gn = std::distance(got.begin(), ge);
+                if (rn != gn || !eqn(got, ref, rn)) { std::printf("MISMATCH copy_if\n"); ++fails; } else std::printf("ok copy_if\n"); }
               // remove_if (in place)
-              { std::vector<int> v(N); for (auto& x : v) x = rng(); std::vector<int> ref = v;
+              { std::vector<int> v(N); for (auto& x : v) x = rng();
+                std::vector<int> ref(v.begin(), v.end());
                 auto re = std::remove_if(ref.begin(), ref.end(), [](int x){ return x > 500; });
                 auto ge = std::remove_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 500; });
                 size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
-                bool eq = (rn == gn); for (size_t i = 0; i < rn && eq; ++i) if (v[i] != ref[i]) eq = false;
-                if (!eq) { std::printf("MISMATCH remove_if\n"); ++fails; } else std::printf("ok remove_if\n"); }
-              // unique (on data with runs)
+                if (rn != gn || !eqn(v, ref, rn)) { std::printf("MISMATCH remove_if\n"); ++fails; } else std::printf("ok remove_if\n"); }
+              // unique (on sorted data with runs)
               { std::vector<int> v(N); for (int i = 0; i < N; ++i) v[i] = rng() % 50; std::sort(v.begin(), v.end());
-                std::vector<int> ref = v;
+                std::vector<int> ref(v.begin(), v.end());
                 auto re = std::unique(ref.begin(), ref.end());
                 auto ge = std::unique(std::execution::par, v.begin(), v.end());
                 size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
-                bool eq = (rn == gn); for (size_t i = 0; i < rn && eq; ++i) if (v[i] != ref[i]) eq = false;
-                if (!eq) { std::printf("MISMATCH unique\n"); ++fails; } else std::printf("ok unique\n"); }
+                if (rn != gn || !eqn(v, ref, rn)) { std::printf("MISMATCH unique\n"); ++fails; } else std::printf("ok unique\n"); }
               std::printf("conformance fails=%d\n", fails);
               return fails == 0 ? 0 : 1;
           }
