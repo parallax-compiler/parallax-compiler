@@ -1332,7 +1332,9 @@ jobs:
                 auto re = std::remove_if(ref.begin(), ref.end(), [](int x){ return x > 500; });
                 auto ge = std::remove_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 500; });
                 size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
-                if (rn != gn || !eqn(v, ref, rn)) { std::printf("MISMATCH remove_if\n"); ++fails; } else std::printf("ok remove_if\n"); }
+                size_t bad = rn; for (size_t i = 0; i < rn && i < gn; ++i) if (v[i] != ref[i]) { bad = i; break; }
+                if (rn != gn || !eqn(v, ref, rn)) { std::printf("MISMATCH remove_if rn=%zu gn=%zu bad@%zu v=%d ref=%d\n",
+                    rn, gn, bad, bad<gn?v[bad]:-1, bad<rn?ref[bad]:-1); ++fails; } else std::printf("ok remove_if\n"); }
               // unique (on sorted data with runs)
               { std::vector<int> v(N); for (int i = 0; i < N; ++i) v[i] = rng() % 50; std::sort(v.begin(), v.end());
                 std::vector<int> ref(v.begin(), v.end());
