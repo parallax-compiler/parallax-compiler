@@ -1941,9 +1941,9 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     // "name" location can sit a line off, which would drop us into the ambiguous
     // mangled-name fallback and pick the WRONG lambda (aliasing). Try the begin
     // line first, then the name-location line, before the mangled fallback.
-    auto& SM = ast_context.getSourceManager();
-    unsigned begin_line = SM.getExpansionLineNumber(method->getBeginLoc());
-    unsigned loc_line   = SM.getExpansionLineNumber(method->getLocation());
+    auto& src_mgr = ast_context.getSourceManager();
+    unsigned begin_line = src_mgr.getExpansionLineNumber(method->getBeginLoc());
+    unsigned loc_line   = src_mgr.getExpansionLineNumber(method->getLocation());
     llvm::Function* target = nullptr;
     unsigned matches = 0;
     unsigned target_line = begin_line;
