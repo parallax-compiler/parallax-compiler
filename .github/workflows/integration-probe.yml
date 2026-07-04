@@ -1275,6 +1275,44 @@ jobs:
             || { echo "::error::partition produced a wrong result"; exit 1; }
           echo "PASS: std::partition(par) offloaded GPU partitioning"
 
+      - name: "GATE (removeif-int-alone): isolate int remove_if (aliasing vs codegen)"
+        run: |
+          # Diagnostic: int remove_if with random data, ALONE (no other compaction op
+          # in the TU). If this passes but the 6-algorithm conformance fails on
+          # remove_if, the bug is multi-compaction predicate aliasing, not int+negate.
+          cat > probe_ri.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <iterator>
+          #include <execution>
+          #include <cstdint>
+          #include <cstdio>
+          static uint32_t st = 2463534242u;
+          static int rng() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return (int)(st % 1000); }
+          int main() {
+              const int N = 3000;
+              std::vector<int> v(N); for (auto& x : v) x = rng();
+              std::vector<int> ref(v.begin(), v.end());
+              auto re = std::remove_if(ref.begin(), ref.end(), [](int x){ return x > 500; });
+              auto ge = std::remove_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 500; });
+              size_t rn = std::distance(ref.begin(), re), gn = std::distance(v.begin(), ge);
+              bool eq = (rn == gn); for (size_t i = 0; i < rn && eq; ++i) if (v[i] != ref[i]) eq = false;
+              std::printf("removeif_int rn=%zu gn=%zu eq=%d\n", rn, gn, eq ? 1 : 0);
+              return eq ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_ri.cpp -o /dev/null 2>/dev/null || true
+          "$CLANGXX" -std=c++20 -O2 probe_ri.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_ri 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_ri 2>&1)" || true
+          echo "$out" | grep -aE "removeif_int" | head
+          echo "$out" | grep -q "removeif_int rn=[0-9]* gn=[0-9]* eq=1" \
+            && echo "RESULT: int remove_if ALONE is CORRECT -> conformance failure is ALIASING" \
+            || echo "RESULT: int remove_if ALONE is WRONG -> int+negate codegen bug"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
