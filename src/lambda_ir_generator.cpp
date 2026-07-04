@@ -1935,14 +1935,26 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     // lookup is ambiguous — same-signature lambdas in one TU can all mangle to
     // '$_0' (no Sema-assigned discriminator), so getFunction() would return the
     // first lambda for every call. The source line is unique per lambda.
-    unsigned target_line =
-        ast_context.getSourceManager().getExpansionLineNumber(method->getLocation());
+    //
+    // The emitted operator()'s DISubprogram line aligns with the decl's BEGIN
+    // location (the lambda's '['), NOT method->getLocation() — for a lambda that
+    // "name" location can sit a line off, which would drop us into the ambiguous
+    // mangled-name fallback and pick the WRONG lambda (aliasing). Try the begin
+    // line first, then the name-location line, before the mangled fallback.
+    auto& SM = ast_context.getSourceManager();
+    unsigned begin_line = SM.getExpansionLineNumber(method->getBeginLoc());
+    unsigned loc_line   = SM.getExpansionLineNumber(method->getLocation());
     llvm::Function* target = nullptr;
     unsigned matches = 0;
-    for (llvm::Function& f : *module) {
-        if (f.isDeclaration()) continue;
-        llvm::DISubprogram* sp = f.getSubprogram();
-        if (sp && sp->getLine() == target_line) { target = &f; ++matches; }
+    unsigned target_line = begin_line;
+    for (unsigned cand : {begin_line, loc_line}) {
+        target = nullptr; matches = 0;
+        for (llvm::Function& f : *module) {
+            if (f.isDeclaration()) continue;
+            llvm::DISubprogram* sp = f.getSubprogram();
+            if (sp && sp->getLine() == cand) { target = &f; ++matches; }
+        }
+        if (matches == 1) { target_line = cand; break; }
     }
     if (matches != 1) {
         // Ambiguous or no line match — fall back to the mangled name.
