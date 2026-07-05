@@ -1944,6 +1944,16 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     auto& src_mgr = ast_context.getSourceManager();
     unsigned begin_line = src_mgr.getExpansionLineNumber(method->getBeginLoc());
     unsigned loc_line   = src_mgr.getExpansionLineNumber(method->getLocation());
+    // The operator() signature suffix (e.g. "clEi") is discriminator-independent, so
+    // use it to select the LAMBDA CALL OPERATOR at the target line. The STL algorithm
+    // template instantiated with this lambda ALSO carries the call-site line, so a
+    // plain line match was ambiguous (matches==2) and fell back to the mangled name —
+    // but the two compilations number lambdas differently ($_0 vs $_3), so that
+    // fallback picked the WRONG lambda. Filtering by the call-operator suffix leaves
+    // exactly the operator() we want.
+    size_t clpos = mangled.rfind("clE");
+    llvm::StringRef op_suffix =
+        (clpos != std::string::npos) ? llvm::StringRef(mangled).substr(clpos) : llvm::StringRef();
     llvm::Function* target = nullptr;
     unsigned matches = 0;
     unsigned target_line = begin_line;
@@ -1952,7 +1962,9 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         for (llvm::Function& f : *module) {
             if (f.isDeclaration()) continue;
             llvm::DISubprogram* sp = f.getSubprogram();
-            if (sp && sp->getLine() == cand) { target = &f; ++matches; }
+            if (!sp || sp->getLine() != cand) continue;
+            if (!op_suffix.empty() && !f.getName().ends_with(op_suffix)) continue;
+            target = &f; ++matches;
         }
         if (matches == 1) { target_line = cand; break; }
     }
