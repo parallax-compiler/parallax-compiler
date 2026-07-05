@@ -13,6 +13,7 @@
 #include <sstream>
 #include <iomanip>
 #include <set>
+#include <unordered_set>
 
 namespace parallax {
 
@@ -149,6 +150,13 @@ public:
      * Add a transformation to be applied
      */
     void addTransform(TransformInfo& info) {
+        // With template-instantiation visiting on, a generic algorithm call is visited
+        // once per instantiation but maps to ONE source location. Rewrite each source
+        // location only once to avoid overlapping/duplicate edits.
+        if (info.call_expr) {
+            unsigned key = info.call_expr->getBeginLoc().getRawEncoding();
+            if (!seen_call_locs_.insert(key).second) return;
+        }
         transforms_.push_back(info);
     }
 
@@ -190,6 +198,7 @@ private:
     clang::CompilerInstance& CI_;
     clang::SourceManager& SM_;
     std::vector<TransformInfo> transforms_;
+    std::unordered_set<unsigned> seen_call_locs_;  // dedup rewrites across instantiations
 
     // Container tracking for allocator injection
     std::set<const clang::VarDecl*> containers_needing_allocator_;
@@ -962,6 +971,12 @@ public:
                              ParallaxRewriter& rewriter)
         : context_(context), CI_(CI), rewriter_(rewriter),
           ir_generator_(CI) {}
+
+    // Visit template INSTANTIATIONS too: parallel-STL benchmarks and libraries wrap
+    // std::execution::par calls in generic lambdas / function templates, so the
+    // policy, container, and functor are only concrete AFTER instantiation. Without
+    // this we would only see the (dependent) primary template and never rewrite them.
+    bool shouldVisitTemplateInstantiations() const { return true; }
 
     bool VisitCallExpr(clang::CallExpr* call) {
         // Debug: Log ALL call expressions to see if traversal is working
