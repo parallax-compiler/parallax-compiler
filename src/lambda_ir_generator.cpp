@@ -1956,6 +1956,16 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
         }
         if (matches == 1) { target_line = cand; break; }
     }
+    if (getenv("PARALLAX_DEBUG_LAMBDA")) {
+        llvm::errs() << "[LSEL] target begin_line=" << begin_line << " loc_line=" << loc_line
+                     << " mangled=" << mangled << " -> matches=" << matches << "; emitted:";
+        for (llvm::Function& f : *module) {
+            if (f.isDeclaration()) continue;
+            llvm::DISubprogram* sp = f.getSubprogram();
+            llvm::errs() << " [" << f.getName().str() << "@" << (sp ? sp->getLine() : 0) << "]";
+        }
+        llvm::errs() << "\n";
+    }
     if (matches != 1) {
         // Ambiguous or no line match — fall back to the mangled name.
         llvm::Function* byname = module->getFunction(mangled);
