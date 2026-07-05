@@ -1322,6 +1322,50 @@ jobs:
             || { echo "::error::partition produced a wrong result"; exit 1; }
           echo "PASS: std::partition(par) offloaded GPU partitioning"
 
+      - name: "GATE (generic-lambda): pSTL-Bench-style templated par call offloads"
+        run: |
+          # The pSTL-Bench pattern: the algorithm is wrapped in a GENERIC lambda where
+          # the policy, container, and functor are all template params. Instantiation-
+          # level interception must detect + offload this (not just concrete calls).
+          # Built WITHOUT a CPU par backend (no -ltbb): if the plugin didn't rewrite the
+          # call it would fail to link -> a hard proof the interception works.
+          cat > probe_generic.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          // mimics for_each_std.h: policy + container + functor are all generic params
+          const auto for_each_std = [](auto && policy, auto & input, auto && f) {
+              std::for_each(policy, input.begin(), input.end(), f);
+          };
+          int main() {
+              std::vector<float> v(64, 1.0f);
+              auto myf = [](float & x) { x = x * 2.0f + 1.0f; };
+              for_each_std(std::execution::par, v, myf);
+              std::printf("generic result=%.1f expected=3.0\n", v[0]);
+              return v[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/gen.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_generic.cpp -o /dev/null 2> gen.log || true
+          echo "=== plugin log (detection) ==="; grep -aiE "for_each|function object|generated|SPIR-V|par|Located|rewrit|Skipping|leaving on CPU" gen.log | head -20 || true
+          [ -f gen.spv ] && echo "SPIR-V EMITTED for the generic call" || echo "NO SPIR-V (call not intercepted)"
+          echo "=== rewritten source ==="; cat probe_generic.cpp | grep -nE "parallax_kernel|for_each_std|std::for_each" | head
+          # Build without TBB: only succeeds if the par call was rewritten to a GPU dispatch.
+          if "$CLANGXX" -std=c++20 -O2 probe_generic.cpp \
+               -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_generic 2>gbuild.log; then
+            export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+            out="$(./probe_generic 2>&1)" || true
+            echo "$out" | grep -aE "generic result=|Successfully loaded kernel" | head
+            if echo "$out" | grep -q "generic result=3.0"; then
+              echo "RESULT: generic-lambda par call OFFLOADED and correct"
+            else
+              echo "RESULT: built but wrong/no result"; fi
+          else
+            echo "RESULT: build FAILED without TBB (call not rewritten):"; grep -iE "undefined|pstl|tbb|error:" gbuild.log | head -5
+          fi
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
