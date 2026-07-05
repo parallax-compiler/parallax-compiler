@@ -119,6 +119,12 @@ private:
                             const std::set<size_t>& buffer_param_indices = {});
     void translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
                                std::unordered_map<llvm::Value*, uint32_t>& value_map);
+    // True if a scalar load/store through `ptr` is an offset-0 struct field whose GEP
+    // LLVM elided (needs a synthesized member-0 access). Bails (translation_failed_)
+    // if the offset-0 member's type doesn't match the scalar.
+    bool     is_elided_struct_field(llvm::Value* ptr, llvm::Type* scalar_ty);
+    uint32_t emit_member0_ptr(SPIRVBuilder& builder, uint32_t base,
+                              llvm::Type* scalar_ty, llvm::LLVMContext& ctx);
     uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
     uint32_t get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class);
     uint32_t get_value_id(SPIRVBuilder& builder, llvm::Value* val, std::unordered_map<llvm::Value*, uint32_t>& value_map);
@@ -179,6 +185,16 @@ private:
     uint32_t    reloc_host_base_id_ = 0;
     uint32_t    reloc_dev_base_id_ = 0;
     std::unordered_set<llvm::Value*> relocatable_values_;
+
+    // Struct element support. data_layout_ (set per generate_from_lambda) gives the
+    // host member offsets/sizes so the device reads the same bytes the host wrote.
+    // struct_element_ptrs_ holds pointer values that point at the whole struct element
+    // (the lambda's element-pointer param); LLVM elides the offset-0 field GEP
+    // (`p.x` -> `load T, ptr %p`), so a scalar load/store through such a pointer needs
+    // a synthesized member-0 OpAccessChain (a raw OpLoad of T through a ptr-to-struct
+    // is invalid SPIR-V).
+    const llvm::DataLayout* data_layout_ = nullptr;
+    std::unordered_set<llvm::Value*> struct_element_ptrs_;
 
     // Set true when translate_instruction hits an LLVM instruction it cannot lower
     // (an unsupported construct in the user callable). generate_from_lambda checks

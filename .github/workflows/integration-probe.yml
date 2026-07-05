@@ -976,6 +976,53 @@ jobs:
             || { echo "::error::struct-by-value capture produced wrong result"; exit 1; }
           echo "PASS: struct-by-value capture offloaded (closure flattened)"
 
+      - name: "GATE (struct element): for_each over a container of structs"
+        run: |
+          # Codegen breadth: the element type is a struct (Point{float x,y}). The data
+          # buffer is a runtime array of OpTypeStruct with member Offsets from the host
+          # layout; p.x (offset-0, GEP elided by LLVM) uses a synthesized member-0
+          # OpAccessChain, p.y uses a field GEP. p.x*=2, p.y+=1.
+          cat > probe_struct.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          struct Point { float x, y; };
+          int main() {
+              const int N = 256;
+              std::vector<Point> v(N);
+              for (int i = 0; i < N; ++i) { v[i].x = (float)i; v[i].y = (float)i * 2.0f; }
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](Point& p){ p.x = p.x * 2.0f; p.y = p.y + 1.0f; });
+              bool ok = true;
+              for (int i = 0; i < N && ok; ++i)
+                  if (v[i].x != (float)i * 2.0f || v[i].y != (float)i * 2.0f + 1.0f) ok = false;
+              std::printf("struct ok=%d v[3].x=%.1f v[3].y=%.1f (exp 6.0, 7.0)\n", ok ? 1 : 0, v[3].x, v[3].y);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/st.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_struct.cpp -o /dev/null 2> st.log || true
+          if [ -f st.spv ]; then
+            spirv-val st.spv || { echo "::error::struct-element SPIR-V failed validation"; exit 1; }
+            spirv-dis st.spv 2>/dev/null | grep -q "OpTypeStruct" \
+              || { echo "::error::no OpTypeStruct emitted for the element"; exit 1; }
+          else
+            echo "::error::no struct SPIR-V (struct element bailed to CPU)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_struct.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_struct 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_struct 2>&1)" || true
+          echo "$out" | grep -aE "struct ok=" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::struct kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "struct ok=1 v\[3\].x=6.0 v\[3\].y=7.0" \
+            || { echo "::error::struct element produced a wrong result"; exit 1; }
+          echo "PASS: for_each over a struct element type offloaded (OpTypeStruct + member-0 + field GEP)"
+
       - name: "GATE (inclusive_scan): multi-block prefix scan on the GPU"
         run: |
           # Phase 5: the plugin detects std::inclusive_scan, emits two kernels (a

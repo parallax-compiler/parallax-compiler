@@ -458,6 +458,32 @@ static uint32_t spirv_align_of(llvm::Type* t) {
     return bytes < 4 ? 4 : bytes;
 }
 
+bool SPIRVGenerator::is_elided_struct_field(llvm::Value* ptr, llvm::Type* scalar_ty) {
+    if (!struct_element_ptrs_.count(ptr)) return false;
+    if (!active_element_type_ || !active_element_type_->isStructTy()) return false;
+    if (scalar_ty == active_element_type_) return false;  // whole-struct load/store
+    auto* st = llvm::cast<llvm::StructType>(active_element_type_);
+    // Offset-0 elision only reaches member 0; require its type to match the scalar so
+    // we never emit a wrong-typed access (a nested/mismatched member bails to CPU).
+    if (st->getNumElements() == 0 || st->getElementType(0) != scalar_ty) {
+        translation_failed_ = true;
+        llvm::errs() << "[SPIRVGenerator] struct offset-0 field is not member 0; leaving on CPU\n";
+        return false;
+    }
+    return true;
+}
+
+uint32_t SPIRVGenerator::emit_member0_ptr(SPIRVBuilder& builder, uint32_t base,
+                                          llvm::Type* scalar_ty, llvm::LLVMContext& ctx) {
+    uint32_t scalar_id = get_type_id(builder, scalar_ty);
+    uint32_t mem_ptr_ty = get_pointer_type_id(builder, scalar_id, 12 /* StorageBuffer */);
+    // The struct member index must be a constant; member 0 is at offset 0.
+    uint32_t zero = get_constant_id(builder, llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0));
+    uint32_t mp = builder.get_next_id();
+    builder.emit_op(SPIRVOp::OpAccessChain, {mem_ptr_ty, mp, base, zero});
+    return mp;
+}
+
 void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruction* inst,
                                            std::unordered_map<llvm::Value*, uint32_t>& value_map) {
     // Use a result id pre-assigned by translate_function (so loop PHIs and other
@@ -596,6 +622,12 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
                 uint32_t u64 = get_type_id(builder, llvm::Type::getInt64Ty(ctx));
                 builder.emit_op(SPIRVOp::OpLoad, {u64, result_id, ptr});
                 relocatable_values_.insert(inst);
+            } else if (is_elided_struct_field(ptr_operand, inst->getType())) {
+                // p.x (offset-0 field): LLVM elided the GEP (`load T, ptr %p`). %p is a
+                // ptr-to-struct, so synthesize member-0 access before the scalar load.
+                uint32_t base = get_value_id(builder, ptr_operand, value_map);
+                uint32_t mp = emit_member0_ptr(builder, base, inst->getType(), ctx);
+                builder.emit_op(SPIRVOp::OpLoad, {get_type_id(builder, inst->getType()), result_id, mp});
             } else {
                 uint32_t ptr = get_value_id(builder, ptr_operand, value_map);
                 builder.emit_op(SPIRVOp::OpLoad, {get_type_id(builder, inst->getType()), result_id, ptr});
@@ -614,6 +646,13 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
                 uint32_t pp = emit_relocate(builder, host_addr, val_operand->getType(), ctx);
                 builder.emit_op(SPIRVOp::OpStore,
                                 {pp, value, 0x2 /* Aligned */, spirv_align_of(val_operand->getType())});
+            } else if (is_elided_struct_field(ptr_operand, val_operand->getType())) {
+                // p.x = ... (offset-0 field): synthesize member-0 access to store into.
+                llvm::LLVMContext& ctx = val_operand->getType()->getContext();
+                uint32_t value = get_value_id(builder, val_operand, value_map);
+                uint32_t base = get_value_id(builder, ptr_operand, value_map);
+                uint32_t mp = emit_member0_ptr(builder, base, val_operand->getType(), ctx);
+                builder.emit_op(SPIRVOp::OpStore, {mp, value});
             } else {
                 uint32_t value = get_value_id(builder, val_operand, value_map);
                 uint32_t ptr = get_value_id(builder, ptr_operand, value_map);
@@ -625,16 +664,35 @@ void SPIRVGenerator::translate_instruction(SPIRVBuilder& builder, llvm::Instruct
         case llvm::Instruction::GetElementPtr: {
             auto* gep = llvm::cast<llvm::GetElementPtrInst>(inst);
             uint32_t base = get_value_id(builder, gep->getPointerOperand(), value_map);
-            
-            std::vector<uint32_t> ops;
-            ops.push_back(get_type_id(builder, gep->getType()));
-            ops.push_back(result_id);
-            ops.push_back(base);
-            
-            for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it) {
-                ops.push_back(get_value_id(builder, *it, value_map));
+
+            // Struct field access: clang emits `getelementptr T, ptr %p, i32 0, i32 f`.
+            // SPIR-V OpAccessChain indexes the pointed-to object directly (no leading
+            // pointer-deref index), and the result is a pointer to the reached field —
+            // which an opaque LLVM pointer can't tell us, so use getResultElementType().
+            // The element pointers we index live in the StorageBuffer.
+            bool struct_field = false;
+            if (gep->getNumIndices() >= 2) {
+                if (auto* c0 = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get()))
+                    struct_field = c0->isZero();
             }
-            
+
+            std::vector<uint32_t> ops;
+            if (struct_field) {
+                uint32_t pointee = get_type_id(builder, gep->getResultElementType());
+                ops.push_back(get_pointer_type_id(builder, pointee, 12 /* StorageBuffer */));
+                ops.push_back(result_id);
+                ops.push_back(base);
+                auto it = gep->idx_begin();
+                ++it;  // drop the leading 0
+                for (; it != gep->idx_end(); ++it)
+                    ops.push_back(get_value_id(builder, *it, value_map));
+            } else {
+                ops.push_back(get_type_id(builder, gep->getType()));
+                ops.push_back(result_id);
+                ops.push_back(base);
+                for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it)
+                    ops.push_back(get_value_id(builder, *it, value_map));
+            }
             builder.emit_op(SPIRVOp::OpAccessChain, ops);
             break;
         }
@@ -973,6 +1031,30 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         uint32_t ptr_ty = get_pointer_type_id(builder, el_ty_id, 12 /* StorageBuffer */);
         type_cache_[type] = ptr_ty;
         return ptr_ty;
+    } else if (type->isStructTy() && data_layout_) {
+        // A struct element type (e.g. Point{float x,y}). It only ever lives in the
+        // StorageBuffer (the data array + pointers into it), so member Offset
+        // decorations are valid and there is no decorated/undecorated duality. Emit
+        // member offsets from the HOST data layout so the device reads exactly the
+        // bytes the host wrote.
+        auto* st = llvm::cast<llvm::StructType>(type);
+        std::vector<uint32_t> members;
+        members.reserve(st->getNumElements());
+        for (unsigned m = 0; m < st->getNumElements(); ++m)
+            members.push_back(get_type_id(builder, st->getElementType(m)));  // recurse first
+        builder.set_section(SPIRVBuilder::Section::Types);
+        std::vector<uint32_t> ops = {type_id};
+        ops.insert(ops.end(), members.begin(), members.end());
+        builder.emit_op(SPIRVOp::OpTypeStruct, ops);
+        const llvm::StructLayout* sl = data_layout_->getStructLayout(st);
+        builder.set_section(SPIRVBuilder::Section::Decorations);
+        for (unsigned m = 0; m < st->getNumElements(); ++m)
+            builder.emit_op(SPIRVOp::OpMemberDecorate,
+                            {type_id, m, 35 /* Offset */,
+                             static_cast<uint32_t>(sl->getElementOffset(m))});
+        type_cache_[type] = type_id;
+        builder.set_section(prev_section);
+        return type_id;
     } else {
         // A type we don't model yet: vectors (floatN), structs/aggregates as values,
         // fixed arrays, and 8/16-bit integers. Silently emitting i32 would miscompile
@@ -1070,18 +1152,24 @@ uint32_t SPIRVGenerator::get_constant_id(SPIRVBuilder& builder, llvm::Constant* 
 // Recover the element type accessed through an (opaque) pointer parameter by
 // inspecting the first load/store/GEP that uses it. Returns nullptr if none.
 static llvm::Type* infer_pointee_type(llvm::Function* f, const llvm::Argument* arg) {
+    // Prefer a GEP's source element type: it names the aggregate being indexed (e.g.
+    // %Point), which is the true element type. A plain load/store only reveals the
+    // FIELD type, and LLVM elides the GEP for the offset-0 field (`p.x` -> `load T`),
+    // so relying on the first load would misinfer a struct element as a scalar. Only
+    // fall back to the load/store type when no GEP indexes the argument.
+    llvm::Type* fallback = nullptr;
     for (auto& bb : *f) {
         for (auto& inst : bb) {
-            if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-                if (ld->getPointerOperand() == arg) return ld->getType();
-            } else if (auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-                if (st->getPointerOperand() == arg) return st->getValueOperand()->getType();
-            } else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+            if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
                 if (gep->getPointerOperand() == arg) return gep->getSourceElementType();
+            } else if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+                if (ld->getPointerOperand() == arg && !fallback) fallback = ld->getType();
+            } else if (auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+                if (st->getPointerOperand() == arg && !fallback) fallback = st->getValueOperand()->getType();
             }
         }
     }
-    return nullptr;
+    return fallback;
 }
 
 std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
@@ -1158,9 +1246,12 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     active_element_type_ = nullptr;
     element_is_pointer_ = false;
     relocatable_values_.clear();
+    struct_element_ptrs_.clear();
+    data_layout_ = &lambda_func->getParent()->getDataLayout();
     pc_var_id_ = 0;
     reloc_host_base_id_ = 0;
     reloc_dev_base_id_ = 0;
+    const llvm::Argument* elem_ptr_arg = nullptr;  // for_each element pointer (if any)
     if (is_transform) {
         if (lambda_func->arg_size() > 0) {
             active_element_type_ = lambda_func->getArg(0)->getType();
@@ -1169,9 +1260,16 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
         for (auto& a : lambda_func->args()) {
             if (a.getType()->isPointerTy() && a.getArgNo() < num_data_params) {
                 active_element_type_ = infer_pointee_type(lambda_func, &a);
+                elem_ptr_arg = &a;
                 break;
             }
         }
+    }
+    // A struct element type is accessed through the element pointer; record that
+    // pointer so a scalar load/store through it (LLVM's elided offset-0 field GEP)
+    // gets a synthesized member-0 access instead of an invalid OpLoad-through-struct.
+    if (elem_ptr_arg && active_element_type_ && active_element_type_->isStructTy()) {
+        struct_element_ptrs_.insert(const_cast<llvm::Argument*>(elem_ptr_arg));
     }
     if (active_element_type_ && active_element_type_->isPointerTy()) {
         // The kernel dereferences a pointer stored in the data (pointer-chasing /
@@ -1186,6 +1284,15 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     }
     if (active_element_type_) {
         llvm::errs() << "[SPIRVGenerator] Kernel element type: " << *active_element_type_ << "\n";
+    }
+    // transform passes the element BY VALUE. A struct element would need to be loaded
+    // as a whole value, but a Block/Offset-decorated struct is only valid in the
+    // StorageBuffer — so transform-over-struct bails to CPU. for_each (by reference /
+    // pointer, handled above) does support structs.
+    if (is_transform && active_element_type_ && active_element_type_->isStructTy()) {
+        translation_failed_ = true;
+        llvm::errs() << "[SPIRVGenerator] transform over a by-value struct element not "
+                        "supported; leaving on CPU\n";
     }
 
     // Create the push-constant block (count [+ host_base/dev_base for pointer
@@ -2750,7 +2857,14 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         data_elem_stride = 8;
     } else {
         llvm::Type* data_elem_ty = active_element_type_ ? active_element_type_ : float_ty;
-        data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
+        if (data_elem_ty->isStructTy() && data_layout_) {
+            // Struct element: stride is the host sizeof (incl. padding) so the array
+            // spacing matches the host vector<Struct> exactly (getPrimitiveSizeInBits
+            // is 0 for aggregates).
+            data_elem_stride = static_cast<uint32_t>(data_layout_->getTypeAllocSize(data_elem_ty));
+        } else {
+            data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
+        }
         if (data_elem_stride < 4) data_elem_stride = 4;
     }
 
