@@ -1345,11 +1345,10 @@ jobs:
           }
           EOF
           # Step 1: the plugin rewrites probe_conf.cpp in place (par calls -> GPU).
-          PARALLAX_DEBUG_LAMBDA=1 "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
             -c probe_conf.cpp -o /dev/null 2> conf.log || true
           grep -cE ": generated|Generated [0-9]+ SPIR-V" conf.log | sed 's/^/rewritten algorithms: /' || true
-          echo "=== lambda selection ==="; grep -aE "^\[LSEL\]" conf.log || true
           # Step 2: compile the rewritten source + link the runtime.
           "$CLANGXX" -std=c++20 -O2 probe_conf.cpp \
             -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_conf 2>&1 | tail -5
