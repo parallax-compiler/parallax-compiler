@@ -1351,6 +1351,8 @@ jobs:
           PARALLAX_DUMP_SPIRV="$PWD/gen.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
             -c probe_generic.cpp -o /dev/null 2> gen.log || true
+          echo "=== plugin detection log ==="; grep -aiE "Found parallel|for_each|function object|Generated [0-9]+ SPIR-V|Could not extract|No lambda|leaving on CPU|Located operator|Replacement code" gen.log | head -25 || true
+          echo "=== rewritten? ==="; grep -cE "parallax_kernel|__parallax_kernel" probe_generic.cpp | sed 's/^/parallax refs in source: /'
           [ -f gen.spv ] || { echo "::error::generic-lambda par call not intercepted (no SPIR-V)"; exit 1; }
           # Build WITHOUT a CPU par backend (no -ltbb): only links if the par call was
           # rewritten to a GPU dispatch (else libstdc++ PSTL needs TBB -> link failure).
