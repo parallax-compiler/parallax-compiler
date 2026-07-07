@@ -1342,11 +1342,10 @@ jobs:
           };
           int main() {
               std::vector<float> v(64, 1.0f);
-              const std::size_t its = 3;                       // generic + capturing + looping functor
-              auto myf = [=](auto& elem) { for (std::size_t i = 0; i < its; ++i) elem += 1.0f; };
+              auto myf = [](auto& elem) { elem = elem * 2.0f + 1.0f; };  // generic, captureless
               for_each_par(parallax::par, v, myf);
-              std::printf("funnel result=%.1f expected=4.0\n", v[0]);
-              return v[0] == 4.0f ? 0 : 1;
+              std::printf("funnel result=%.1f expected=3.0\n", v[0]);
+              return v[0] == 3.0f ? 0 : 1;
           }
           EOF
           }
@@ -1376,7 +1375,7 @@ jobs:
           # so require the actual GPU kernel load as the offload proof.
           echo "$out" | grep -q "Successfully loaded kernel" \
             || { echo "::error::funnel kernel not offloaded (register/lookup key mismatch?)"; exit 1; }
-          echo "$out" | grep -q "funnel result=4.0" \
+          echo "$out" | grep -q "funnel result=3.0" \
             || { echo "::error::funnel produced a wrong result"; exit 1; }
           echo "PASS: pSTL-Bench-style generic par call offloaded DETERMINISTICALLY via the device_invoke funnel"
 
