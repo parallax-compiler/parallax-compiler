@@ -1066,7 +1066,21 @@ public:
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
         if (!functor) return;
         clang::CXXMethodDecl* op_call = getFunctionCallOperator(functor);
-        if (!op_call || !op_call->hasBody()) {
+        if (!op_call) return;
+        // Generic lambda / templated functor: operator() is a function template whose
+        // pattern is dependent (no compilable body). device_invoke<T,F> odr-uses the
+        // concrete operator()<T&>, so pick that instantiation instead of the pattern.
+        if (clang::FunctionTemplateDecl* ft = op_call->getDescribedFunctionTemplate()) {
+            clang::CXXMethodDecl* concrete = nullptr;
+            for (clang::FunctionDecl* s : ft->specializations()) {
+                if (s->hasBody()) { concrete = llvm::dyn_cast<clang::CXXMethodDecl>(s); break; }
+            }
+            if (concrete) op_call = concrete;
+            llvm::errs() << "[FUNNEL-DBG] generic functor: "
+                         << (concrete ? "using operator() instantiation" : "no instantiation found")
+                         << "\n";
+        }
+        if (!op_call->hasBody()) {
             llvm::errs() << "[ParallaxFunnel] functor operator() has no body; host fallback\n";
             return;
         }
