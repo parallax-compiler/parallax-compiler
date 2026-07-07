@@ -192,7 +192,15 @@ public:
         std::string esc;
         for (char c : key) { if (c == '\\' || c == '"') esc.push_back('\\'); esc.push_back(c); }
         std::ostringstream ss;
-        ss << "\n" << generateSPIRVArray(arr, spirv)
+        // `unsigned int` (not uint32_t) so no <cstdint> is required at end-of-file,
+        // where these registrars are appended.
+        ss << "\nstatic const unsigned int " << arr << "_spirv[] = {\n";
+        for (size_t i = 0; i < spirv.size(); ++i) {
+            ss << "0x" << std::hex << std::setw(8) << std::setfill('0') << spirv[i]
+               << std::dec << (i + 1 < spirv.size() ? "," : "")
+               << ((i + 1) % 8 == 0 ? "\n" : " ");
+        }
+        ss << "\n};\n"
            << "namespace { struct " << arr << "_reg { " << arr << "_reg() { "
            << "parallax_kernel_register(\"" << esc << "\", " << arr << "_spirv, "
            << "sizeof(" << arr << "_spirv)/sizeof(unsigned int)); } } "
