@@ -1106,8 +1106,9 @@ public:
         llvm::errs() << "[ParallaxFunnel] device_invoke<" << elemT.getAsString()
                      << ", " << functor->getNameAsString() << ">\n  key=" << key << "\n";
 
-        ClassContext class_ctx = class_extractor_.extract(op_call, context_);
-        auto module = ir_generator_.generateIRManual(op_call, class_ctx, context_);
+        // Use the real clang sub-compilation path (handles arbitrary bodies: loops,
+        // compound assigns, captures) rather than the hand-rolled manual translator.
+        auto module = ir_generator_.generateIR(op_call, context_);
         if (!module) {
             llvm::errs() << "[ParallaxFunnel] IR gen failed; host fallback\n";
             return;
