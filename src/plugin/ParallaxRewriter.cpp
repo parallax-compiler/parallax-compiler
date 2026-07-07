@@ -9,6 +9,7 @@
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/TemplateBase.h>
 #include <clang/AST/ExprCXX.h>
+#include <clang/AST/Expr.h>
 #include <llvm/Support/raw_ostream.h>
 #include <sstream>
 #include <iomanip>
@@ -180,6 +181,34 @@ public:
     }
 
     /**
+     * Layer A funnel: append a per-instantiation registrar for a device_invoke<T,F>
+     * kernel. No shared template body is rewritten (all instantiations share one
+     * source range); instead each instantiation's SPIR-V is registered at static-init
+     * time under the key the runtime funnel computes identically (__PRETTY_FUNCTION__).
+     */
+    void emitFunnelRegistrar(const std::string& key, const std::vector<uint32_t>& spirv) {
+        int n = funnel_counter_++;
+        std::string arr = "__plx_funnel_" + std::to_string(n);
+        std::string esc;
+        for (char c : key) { if (c == '\\' || c == '"') esc.push_back('\\'); esc.push_back(c); }
+        std::ostringstream ss;
+        ss << "\n" << generateSPIRVArray(arr, spirv)
+           << "namespace { struct " << arr << "_reg { " << arr << "_reg() { "
+           << "parallax_kernel_register(\"" << esc << "\", " << arr << "_spirv, "
+           << "sizeof(" << arr << "_spirv)/sizeof(unsigned int)); } } "
+           << arr << "_reg_inst; }\n";
+        funnel_emissions_ += ss.str();
+    }
+
+    /** Insert all accumulated funnel registrars at end of the main file. */
+    void finalizeFunnelEmissions() {
+        if (funnel_emissions_.empty()) return;
+        clang::SourceLocation eof = SM_.getLocForEndOfFile(SM_.getMainFileID());
+        rewriter_.InsertText(eof, funnel_emissions_, /*InsertAfter=*/true,
+                             /*indentNewLines=*/false);
+    }
+
+    /**
      * Mark a container as needing allocator injection
      */
     void markContainerForAllocation(const clang::VarDecl* var_decl) {
@@ -199,6 +228,8 @@ private:
     clang::SourceManager& SM_;
     std::vector<TransformInfo> transforms_;
     std::unordered_set<unsigned> seen_call_locs_;  // dedup rewrites across instantiations
+    std::string funnel_emissions_;                 // Layer A: appended registrars
+    int funnel_counter_ = 0;
 
     // Container tracking for allocator injection
     std::set<const clang::VarDecl*> containers_needing_allocator_;
@@ -977,6 +1008,76 @@ public:
     // policy, container, and functor are only concrete AFTER instantiation. Without
     // this we would only see the (dependent) primary template and never rewrite them.
     bool shouldVisitTemplateInstantiations() const { return true; }
+
+    // Layer A: the robust interception path. Instead of pattern-matching
+    // std::for_each(par,...) call sites (fragile in generic contexts), we key on
+    // instantiations of the ONE funnel template parallax::detail::device_invoke<T,F>.
+    // The header routes every parallel algorithm through it by ordinary overload
+    // resolution, so a concrete (T,F) instantiation always exists at the leaf; a
+    // named namespace-scope function template instantiation is visited
+    // deterministically (unlike generic-lambda member-template bodies). For each we
+    // compile F applied to an element to SPIR-V and register it under the
+    // instantiation's __PRETTY_FUNCTION__ (which the runtime funnel recomputes),
+    // rather than rewriting the shared template body.
+    bool VisitFunctionDecl(clang::FunctionDecl* FD) {
+        if (!FD || FD->getTemplatedKind() !=
+                       clang::FunctionDecl::TK_FunctionTemplateSpecialization)
+            return true;
+        if (FD->getQualifiedNameAsString() != "parallax::detail::device_invoke")
+            return true;
+
+        const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
+        if (!targs || targs->size() < 2) return true;
+        if (targs->get(0).getKind() != clang::TemplateArgument::Type ||
+            targs->get(1).getKind() != clang::TemplateArgument::Type)
+            return true;
+        clang::QualType elemT = targs->get(0).getAsType();
+        clang::QualType funcT = targs->get(1).getAsType();
+        clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
+        if (!functor) return true;
+        clang::CXXMethodDecl* op_call = getFunctionCallOperator(functor);
+        if (!op_call || !op_call->hasBody()) return true;
+
+        // Key both sides compute identically: the instantiation's __PRETTY_FUNCTION__.
+        std::string key = clang::PredefinedExpr::ComputeName(
+            clang::PredefinedIdentKind::PrettyFunction, FD);
+        if (!seen_funnel_keys_.insert(key).second) return true;
+
+        llvm::errs() << "[ParallaxFunnel] device_invoke<" << elemT.getAsString()
+                     << ", " << functor->getNameAsString() << ">\n  key=" << key << "\n";
+
+        ClassContext class_ctx = class_extractor_.extract(op_call, context_);
+        auto module = ir_generator_.generateIRManual(op_call, class_ctx, context_);
+        if (!module) {
+            llvm::errs() << "[ParallaxFunnel] IR gen failed; host fallback\n";
+            return true;
+        }
+        llvm::Function* kernel_func = nullptr;
+        for (auto& f : *module) {
+            if (f.getName().str().rfind("kernel_", 0) == 0) { kernel_func = &f; break; }
+        }
+        if (!kernel_func)
+            for (auto& f : *module)
+                if (!f.isDeclaration()) { kernel_func = &f; break; }
+        if (!kernel_func) {
+            llvm::errs() << "[ParallaxFunnel] no kernel function; host fallback\n";
+            return true;
+        }
+
+        SPIRVGenerator spirv_gen;
+        spirv_gen.set_target_vulkan_version(1, 2);
+        std::vector<std::string> param_types = {
+            elemT.getUnqualifiedType().getAsString() + "&"};
+        auto spirv = spirv_gen.generate_from_lambda(kernel_func, param_types);
+        if (spirv.empty()) {
+            llvm::errs() << "[ParallaxFunnel] SPIR-V gen failed; host fallback\n";
+            return true;
+        }
+        llvm::errs() << "[ParallaxFunnel] Generated " << spirv.size()
+                     << " SPIR-V words; registering\n";
+        rewriter_.emitFunnelRegistrar(key, spirv);
+        return true;
+    }
 
     bool VisitCallExpr(clang::CallExpr* call) {
         // Debug: Log ALL call expressions to see if traversal is working
@@ -1759,6 +1860,7 @@ private:
     ParallaxRewriter& rewriter_;
     LambdaIRGenerator ir_generator_;
     ClassContextExtractor class_extractor_;
+    std::unordered_set<std::string> seen_funnel_keys_;  // Layer A: dedup device_invoke instantiations
 
     bool isParallelAlgorithm(clang::CallExpr* call);
     std::string extractAlgorithmName(clang::CallExpr* call);
@@ -2083,6 +2185,10 @@ public:
 
         // Phase 2: Apply transformations
         rewriter_.applyAllTransformations();
+
+        // Layer A: append device_invoke funnel registrars (independent of call-site
+        // transforms; the funnel path may fire with no call-site rewrites at all).
+        rewriter_.finalizeFunnelEmissions();
 
         llvm::errs() << "[Parallax] Phase 3: Writing rewritten files...\n";
 

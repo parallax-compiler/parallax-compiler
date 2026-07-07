@@ -1322,51 +1322,63 @@ jobs:
             || { echo "::error::partition produced a wrong result"; exit 1; }
           echo "PASS: std::partition(par) offloaded GPU partitioning"
 
-      - name: "GATE (generic-lambda): pSTL-Bench-style templated par call offloads"
+      - name: "GATE (funnel): pSTL-Bench-style generic par call offloads via device_invoke (DETERMINISTIC)"
         run: |
-          # The pSTL-Bench pattern: the algorithm is wrapped in a GENERIC lambda where
-          # the policy, container, and functor are all template params. Instantiation-
-          # level interception must detect + offload this (not just concrete calls).
-          # Built WITHOUT a CPU par backend (no -ltbb): if the plugin didn't rewrite the
-          # call it would fail to link -> a hard proof the interception works.
-          cat > probe_generic.cpp <<'EOF'
+          # Layer A (nvc++/dpc++ shape): interception rides ordinary C++ overload
+          # resolution through the ONE funnel template parallax::detail::device_invoke<T,F>.
+          # The plugin keys on THAT named instantiation (deterministically visited),
+          # not on pattern-matching the call site inside a generic wrapper (which was
+          # non-deterministic). It registers per-instantiation SPIR-V keyed by the
+          # instantiation's __PRETTY_FUNCTION__, which the runtime funnel recomputes.
+          write_probe() {
+            cat > probe_funnel.cpp <<'EOF'
           #include <vector>
-          #include <algorithm>
-          #include <execution>
           #include <cstdio>
-          // mimics for_each_std.h: policy + container + functor are all generic params
-          const auto for_each_std = [](auto && policy, auto & input, auto && f) {
-              std::for_each(policy, input.begin(), input.end(), f);
+          #include <cstddef>
+          #include <parallax/stdpar.hpp>
+          // pSTL-Bench shape: policy + container + functor are all generic template params.
+          const auto for_each_par = [](auto&& policy, auto& input, auto&& f) {
+              parallax::for_each(policy, input.begin(), input.end(), f);
           };
           int main() {
               std::vector<float> v(64, 1.0f);
-              // pSTL-Bench-shape functor: GENERIC (auto& elem), CAPTURES state, loops.
-              const std::size_t its = 3;
-              auto myf = [=](auto & elem) { for (std::size_t i = 0; i < its; ++i) elem += 1.0f; };
-              for_each_std(std::execution::par, v, myf);
-              std::printf("generic result=%.1f expected=4.0\n", v[0]);
+              const std::size_t its = 3;                       // generic + capturing + looping functor
+              auto myf = [=](auto& elem) { for (std::size_t i = 0; i < its; ++i) elem += 1.0f; };
+              for_each_par(parallax::par, v, myf);
+              std::printf("funnel result=%.1f expected=4.0\n", v[0]);
               return v[0] == 4.0f ? 0 : 1;
           }
           EOF
-          PARALLAX_DUMP_SPIRV="$PWD/gen.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
-            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
-            -c probe_generic.cpp -o /dev/null 2> gen.log; pcode=$?
-          echo "plugin -c exit code: $pcode (139=segfault, 134=abort)"
-          echo "=== plugin log tail ==="; tail -15 gen.log || true
-          echo "=== rewritten? ==="; grep -cE "parallax_kernel|__parallax_kernel" probe_generic.cpp | sed 's/^/parallax refs in source: /'
-          [ -f gen.spv ] || { echo "::error::generic-lambda par call not intercepted (no SPIR-V)"; exit 1; }
-          # Build WITHOUT a CPU par backend (no -ltbb): only links if the par call was
-          # rewritten to a GPU dispatch (else libstdc++ PSTL needs TBB -> link failure).
-          "$CLANGXX" -std=c++20 -O2 probe_generic.cpp \
-            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_generic 2>&1 | tail -3
+          }
+          # DETERMINISM: run the plugin compile 3x on a FRESH source each time; the
+          # per-instantiation registrar must be emitted EVERY time.
+          for run in 1 2 3; do
+            write_probe
+            "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+              -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+              -c probe_funnel.cpp -o /dev/null 2> fun_$run.log; pc=$?
+            regs=$(grep -c "parallax_kernel_register" probe_funnel.cpp || true)
+            echo "run $run: plugin exit=$pc, registrars emitted=$regs"
+            grep -aE "ParallaxFunnel" fun_$run.log | head -4 || true
+            if [ "$regs" -lt 1 ]; then
+              echo "::error::funnel registrar NOT emitted on run $run (interception is non-deterministic)"; exit 1
+            fi
+          done
+          # Build the rewritten source + link WITHOUT -ltbb (the funnel host fallback
+          # needs no par backend, so linking alone no longer proves offload -> we prove
+          # it via the runtime kernel load below).
+          "$CLANGXX" -std=c++20 -O2 probe_funnel.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_funnel 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          out="$(./probe_generic 2>&1)" || true
-          echo "$out" | grep -aE "generic result=" | head
+          out="$(PARALLAX_DEBUG=1 ./probe_funnel 2>&1)" || true
+          echo "$out" | grep -aE "funnel result=|Successfully loaded kernel|kernel_lookup|kernel_register" | head -20
+          # A registry key MISMATCH would silently fall back to the host loop (still 4.0),
+          # so require the actual GPU kernel load as the offload proof.
           echo "$out" | grep -q "Successfully loaded kernel" \
-            || { echo "::error::generic-lambda kernel was not offloaded"; exit 1; }
-          echo "$out" | grep -q "generic result=4.0" \
-            || { echo "::error::generic-lambda produced a wrong result"; exit 1; }
-          echo "PASS: pSTL-Bench-style generic-lambda par call offloaded (instantiation interception)"
+            || { echo "::error::funnel kernel not offloaded (register/lookup key mismatch?)"; exit 1; }
+          echo "$out" | grep -q "funnel result=4.0" \
+            || { echo "::error::funnel produced a wrong result"; exit 1; }
+          echo "PASS: pSTL-Bench-style generic par call offloaded DETERMINISTICALLY via the device_invoke funnel"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
