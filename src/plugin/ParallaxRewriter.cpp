@@ -1064,9 +1064,23 @@ public:
         clang::QualType elemT = targs->get(0).getAsType();
         clang::QualType funcT = targs->get(1).getAsType();
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
-        if (!functor) return;
-        clang::CXXMethodDecl* op_call = getFunctionCallOperator(functor);
-        if (!op_call) return;
+        if (!functor) {
+            llvm::errs() << "[ParallaxFunnel] F is not a record type (" << funcT.getAsString()
+                         << "); host fallback\n";
+            return;
+        }
+        // A generic lambda's call operator is a FunctionTemplateDecl, which
+        // CXXRecordDecl::methods() does NOT surface — so getFunctionCallOperator would
+        // return null. Use getLambdaCallOperator() for lambdas (it returns the templated
+        // pattern for generic lambdas); fall back to the methods() scan for plain functors.
+        clang::CXXMethodDecl* op_call =
+            functor->isLambda() ? functor->getLambdaCallOperator()
+                                : getFunctionCallOperator(functor);
+        if (!op_call) {
+            llvm::errs() << "[ParallaxFunnel] no operator() on " << functor->getNameAsString()
+                         << " (isLambda=" << functor->isLambda() << "); host fallback\n";
+            return;
+        }
         // Generic lambda / templated functor: operator() is a function template whose
         // pattern is dependent (no compilable body). device_invoke<T,F> odr-uses the
         // concrete operator()<T&>, so pick that instantiation instead of the pattern.
