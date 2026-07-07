@@ -1359,7 +1359,7 @@ jobs:
               -c probe_funnel.cpp -o /dev/null 2> fun_$run.log; pc=$?
             regs=$(grep -c "parallax_kernel_register" probe_funnel.cpp || true)
             echo "run $run: plugin exit=$pc, registrars emitted=$regs"
-            grep -aE "ParallaxFunnel" fun_$run.log | head -4 || true
+            grep -aE "FUNNEL-DBG|ParallaxFunnel" fun_$run.log | head -12 || true
             if [ "$regs" -lt 1 ]; then
               echo "::error::funnel registrar NOT emitted on run $run (interception is non-deterministic)"; exit 1
             fi

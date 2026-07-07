@@ -1019,29 +1019,61 @@ public:
     // compile F applied to an element to SPIR-V and register it under the
     // instantiation's __PRETTY_FUNCTION__ (which the runtime funnel recomputes),
     // rather than rewriting the shared template body.
+    // Per-specialization visit (may be flaky for instantiations nested in other
+    // instantiations); the deterministic driver is VisitFunctionTemplateDecl below,
+    // which explicitly enumerates device_invoke's specializations. Dedup makes the
+    // two paths idempotent.
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
-        if (!FD || FD->getTemplatedKind() !=
-                       clang::FunctionDecl::TK_FunctionTemplateSpecialization)
-            return true;
-        if (FD->getQualifiedNameAsString() != "parallax::detail::device_invoke")
-            return true;
+        if (!FD) return true;
+        std::string qn_dbg = FD->getQualifiedNameAsString();
+        if (qn_dbg.find("device_invoke") != std::string::npos) {
+            llvm::errs() << "[FUNNEL-DBG] VisitFunctionDecl '" << qn_dbg
+                         << "' templatedKind=" << FD->getTemplatedKind()
+                         << " isThisDef=" << FD->isThisDeclarationADefinition() << "\n";
+        }
+        if (FD->getTemplatedKind() ==
+                clang::FunctionDecl::TK_FunctionTemplateSpecialization &&
+            FD->getQualifiedNameAsString() == "parallax::detail::device_invoke")
+            processDeviceInvoke(FD);
+        return true;
+    }
 
+    // Deterministic driver: the device_invoke FunctionTemplateDecl lives in the
+    // header and is always traversed; iterate ITS specializations() directly rather
+    // than relying on RecursiveASTVisitor reaching each nested instantiation.
+    bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
+        if (!FTD) return true;
+        if (FTD->getQualifiedNameAsString() != "parallax::detail::device_invoke")
+            return true;
+        int n = 0;
+        for (clang::FunctionDecl* spec : FTD->specializations()) { ++n; processDeviceInvoke(spec); }
+        llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl device_invoke: "
+                     << n << " specialization(s)\n";
+        return true;
+    }
+
+    // Compile one device_invoke<T,F> instantiation to SPIR-V and register it under
+    // the instantiation's __PRETTY_FUNCTION__ (the key the runtime funnel recomputes).
+    void processDeviceInvoke(clang::FunctionDecl* FD) {
+        if (!FD) return;
         const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
-        if (!targs || targs->size() < 2) return true;
+        if (!targs || targs->size() < 2) return;
         if (targs->get(0).getKind() != clang::TemplateArgument::Type ||
             targs->get(1).getKind() != clang::TemplateArgument::Type)
-            return true;
+            return;
         clang::QualType elemT = targs->get(0).getAsType();
         clang::QualType funcT = targs->get(1).getAsType();
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
-        if (!functor) return true;
+        if (!functor) return;
         clang::CXXMethodDecl* op_call = getFunctionCallOperator(functor);
-        if (!op_call || !op_call->hasBody()) return true;
+        if (!op_call || !op_call->hasBody()) {
+            llvm::errs() << "[ParallaxFunnel] functor operator() has no body; host fallback\n";
+            return;
+        }
 
-        // Key both sides compute identically: the instantiation's __PRETTY_FUNCTION__.
         std::string key = clang::PredefinedExpr::ComputeName(
             clang::PredefinedIdentKind::PrettyFunction, FD);
-        if (!seen_funnel_keys_.insert(key).second) return true;
+        if (!seen_funnel_keys_.insert(key).second) return;
 
         llvm::errs() << "[ParallaxFunnel] device_invoke<" << elemT.getAsString()
                      << ", " << functor->getNameAsString() << ">\n  key=" << key << "\n";
@@ -1050,7 +1082,7 @@ public:
         auto module = ir_generator_.generateIRManual(op_call, class_ctx, context_);
         if (!module) {
             llvm::errs() << "[ParallaxFunnel] IR gen failed; host fallback\n";
-            return true;
+            return;
         }
         llvm::Function* kernel_func = nullptr;
         for (auto& f : *module) {
@@ -1061,7 +1093,7 @@ public:
                 if (!f.isDeclaration()) { kernel_func = &f; break; }
         if (!kernel_func) {
             llvm::errs() << "[ParallaxFunnel] no kernel function; host fallback\n";
-            return true;
+            return;
         }
 
         SPIRVGenerator spirv_gen;
@@ -1071,12 +1103,11 @@ public:
         auto spirv = spirv_gen.generate_from_lambda(kernel_func, param_types);
         if (spirv.empty()) {
             llvm::errs() << "[ParallaxFunnel] SPIR-V gen failed; host fallback\n";
-            return true;
+            return;
         }
         llvm::errs() << "[ParallaxFunnel] Generated " << spirv.size()
                      << " SPIR-V words; registering\n";
         rewriter_.emitFunnelRegistrar(key, spirv);
-        return true;
     }
 
     bool VisitCallExpr(clang::CallExpr* call) {
