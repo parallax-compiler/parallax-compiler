@@ -218,6 +218,11 @@ public:
      */
     void routeCallee(clang::CallExpr* call, const char* target) {
         if (!call || !call->getCallee()) return;
+        // NEVER route calls inside the parallax stdpar header — those are the funnel's
+        // OWN serial std:: fallbacks (parallax::sort -> std::sort(first,last), etc.).
+        // Rewriting them would corrupt the header (self-recursion) and route spuriously.
+        llvm::StringRef fname = SM_.getFilename(SM_.getExpansionLoc(call->getBeginLoc()));
+        if (fname.contains("stdpar.hpp")) return;
         unsigned key = call->getBeginLoc().getRawEncoding();
         if (!seen_route_locs_.insert(key).second) return;
         clang::Expr* callee = call->getCallee()->IgnoreImplicit();

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+###############################################################################
+# parallax-cxx — drop-in C++ compiler wrapper for the Parallax GPU-offload
+# transparent toolchain. Point CMake at it with:
+#     -DCMAKE_CXX_COMPILER=/abs/path/to/parallax-cxx
+#
+# WHAT IT DOES
+#   CMake invokes this exactly like it would invoke clang++. For a *compile of a
+#   single C++ translation unit into an object* we transparently run the Parallax
+#   plugin's two rewrite passes over the source BEFORE the real compile:
+#     PASS 1 (route)  : PARALLAX_TRANSPARENT=1 clang++ <plugin> ... -c SRC -o /dev/null
+#                       -> rewrites SRC (and any headers it #includes) IN PLACE,
+#                          turning std::for_each(par,...)/transform/reduce/... into
+#                          parallax::for_each/... .
+#     PASS 2 (funnel) : the SAME command again on the now-rewritten SRC
+#                       -> appends per-instantiation SPIR-V kernel registrars to SRC.
+#     BUILD (real)    : clang++ <ALL original args, NO plugin> -include parallax/stdpar.hpp
+#                       -> compiles the rewritten SRC into the requested object.
+#   Any non-compile invocation (link, -E/-M preprocess, --version probe, no source)
+#   is passed straight through to the real clang++ with its args UNCHANGED.
+#
+# !!! CONCURRENCY CAVEAT !!!
+#   PASS 1 rewrites *shared headers in place*. Two compiles running at once can
+#   observe / clobber a half-rewritten header, corrupting the build. THE BUILD
+#   MUST BE SERIALIZED: configure with Unix Makefiles or Ninja and build with
+#   `cmake --build <dir> --parallel 1` (a.k.a. -j1). Do NOT run a parallel build.
+#   (pSTL-Bench compiles essentially one big TU — src/main.cpp — but google/benchmark
+#   and any future multi-TU layout would race, hence -j1 is mandatory.)
+#
+# REQUIRED ENV
+#   PARALLAX_PLUGIN      abs path to libparallax-clang-plugin.so   (the CI $PLUGIN)
+#   PARALLAX_RT_INCLUDE  abs path to parallax-runtime/include      (holds parallax/stdpar.hpp)
+# OPTIONAL ENV
+#   CLANGXX              real clang++ (default /usr/lib/llvm-21/bin/clang++)
+#   PARALLAX_CXX_DEBUG   if set, echo the sub-commands to stderr for tracing
+###############################################################################
+set -u
+
+# --- locate the real compiler --------------------------------------------------
+REAL_CXX="${CLANGXX:-/usr/lib/llvm-21/bin/clang++}"
+if [[ ! -x "$REAL_CXX" ]]; then
+    # fall back to whatever clang++ is on PATH so a bad CLANGXX is still diagnosable
+    REAL_CXX="$(command -v clang++ || true)"
+fi
+
+# --- required paths ------------------------------------------------------------
+PLUGIN="${PARALLAX_PLUGIN:-}"
+RT_INCLUDE="${PARALLAX_RT_INCLUDE:-}"
+
+dbg() { [[ -n "${PARALLAX_CXX_DEBUG:-}" ]] && printf 'parallax-cxx: %s\n' "$*" >&2 || true; }
+
+# All args exactly as CMake passed them; used verbatim for the real compile/link.
+ORIG_ARGS=("$@")
+
+# --- classify the invocation ---------------------------------------------------
+# We only do the rewrite dance for a genuine single-source COMPILE:
+#   * contains -c
+#   * contains a .cpp/.cc/.cxx/.C source
+#   * contains -o <something.o>   (an object output)
+# and is NOT a preprocess-only pass (-E) or dependency-only pass (-M/-MM).
+IS_COMPILE=0        # saw -c
+HAS_SRC=0           # saw a C++ source file
+PREPROCESS_ONLY=0   # saw -E / -M / -MM (do not rewrite)
+SRC=""              # the source path
+OBJ=""              # the -o object path (for logging only)
+
+# Flags we must replay on PASS 1/2 so the source parses IDENTICALLY to the real
+# compile: include dirs (-I / -isystem / -iquote), macros (-D / -U), the language
+# standard (-std=...), and sysroot/target bits. We deliberately do NOT replay
+# -c/-o/-M*/optimization/-Werror etc. — the passes always compile to /dev/null and
+# their only job is to make the plugin see the same declarations.
+PARSE_FLAGS=()
+
+i=0
+n=${#ORIG_ARGS[@]}
+while (( i < n )); do
+    a="${ORIG_ARGS[$i]}"
+    case "$a" in
+        -c)            IS_COMPILE=1 ;;
+        -E|-M|-MM)     PREPROCESS_ONLY=1 ;;
+        -o)            # object/output path is the next token
+            OBJ="${ORIG_ARGS[$((i+1))]:-}"
+            ;;
+        -o*)           OBJ="${a#-o}" ;;
+
+        # --- flags that affect parsing: replay them on the plugin passes ---
+        -std=*)        PARSE_FLAGS+=("$a") ;;
+        -I|-isystem|-iquote|-idirafter|-include|-isysroot|--sysroot|-target|-D|-U|-imacros)
+            # two-token form: keep the flag AND its argument
+            PARSE_FLAGS+=("$a" "${ORIG_ARGS[$((i+1))]:-}")
+            i=$((i+1))
+            ;;
+        -I*|-D*|-U*|-isystem*|--sysroot=*|--target=*|-std*)
+            # glued single-token form
+            PARSE_FLAGS+=("$a")
+            ;;
+
+        # --- source file detection ---
+        *.cpp|*.cc|*.cxx|*.C|*.c++)
+            HAS_SRC=1
+            SRC="$a"
+            ;;
+        *) : ;;   # ignore everything else for classification
+    esac
+    i=$((i+1))
+done
+
+# --- decide: rewrite path, or straight passthrough -----------------------------
+if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
+        && [[ -n "$SRC" && -f "$SRC" ]] \
+        && [[ -n "$PLUGIN" && -n "$RT_INCLUDE" ]]; then
+
+    dbg "COMPILE src=$SRC obj=$OBJ"
+
+    # The force-include + runtime include the Parallax passes and the real compile
+    # both need. -I "$RT_INCLUDE" makes <parallax/stdpar.hpp> resolvable.
+    FORCE=( -I "$RT_INCLUDE" -include parallax/stdpar.hpp )
+
+    # Plugin driver flags (identical to the CI probe invocation).
+    PLG=( -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax )
+
+    # PASS 1 (route) and PASS 2 (funnel): same command twice. Both compile to
+    # /dev/null; PARALLAX_TRANSPARENT=1 enables the std::par -> parallax:: rewrite.
+    # We feed the *same* parse-affecting flags the real compile got, plus FORCE,
+    # so the plugin sees exactly the declarations the object build will see.
+    #
+    # NOTE: FORCE already contains `-include parallax/stdpar.hpp`; if the original
+    # args ALSO force-include it (unlikely from CMake) the duplicate is harmless.
+    PASS_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -c "$SRC" -o /dev/null )
+
+    dbg "PASS1: PARALLAX_TRANSPARENT=1 ${PASS_CMD[*]}"
+    PARALLAX_TRANSPARENT=1 "${PASS_CMD[@]}" 2> >(cat >&2) || \
+        dbg "PASS1 returned non-zero (route pass errors are often benign; continuing)"
+
+    dbg "PASS2: PARALLAX_TRANSPARENT=1 ${PASS_CMD[*]}"
+    PARALLAX_TRANSPARENT=1 "${PASS_CMD[@]}" 2> >(cat >&2) || \
+        dbg "PASS2 returned non-zero (funnel pass errors are often benign; continuing)"
+
+    # REAL COMPILE: every original arg, UNTOUCHED, NO plugin, but with the runtime
+    # include dir + the stdpar force-include so parallax:: names + the arena hooks
+    # resolve. The rewritten SRC is what actually gets compiled here.
+    REAL_CMD=( "$REAL_CXX" "${FORCE[@]}" "${ORIG_ARGS[@]}" )
+    dbg "BUILD: ${REAL_CMD[*]}"
+    exec "${REAL_CMD[@]}"
+fi
+
+# --- passthrough (link / preprocess / probe / no-source / missing env) ---------
+# Link steps and everything else run the real clang++ with args UNCHANGED. We do
+# NOT inject includes here: -include only makes sense on a compile, and adding it
+# to a pure link line can confuse the driver.
+if [[ -z "$PLUGIN" || -z "$RT_INCLUDE" ]] && (( IS_COMPILE == 1 && HAS_SRC == 1 )); then
+    echo "parallax-cxx: WARNING: PARALLAX_PLUGIN / PARALLAX_RT_INCLUDE unset;" >&2
+    echo "parallax-cxx: compiling '$SRC' WITHOUT offload rewrite." >&2
+fi
+dbg "PASSTHROUGH: $REAL_CXX ${ORIG_ARGS[*]}"
+exec "$REAL_CXX" "${ORIG_ARGS[@]}"
