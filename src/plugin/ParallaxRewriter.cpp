@@ -1059,13 +1059,17 @@ public:
         return qn == "parallax::detail::device_invoke" ||
                qn == "parallax::detail::device_transform";
     }
+    static bool isReduceFunnel(const std::string& qn) {
+        return qn == "parallax::detail::device_reduce";
+    }
 
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
-        if (!FD) return true;
-        if (FD->getTemplatedKind() ==
-                clang::FunctionDecl::TK_FunctionTemplateSpecialization &&
-            isFunnelTemplate(FD->getQualifiedNameAsString()))
-            processDeviceInvoke(FD);
+        if (!FD || FD->getTemplatedKind() !=
+                       clang::FunctionDecl::TK_FunctionTemplateSpecialization)
+            return true;
+        std::string qn = FD->getQualifiedNameAsString();
+        if (isFunnelTemplate(qn)) processDeviceInvoke(FD);
+        else if (isReduceFunnel(qn)) processDeviceReduce(FD);
         return true;
     }
 
@@ -1073,12 +1077,49 @@ public:
     // always traversed; iterate ITS specializations() directly rather than relying on
     // RecursiveASTVisitor reaching each nested instantiation.
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
-        if (!FTD || !isFunnelTemplate(FTD->getQualifiedNameAsString())) return true;
+        if (!FTD) return true;
+        std::string qn = FTD->getQualifiedNameAsString();
+        const bool funnel = isFunnelTemplate(qn), reduce = isReduceFunnel(qn);
+        if (!funnel && !reduce) return true;
         int n = 0;
-        for (clang::FunctionDecl* spec : FTD->specializations()) { ++n; processDeviceInvoke(spec); }
+        for (clang::FunctionDecl* spec : FTD->specializations()) {
+            ++n;
+            if (funnel) processDeviceInvoke(spec); else processDeviceReduce(spec);
+        }
         llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl "
                      << FTD->getNameAsString() << ": " << n << " specialization(s)\n";
         return true;
+    }
+
+    // device_reduce<T>: no functor — generate the fixed workgroup tree-reduction kernel
+    // for element type T (default '+'), keyed by __PRETTY_FUNCTION__.
+    void processDeviceReduce(clang::FunctionDecl* FD) {
+        if (!FD) return;
+        const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
+        if (!targs || targs->size() < 1 ||
+            targs->get(0).getKind() != clang::TemplateArgument::Type)
+            return;
+        clang::QualType elemT = targs->get(0).getAsType();
+        SPIRVGenerator::ReduceElemType ek;
+        if (elemT->isRealFloatingType())
+            ek = context_.getTypeSize(elemT) >= 64 ? SPIRVGenerator::ReduceElemType::F64
+                                                   : SPIRVGenerator::ReduceElemType::F32;
+        else if (elemT->isIntegerType())
+            ek = context_.getTypeSize(elemT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
+                                                   : SPIRVGenerator::ReduceElemType::I32;
+        else { llvm::errs() << "[ParallaxFunnel] reduce: unsupported element type; host fallback\n"; return; }
+
+        std::string key = clang::PredefinedExpr::ComputeName(
+            clang::PredefinedIdentKind::PrettyFunction, FD);
+        if (!seen_funnel_keys_.insert(key).second) return;
+
+        SPIRVGenerator gen;
+        gen.set_target_vulkan_version(1, 2);
+        auto spirv = gen.generate_reduce_kernel(ek);
+        if (spirv.empty()) { llvm::errs() << "[ParallaxFunnel] reduce kernel gen failed; host fallback\n"; return; }
+        llvm::errs() << "[ParallaxFunnel] device_reduce<" << elemT.getAsString() << "> "
+                     << spirv.size() << " SPIR-V words; registering\n  key=" << key << "\n";
+        rewriter_.emitFunnelRegistrar(key, spirv);
     }
 
     // Compile one funnel instantiation to SPIR-V and register it under the
@@ -1202,6 +1243,9 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "transform", 5)) {   // unary transform
                 rewriter_.routeCallee(call, "parallax::transform"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "reduce", 4)) {       // reduce(par, first, last, init)
+                rewriter_.routeCallee(call, "parallax::reduce"); return true;
             }
         }
 

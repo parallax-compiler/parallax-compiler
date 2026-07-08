@@ -1550,6 +1550,39 @@ jobs:
           echo "$o" | grep -q "transform result=7.0" || { echo "::error::transform wrong result"; exit 1; }
           echo "PASS: real pSTL-Bench transform_std offloaded (2-buffer map) + verified"
 
+      - name: "GATE (pSTL-Bench reduce): real reduce_std.h offloads (fold, value-returning)"
+        run: |
+          # The REAL pSTL-Bench reduce_std.h (generic wrapper -> std::reduce(par,b,e,elem_t{}))
+          # via transparent routing -> the device_reduce funnel (fixed tree-reduction kernel,
+          # value-returning). elem_t defaults to double, so this also exercises the F64 kernel.
+          git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb 2>/dev/null || true
+          INC="-I parallax-runtime/include -I /tmp/pstlb/include -include parallax/stdpar.hpp"
+          PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          cat > rd.cpp <<'EOF'
+          #include <vector>
+          #include <execution>
+          #include <cstdio>
+          #include "pstl/benchmarks/reduce/reduce_std.h"
+          int main(){
+            std::vector<pstl::elem_t> v(4096, pstl::elem_t{1});
+            auto s = benchmark_reduce::reduce_std(std::execution::par, v);
+            std::printf("reduce result=%.1f expected=4096.0\n", (double)s);
+            return s == pstl::elem_t{4096} ? 0 : 1;
+          }
+          EOF
+          cp rd.cpp rdw.cpp
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c rdw.cpp -o /dev/null 2>r1.log || true
+          echo "routed: $(grep -c 'parallax::reduce' /tmp/pstlb/include/pstl/benchmarks/reduce/reduce_std.h)"; grep -aE 'ParallaxRoute' r1.log | head
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c rdw.cpp -o /dev/null 2>r2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' rdw.cpp)"; grep -aE 'ParallaxFunnel|SPIR-V words' r2.log | head
+          "$CLANGXX" -std=c++20 -O2 $INC rdw.cpp -L parallax-runtime/out -lparallax-runtime -o rdbin 2>&1 | tail -3
+          o="$(PARALLAX_DEBUG=1 ./rdbin 2>&1)" || true
+          echo "$o" | grep -aE "reduce result=|Successfully loaded kernel|MISS" | head
+          echo "$o" | grep -q "Successfully loaded kernel" || { echo "::error::reduce not offloaded"; exit 1; }
+          echo "$o" | grep -q "reduce result=4096.0" || { echo "::error::reduce wrong result"; exit 1; }
+          echo "PASS: real pSTL-Bench reduce_std offloaded (fold) + verified"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
