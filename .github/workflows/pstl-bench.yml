@@ -66,14 +66,15 @@ jobs:
       - name: Configure pSTL-Bench with the parallax-cxx wrapper
         run: |
           set -o pipefail
-          # No explicit backend: the *_std.h wrappers call std::execution::par directly,
-          # which resolves to libstdc++'s PSTL (linked against TBB) for the algorithms
-          # Parallax doesn't route; the routed ones (for_each/transform/reduce/sort) offload.
-          # (The GNU backend needs OpenMP_CXX, which CMake can't detect through the wrapper.)
+          # TBB backend: it defines PSTL_BENCH_USE_PSTL, which is what registers the
+          # PARALLEL std::execution::par_unseq benchmarks (the ones Parallax routes +
+          # offloads); it also links TBB, which backs the algorithms Parallax doesn't
+          # route. (The GNU backend registers __gnu_parallel variants, not std::par, and
+          # its OpenMP_CXX check fails through the wrapper.)
           cmake -S /tmp/pstlb -B /tmp/pstlb/out -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER="$PWD/parallax-compiler/scripts/parallax-cxx" \
-            -DPSTL_BENCH_BACKEND="" \
+            -DPSTL_BENCH_BACKEND=TBB \
             -DPSTL_BENCH_DATA_TYPE=float \
             -DPSTL_BENCH_SEQUENTIAL=OFF \
             -DPSTL_BENCH_MIN_INPUT_SIZE=1024 \
