@@ -1070,10 +1070,12 @@ public:
                qn == "parallax::detail::device_transform";
     }
     // Fixed-kernel funnels: no functor, one element-type arg. The kernel shape is chosen
-    // by the template name (reduce -> tree reduction, sort -> bitonic stage).
+    // by the template name (reduce -> tree reduction, sort -> bitonic stage, scan -> a
+    // PAIR of kernels [per-block scan + add-offsets] registered under ":scan"/":add").
     static bool isFixedKernelFunnel(const std::string& qn) {
         return qn == "parallax::detail::device_reduce" ||
-               qn == "parallax::detail::device_sort";
+               qn == "parallax::detail::device_sort" ||
+               qn == "parallax::detail::device_scan";
     }
 
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
@@ -1129,6 +1131,21 @@ public:
 
         SPIRVGenerator gen;
         gen.set_target_vulkan_version(1, 2);
+        if (qn == "parallax::detail::device_scan") {
+            // scan = a PAIR of kernels; register under ":scan" and ":add" (the funnel
+            // looks each up by appending the same suffix to __PRETTY_FUNCTION__).
+            auto scan_spv = gen.generate_scan_kernel(ek);
+            SPIRVGenerator gen2; gen2.set_target_vulkan_version(1, 2);
+            auto add_spv = gen2.generate_scan_add_kernel(ek);
+            if (scan_spv.empty() || add_spv.empty()) {
+                llvm::errs() << "[ParallaxFunnel] scan kernel gen failed; host fallback\n"; return;
+            }
+            llvm::errs() << "[ParallaxFunnel] device_scan<" << elemT.getAsString() << "> "
+                         << scan_spv.size() << "+" << add_spv.size() << " SPIR-V words; registering\n";
+            rewriter_.emitFunnelRegistrar(key + ":scan", scan_spv);
+            rewriter_.emitFunnelRegistrar(key + ":add", add_spv);
+            return;
+        }
         const bool is_sort = qn == "parallax::detail::device_sort";
         auto spirv = is_sort ? gen.generate_sort_kernel(ek) : gen.generate_reduce_kernel(ek);
         if (spirv.empty()) { llvm::errs() << "[ParallaxFunnel] fixed-kernel gen failed; host fallback\n"; return; }
@@ -1265,6 +1282,9 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "sort", 3)) {         // sort(par, first, last)
                 rewriter_.routeCallee(call, "parallax::sort"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "inclusive_scan", 4)) {  // inclusive_scan(par, first, last, d_first)
+                rewriter_.routeCallee(call, "parallax::inclusive_scan"); return true;
             }
         }
 
