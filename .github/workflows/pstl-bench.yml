@@ -88,13 +88,21 @@ jobs:
             2>&1 | tail -40
 
       - name: Build pSTL-Bench (SERIALIZED — the wrapper rewrites shared headers in place)
+        env:
+          PARALLAX_CXX_DEBUG: "1"
         run: |
           set -o pipefail
           # google/benchmark itself has no std::par, so build it parallel first (safe),
           # then the pSTL-Bench TU serially (the route pass edits shared headers in place).
           cmake --build /tmp/pstlb/out --target benchmark -j 2>&1 | tail -5 || true
           echo "=== building pSTL-Bench (parallel 1) ==="
-          cmake --build /tmp/pstlb/out --parallel 1 2>&1 | tail -60
+          cmake --build /tmp/pstlb/out --parallel 1 > /tmp/build.log 2>&1 || { echo "BUILD FAILED"; tail -60 /tmp/build.log; exit 1; }
+          echo "=== wrapper activity (route/funnel) ==="
+          grep -aE "parallax-cxx:|ParallaxRoute|ParallaxFunnel|Generated .* SPIR-V words|COMPILE src=|PASSTHROUGH" /tmp/build.log | head -40 || true
+          echo "=== rewrite landed in the tree? ==="
+          echo "parallax:: refs in headers: $(grep -arc 'parallax::' /tmp/pstlb/include 2>/dev/null | grep -v ':0' | wc -l) file(s)"
+          echo "registrars in main.cpp: $(grep -ac 'parallax_kernel_register' /tmp/pstlb/src/main.cpp 2>/dev/null || echo 0)"
+          echo "=== build tail ==="; tail -20 /tmp/build.log
 
       - name: Run the suite on lavapipe + report offload coverage
         run: |
