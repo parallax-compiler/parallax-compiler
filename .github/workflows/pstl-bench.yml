@@ -79,6 +79,11 @@ jobs:
             -DPSTL_BENCH_MIN_INPUT_SIZE=1024 \
             -DPSTL_BENCH_MAX_INPUT_SIZE=4096 \
             -DPSTL_BENCH_RANGE_MULTIPLIER=4 \
+            -DBENCHMARK_ENABLE_TESTING=OFF -DBENCHMARK_ENABLE_GTEST_TESTS=OFF \
+            -DBENCHMARK_ENABLE_INSTALL=OFF \
+            -DHAVE_STD_REGEX=ON -DRUN_HAVE_STD_REGEX=1 \
+            -DHAVE_GNU_POSIX_REGEX=OFF -DHAVE_POSIX_REGEX=OFF \
+            -DHAVE_STEADY_CLOCK=ON -DRUN_HAVE_STEADY_CLOCK=1 \
             -DCMAKE_EXE_LINKER_FLAGS="-L$PWD/parallax-runtime/out -lparallax-runtime -ltbb" \
             2>&1 | tail -40
 
