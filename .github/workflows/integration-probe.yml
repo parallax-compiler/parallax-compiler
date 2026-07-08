@@ -1514,6 +1514,42 @@ jobs:
           [ "$fails" -eq 0 ] || { echo "::error::$fails pSTL-Bench for_each variant(s) did not offload+verify"; exit 1; }
           echo "PASS: the REAL pSTL-Bench for_each kernel (volatile+local+nested+capture) offloaded to the GPU + verified"
 
+      - name: "GATE (pSTL-Bench transform): real transform_std.h offloads (2-buffer map)"
+        run: |
+          # The REAL pSTL-Bench transform_std.h wrapper (std::transform(par,in,out,f)) via
+          # transparent routing -> the device_transform funnel (2 buffers, out[i]=f(in[i])).
+          # Exact-comparable op here (the real kernel is sin/tan/min = precision-sensitive;
+          # the interception+2-buffer mechanism is what we gate).
+          git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb 2>/dev/null || true
+          INC="-I parallax-runtime/include -I /tmp/pstlb/include -include parallax/stdpar.hpp"
+          PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          cat > tr.cpp <<'EOF'
+          #include <vector>
+          #include <execution>
+          #include <cstdio>
+          #include "pstl/benchmarks/transform/transform_std.h"
+          using elem_t = float;
+          int main(){
+            std::vector<elem_t> in(64, 3.0f), out(64, 0.0f);
+            benchmark_transform::transform_std(std::execution::par, in, out,
+                                               [](elem_t x){ return x * 2.0f + 1.0f; });
+            std::printf("transform result=%.1f expected=7.0\n", (double)out[0]);
+            return out[0] == 7.0f ? 0 : 1;
+          }
+          EOF
+          cp tr.cpp trw.cpp
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c trw.cpp -o /dev/null 2>t1.log || true
+          echo "routed: $(grep -c 'parallax::transform' /tmp/pstlb/include/pstl/benchmarks/transform/transform_std.h)"; grep -aE 'ParallaxRoute' t1.log | head
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c trw.cpp -o /dev/null 2>t2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' trw.cpp)"; grep -aE 'ParallaxFunnel|SPIR-V words' t2.log | head
+          "$CLANGXX" -std=c++20 -O2 $INC trw.cpp -L parallax-runtime/out -lparallax-runtime -o trbin 2>&1 | tail -3
+          o="$(PARALLAX_DEBUG=1 ./trbin 2>&1)" || true
+          echo "$o" | grep -aE "transform result=|Successfully loaded kernel|MISS" | head
+          echo "$o" | grep -q "Successfully loaded kernel" || { echo "::error::transform not offloaded"; exit 1; }
+          echo "$o" | grep -q "transform result=7.0" || { echo "::error::transform wrong result"; exit 1; }
+          echo "PASS: real pSTL-Bench transform_std offloaded (2-buffer map) + verified"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the

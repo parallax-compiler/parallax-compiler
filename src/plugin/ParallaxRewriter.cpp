@@ -216,15 +216,15 @@ public:
      * visited source-token rewrite (no call-site codegen); the SPIR-V is generated on
      * a subsequent plugin pass once the rewritten source instantiates device_invoke.
      */
-    void routeForEachCallee(clang::CallExpr* call) {
+    void routeCallee(clang::CallExpr* call, const char* target) {
         if (!call || !call->getCallee()) return;
         unsigned key = call->getBeginLoc().getRawEncoding();
         if (!seen_route_locs_.insert(key).second) return;
         clang::Expr* callee = call->getCallee()->IgnoreImplicit();
         std::string cur = getSourceText(callee->getSourceRange());
         if (cur.find("parallax") != std::string::npos) return;  // already routed
-        rewriter_.ReplaceText(callee->getSourceRange(), "parallax::for_each");
-        llvm::errs() << "[ParallaxRoute] " << cur << " -> parallax::for_each\n";
+        rewriter_.ReplaceText(callee->getSourceRange(), target);
+        llvm::errs() << "[ParallaxRoute] " << cur << " -> " << target << "\n";
     }
 
     /** Insert all accumulated funnel registrars at end of the main file. */
@@ -1051,46 +1051,49 @@ public:
     // instantiations); the deterministic driver is VisitFunctionTemplateDecl below,
     // which explicitly enumerates device_invoke's specializations. Dedup makes the
     // two paths idempotent.
+    // The funnel templates the plugin keys on. Each takes the element type(s) first
+    // and the functor as the LAST type argument; generate_from_lambda auto-detects
+    // for_each (void functor -> 1 buffer, in-place) vs transform (non-void -> 2 buffers)
+    // from the functor's return type, so one codegen path serves both.
+    static bool isFunnelTemplate(const std::string& qn) {
+        return qn == "parallax::detail::device_invoke" ||
+               qn == "parallax::detail::device_transform";
+    }
+
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
         if (!FD) return true;
-        std::string qn_dbg = FD->getQualifiedNameAsString();
-        if (qn_dbg.find("device_invoke") != std::string::npos) {
-            llvm::errs() << "[FUNNEL-DBG] VisitFunctionDecl '" << qn_dbg
-                         << "' templatedKind=" << FD->getTemplatedKind()
-                         << " isThisDef=" << FD->isThisDeclarationADefinition() << "\n";
-        }
         if (FD->getTemplatedKind() ==
                 clang::FunctionDecl::TK_FunctionTemplateSpecialization &&
-            FD->getQualifiedNameAsString() == "parallax::detail::device_invoke")
+            isFunnelTemplate(FD->getQualifiedNameAsString()))
             processDeviceInvoke(FD);
         return true;
     }
 
-    // Deterministic driver: the device_invoke FunctionTemplateDecl lives in the
-    // header and is always traversed; iterate ITS specializations() directly rather
-    // than relying on RecursiveASTVisitor reaching each nested instantiation.
+    // Deterministic driver: the funnel FunctionTemplateDecl lives in the header and is
+    // always traversed; iterate ITS specializations() directly rather than relying on
+    // RecursiveASTVisitor reaching each nested instantiation.
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
-        if (!FTD) return true;
-        if (FTD->getQualifiedNameAsString() != "parallax::detail::device_invoke")
-            return true;
+        if (!FTD || !isFunnelTemplate(FTD->getQualifiedNameAsString())) return true;
         int n = 0;
         for (clang::FunctionDecl* spec : FTD->specializations()) { ++n; processDeviceInvoke(spec); }
-        llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl device_invoke: "
-                     << n << " specialization(s)\n";
+        llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl "
+                     << FTD->getNameAsString() << ": " << n << " specialization(s)\n";
         return true;
     }
 
-    // Compile one device_invoke<T,F> instantiation to SPIR-V and register it under
-    // the instantiation's __PRETTY_FUNCTION__ (the key the runtime funnel recomputes).
+    // Compile one funnel instantiation to SPIR-V and register it under the
+    // instantiation's __PRETTY_FUNCTION__ (the key the runtime funnel recomputes). The
+    // functor is the LAST type template arg; the element type is the first.
     void processDeviceInvoke(clang::FunctionDecl* FD) {
         if (!FD) return;
         const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
         if (!targs || targs->size() < 2) return;
+        const unsigned func_idx = targs->size() - 1;  // functor is last
         if (targs->get(0).getKind() != clang::TemplateArgument::Type ||
-            targs->get(1).getKind() != clang::TemplateArgument::Type)
+            targs->get(func_idx).getKind() != clang::TemplateArgument::Type)
             return;
         clang::QualType elemT = targs->get(0).getAsType();
-        clang::QualType funcT = targs->get(1).getAsType();
+        clang::QualType funcT = targs->get(func_idx).getAsType();
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
         if (!functor) {
             llvm::errs() << "[ParallaxFunnel] F is not a record type (" << funcT.getAsString()
@@ -1167,16 +1170,16 @@ public:
         rewriter_.emitFunnelRegistrar(key, spirv);
     }
 
-    // std::for_each(policy, first, last, f) with 4 args, whether resolved (concrete
-    // call) or dependent (inside a generic wrapper, callee = UnresolvedLookupExpr).
-    bool isStdForEachWithPolicy(clang::CallExpr* call) {
-        if (!call || call->getNumArgs() != 4) return false;
+    // std::<name>(policy, ...) with nargs args, whether resolved (concrete call) or
+    // dependent (inside a generic wrapper, callee = UnresolvedLookupExpr).
+    bool isStdAlgoWithPolicy(clang::CallExpr* call, const char* name, unsigned nargs) {
+        if (!call || call->getNumArgs() != nargs) return false;
         if (auto* fd = call->getDirectCallee())
-            return fd->getQualifiedNameAsString() == "std::for_each";
+            return fd->getQualifiedNameAsString() == std::string("std::") + name;
         const clang::Expr* callee =
             call->getCallee() ? call->getCallee()->IgnoreImplicit() : nullptr;
         if (auto* ule = llvm::dyn_cast_or_null<clang::UnresolvedLookupExpr>(callee))
-            return ule->getName().getAsString() == "for_each";
+            return ule->getName().getAsString() == name;
         return false;
     }
 
@@ -1193,9 +1196,13 @@ public:
         // parallax::for_each so it funnels through device_invoke. Skip the old
         // call-site codegen for it (the funnel path handles codegen on a later pass).
         static const bool plx_transparent = std::getenv("PARALLAX_TRANSPARENT") != nullptr;
-        if (plx_transparent && isStdForEachWithPolicy(call)) {
-            rewriter_.routeForEachCallee(call);
-            return true;
+        if (plx_transparent) {
+            if (isStdAlgoWithPolicy(call, "for_each", 4)) {
+                rewriter_.routeCallee(call, "parallax::for_each"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "transform", 5)) {   // unary transform
+                rewriter_.routeCallee(call, "parallax::transform"); return true;
+            }
         }
 
         if (call && call->getDirectCallee()) {
