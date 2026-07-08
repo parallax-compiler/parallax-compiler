@@ -18,6 +18,9 @@ jobs:
     env:
       CLANGXX: /usr/lib/llvm-21/bin/clang++
       LIBGL_ALWAYS_SOFTWARE: "1"
+      # Only rewrite pSTL-Bench's OWN translation units (its src/). Vendored deps
+      # (google/benchmark) and CMake feature checks pass straight through the wrapper.
+      PARALLAX_REWRITE_DIR: "pstlb/src"
     steps:
       - name: Checkout compiler
         uses: actions/checkout@v4

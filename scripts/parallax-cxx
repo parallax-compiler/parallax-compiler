@@ -106,14 +106,21 @@ while (( i < n )); do
 done
 
 # --- never rewrite CMake's internal probe compiles -----------------------------
-# CMake compiles CMakeCXXCompilerId.cpp / CMakeScratch try-compiles / CPM's own
-# feature checks to detect the compiler and its ABI. Force-including stdpar.hpp or
-# loading the plugin into those can break the magic-string detection. Pass them
-# straight through so CMake configures normally; they never contain std::par.
+# CMake / CPM compile CMakeCXXCompilerId.cpp, CMakeScratch try-compiles, and
+# dependency feature checks (e.g. google/benchmark's std::regex probe) to detect the
+# compiler/ABI/features. Force-including stdpar.hpp or loading the plugin into those
+# breaks the detection. Pass them straight through; they never contain std::par.
 case "$SRC" in
-    *CMakeFiles/*|*CMakeScratch/*|*CMakeTmp/*|*/CMakeCXXCompilerId.cpp|*cmake_pch*)
+    *CMakeFiles/*|*CMakeScratch/*|*CMakeTmp/*|*/CMakeCXXCompilerId.cpp|*cmake_pch*|*_deps/*|*deps_cache/*)
         HAS_SRC=0 ;;
 esac
+
+# Optional allowlist: when PARALLAX_REWRITE_DIR is set, ONLY rewrite sources whose
+# path contains it (everything else passes through unchanged). This scopes the
+# rewrite to the project's own TUs and never touches vendored dependencies.
+if [[ -n "${PARALLAX_REWRITE_DIR:-}" && "$SRC" != *"$PARALLAX_REWRITE_DIR"* ]]; then
+    HAS_SRC=0
+fi
 
 # --- decide: rewrite path, or straight passthrough -----------------------------
 if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
