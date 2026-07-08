@@ -7,9 +7,14 @@ name: pSTL-Bench Harness
 # verification aborts on a wrong-result offload, so a clean full run == correctness.
 
 on:
-  push:
-    branches: ["**"]
   workflow_dispatch:
+  push:
+    # Heavy (~30-45 min) full-suite build+run — only auto-run when the harness itself
+    # or the interception surface changes; use workflow_dispatch otherwise.
+    paths:
+      - "scripts/parallax-cxx"
+      - ".github/workflows/pstl-bench.yml"
+      - "src/plugin/ParallaxRewriter.cpp"
 
 jobs:
   harness:
