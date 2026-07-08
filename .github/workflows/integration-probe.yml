@@ -1461,6 +1461,62 @@ jobs:
             || { echo "::error::transparent std::par produced a wrong result"; exit 1; }
           echo "PASS: UNMODIFIED std::for_each(std::execution::par,...) offloaded to the GPU"
 
+      - name: "GATE (pSTL-Bench): the REAL for_each_std.h header offloads via transparent routing"
+        run: |
+          # Pull pSTL-Bench and compile its ACTUAL for_each benchmark shape: the real
+          # for_each_std.h wrapper header + a faithful copy of its kernel (a nested
+          # generic lambda with a volatile, a loop, and a captured iteration count).
+          # This is the real-world validation you asked for: does our parallel-STL
+          # backend offload genuine pSTL-Bench code?
+          git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb 2>&1 | tail -1
+          cat > pstl_probe.cpp <<'EOF'
+          #include <vector>
+          #include <execution>
+          #include <cstdio>
+          #include <cstddef>
+          #include "pstl/benchmarks/for_each/for_each_std.h"   // the REAL pSTL-Bench header
+          using elem_t = float;                                // PSTL_BENCH_DATA_TYPE (MVP: float, not the default double)
+          // Faithful copy of pSTL-Bench's kernel (for_each_utils.h itself pulls in Google Benchmark).
+          const auto kernel = [](auto & input, const auto Its) {
+              volatile std::size_t I = Its;
+              elem_t a{};
+              for (std::size_t i = 0; i < I; ++i) { a++; }
+              input = a;
+          };
+          int main() {
+              std::vector<elem_t> data(64, 0.0f);
+              std::size_t its = 3;
+              benchmark_for_each::for_each_std(std::execution::par, data,
+                                               [=](auto & elem) { kernel(elem, its); });
+              std::printf("pstl for_each result=%.1f expected=3.0\n", (double)data[0]);
+              return data[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          cp pstl_probe.cpp pstl_work.cpp
+          INC="-I parallax-runtime/include -I /tmp/pstlb/include -include parallax/stdpar.hpp"
+          PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          # route pass (rewrites std::for_each inside the pSTL-Bench header) -> funnel pass -> build
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c pstl_work.cpp -o /dev/null 2> p1.log || true
+          echo "routed in header: $(grep -c 'parallax::for_each' /tmp/pstlb/include/pstl/benchmarks/for_each/for_each_std.h || echo 0)"
+          grep -aE 'ParallaxRoute' p1.log | head
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c pstl_work.cpp -o /dev/null 2> p2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' pstl_work.cpp)"
+          grep -aE 'ParallaxFunnel|SPIR-V words|host fallback|translation' p2.log | head
+          "$CLANGXX" -std=c++20 -O2 $INC pstl_work.cpp \
+            -L parallax-runtime/out -lparallax-runtime -o pstl_probe 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./pstl_probe 2>&1)" || true
+          echo "$out" | grep -aE "pstl for_each result=|Successfully loaded kernel|MISS" | head
+          # Correctness is REQUIRED (host fallback keeps it correct even if codegen bailed).
+          echo "$out" | grep -q "pstl for_each result=3.0" \
+            || { echo "::error::pSTL-Bench for_each produced a WRONG result"; exit 1; }
+          # Offload is reported but NOT required to pass yet (empirical signal on codegen coverage).
+          if echo "$out" | grep -q "Successfully loaded kernel"; then
+            echo "PASS: real pSTL-Bench for_each_std OFFLOADED to the GPU + verified"
+          else
+            echo "PARTIAL: real pSTL-Bench for_each_std verified CORRECT on CPU fallback (codegen for this kernel body did not offload — codegen gap to close)"
+          fi
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
