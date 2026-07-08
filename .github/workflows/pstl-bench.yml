@@ -102,6 +102,17 @@ jobs:
           echo "=== rewrite landed in the tree? ==="
           echo "parallax:: refs in headers: $(grep -arc 'parallax::' /tmp/pstlb/include 2>/dev/null | grep -v ':0' | wc -l) file(s)"
           echo "registrars in main.cpp: $(grep -ac 'parallax_kernel_register' /tmp/pstlb/src/main.cpp 2>/dev/null || echo 0)"
+          echo "=== DIAGNOSTIC: re-run funnel pass on the (routed) main.cpp, full output ==="
+          BINC="$(find /tmp/pstlb/out -type d -path '*benchmark/include' | head -1)"
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 -DPSTL_ELEM_T=float \
+            -DPSTL_BENCH_MIN_INPUT_SIZE=1024 -DPSTL_BENCH_MAX_INPUT_SIZE=4096 -DPSTL_BENCH_RANGE_MULTIPLIER=4 \
+            -DBENCHMARK_STATIC_DEFINE -DPSTL_BENCH_BENCHMARK_PREFIX= -DPSTL_BENCH_HAVE_NUMA \
+            -I/tmp/pstlb/include -I"$BINC" -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang "$PARALLAX_PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c /tmp/pstlb/src/main.cpp -o /dev/null 2>/tmp/funnel.log || true
+          echo "device_* template specializations seen:"; grep -aE "VisitFunctionTemplateDecl device_" /tmp/funnel.log | head
+          echo "ParallaxFunnel registrations:"; grep -aE "ParallaxFunnel|Generated .* SPIR-V words|host fallback" /tmp/funnel.log | head -20
+          echo "funnel-pass errors (first 10):"; grep -aE "error:|fatal error" /tmp/funnel.log | head -10
           echo "=== build tail ==="; tail -20 /tmp/build.log
 
       - name: Run the suite on lavapipe + report offload coverage
