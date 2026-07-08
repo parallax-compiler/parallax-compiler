@@ -1391,7 +1391,7 @@ jobs:
           };
           int main() {
               std::vector<float> v(64, 1.0f);
-              const std::size_t its = 3;                                  // captured loop bound
+              std::size_t its = 3;                                        // NON-const: a real runtime capture (const would constant-fold)
               auto myf = [=](auto& elem) { for (std::size_t i = 0; i < its; ++i) elem += 1.0f; };
               for_each_par(parallax::par, v, myf);
               std::printf("funnel cap result=%.1f expected=4.0\n", v[0]);
@@ -1461,14 +1461,13 @@ jobs:
             || { echo "::error::transparent std::par produced a wrong result"; exit 1; }
           echo "PASS: UNMODIFIED std::for_each(std::execution::par,...) offloaded to the GPU"
 
-      - name: "SCOREBOARD (pSTL-Bench for_each): real header + codegen isolation (non-blocking)"
-        continue-on-error: true
+      - name: "GATE (pSTL-Bench for_each): the REAL kernel offloads correctly (+ codegen isolation)"
         run: |
-          # DIAGNOSTIC scoreboard (does not gate the branch). Layer A interception is
-          # proven; this measures Layer B codegen coverage on the REAL pSTL-Bench for_each
-          # kernel and isolates which construct (volatile / local accumulator / loop) breaks
-          # it. Each variant: transparent route -> funnel -> build -> run; report offloaded?
-          # + result vs expected 3.0. A MISCOMPILE = offloaded but wrong (Layer B bug).
+          # Compiles the REAL pSTL-Bench for_each_std.h kernel (nested generic lambda with a
+          # volatile, a local accumulator, a loop, and a captured iteration count) via
+          # transparent route -> funnel -> build -> run on lavapipe. Also runs isolation
+          # variants. REQUIRES every variant (incl. the real kernel) to OFFLOAD + verify.
+          fails=0
           git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb 2>&1 | tail -1
           INC="-I parallax-runtime/include -I /tmp/pstlb/include -include parallax/stdpar.hpp"
           PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
@@ -1495,23 +1494,25 @@ jobs:
             PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c v.cpp -o /dev/null 2> vf.log || true
             "$CLANGXX" -std=c++20 -O2 $INC v.cpp -L parallax-runtime/out -lparallax-runtime -o v 2>/dev/null || true
             o="$(PARALLAX_DEBUG=1 ./v 2>&1)" || true
-            res="$(echo "$o" | grep -aoE "\[$name\] result=[0-9.]+" | head -1)"
+            res="$(echo "$o" | grep -aoE "result=[0-9.]+" | head -1)"
             if echo "$o" | grep -q "Successfully loaded kernel"; then
-              if echo "$o" | grep -q "result=3.0"; then echo "  $name: OFFLOAD ok  ($res)"; else echo "  $name: MISCOMPILE (offloaded, wrong)  ($res)"; fi
+              if echo "$o" | grep -q "result=3.0"; then echo "  $name: OFFLOAD ok  ($res)";
+              else echo "  $name: MISCOMPILE (offloaded, wrong)  ($res)"; fails=$((fails+1)); fi
             else
-              echo "  $name: cpu-fallback  ($res)"
+              echo "  $name: cpu-fallback (not offloaded)  ($res)"; fails=$((fails+1))
             fi
           }
-          echo "=== codegen isolation on the pSTL-Bench for_each kernel ==="
-          run_variant "direct"     "" "elem = (elem_t)its;"
+          echo "=== the REAL pSTL-Bench kernel + codegen isolation (all must OFFLOAD + verify) ==="
+          run_variant "direct"      "" "elem = (elem_t)its;"
           run_variant "loop-direct" "" "for (std::size_t i=0;i<its;++i){ elem++; }"
           run_variant "loop-local"  "" "elem_t a{}; for (std::size_t i=0;i<its;++i){ a++; } elem = a;"
           run_variant "vol-loop"    "" "volatile std::size_t I=its; for (std::size_t i=0;i<I;++i){ elem++; }"
-          run_variant "REAL(vol+local+nested)" \
+          run_variant "real-kernel" \
             '#include "pstl/benchmarks/for_each/for_each_std.h"
           static const auto kernel = [](auto& input, const auto Its){ volatile std::size_t I=Its; float a{}; for(std::size_t i=0;i<I;++i){a++;} input=a; };' \
             "kernel(elem, its);"
-          echo "=== end scoreboard (Layer B target; interception/routing already proven) ==="
+          [ "$fails" -eq 0 ] || { echo "::error::$fails pSTL-Bench for_each variant(s) did not offload+verify"; exit 1; }
+          echo "PASS: the REAL pSTL-Bench for_each kernel (volatile+local+nested+capture) offloaded to the GPU + verified"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
