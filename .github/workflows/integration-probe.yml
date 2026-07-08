@@ -1377,7 +1377,40 @@ jobs:
             || { echo "::error::funnel kernel not offloaded (register/lookup key mismatch?)"; exit 1; }
           echo "$out" | grep -q "funnel result=3.0" \
             || { echo "::error::funnel produced a wrong result"; exit 1; }
-          echo "PASS: pSTL-Bench-style generic par call offloaded DETERMINISTICALLY via the device_invoke funnel"
+          echo "PASS(1/2): captureless generic par call offloaded DETERMINISTICALLY via the funnel"
+
+          # Stage 2: the FULL pSTL-Bench shape — generic + CAPTURING (its) + looping functor.
+          # Exercises capture binding through the funnel (closure bytes -> uniform).
+          cat > probe_funnel_cap.cpp <<'EOF'
+          #include <vector>
+          #include <cstdio>
+          #include <cstddef>
+          #include <parallax/stdpar.hpp>
+          const auto for_each_par = [](auto&& policy, auto& input, auto&& f) {
+              parallax::for_each(policy, input.begin(), input.end(), f);
+          };
+          int main() {
+              std::vector<float> v(64, 1.0f);
+              const std::size_t its = 3;                                  // captured loop bound
+              auto myf = [=](auto& elem) { for (std::size_t i = 0; i < its; ++i) elem += 1.0f; };
+              for_each_par(parallax::par, v, myf);
+              std::printf("funnel cap result=%.1f expected=4.0\n", v[0]);
+              return v[0] == 4.0f ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_funnel_cap.cpp -o /dev/null 2> funcap.log || true
+          grep -aE "ParallaxFunnel|FUNNEL-DBG" funcap.log | head -6 || true
+          "$CLANGXX" -std=c++20 -O2 probe_funnel_cap.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_funnel_cap 2>&1 | tail -3
+          outc="$(PARALLAX_DEBUG=1 ./probe_funnel_cap 2>&1)" || true
+          echo "$outc" | grep -aE "funnel cap result=|Successfully loaded kernel|MISS" | head
+          echo "$outc" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::capturing funnel kernel not offloaded"; exit 1; }
+          echo "$outc" | grep -q "funnel cap result=4.0" \
+            || { echo "::error::capturing funnel produced a wrong result (capture binding)"; exit 1; }
+          echo "PASS(2/2): capturing pSTL-Bench-shape generic par call offloaded correctly via the funnel"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
