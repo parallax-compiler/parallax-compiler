@@ -208,6 +208,25 @@ public:
         funnel_emissions_ += ss.str();
     }
 
+    /**
+     * Transparent std::execution::par routing: rewrite the CALLEE of a
+     * std::for_each(policy, first, last, f) call to parallax::for_each so it funnels
+     * through device_invoke. Only the callee token changes; the policy arg is left
+     * as-is (parallax::for_each gates par-vs-seq itself). This is a simple, reliably-
+     * visited source-token rewrite (no call-site codegen); the SPIR-V is generated on
+     * a subsequent plugin pass once the rewritten source instantiates device_invoke.
+     */
+    void routeForEachCallee(clang::CallExpr* call) {
+        if (!call || !call->getCallee()) return;
+        unsigned key = call->getBeginLoc().getRawEncoding();
+        if (!seen_route_locs_.insert(key).second) return;
+        clang::Expr* callee = call->getCallee()->IgnoreImplicit();
+        std::string cur = getSourceText(callee->getSourceRange());
+        if (cur.find("parallax") != std::string::npos) return;  // already routed
+        rewriter_.ReplaceText(callee->getSourceRange(), "parallax::for_each");
+        llvm::errs() << "[ParallaxRoute] " << cur << " -> parallax::for_each\n";
+    }
+
     /** Insert all accumulated funnel registrars at end of the main file. */
     void finalizeFunnelEmissions() {
         if (funnel_emissions_.empty()) return;
@@ -238,6 +257,7 @@ private:
     std::unordered_set<unsigned> seen_call_locs_;  // dedup rewrites across instantiations
     std::string funnel_emissions_;                 // Layer A: appended registrars
     int funnel_counter_ = 0;
+    std::unordered_set<unsigned> seen_route_locs_;  // transparent-routing dedup
 
     // Container tracking for allocator injection
     std::set<const clang::VarDecl*> containers_needing_allocator_;
@@ -1147,6 +1167,19 @@ public:
         rewriter_.emitFunnelRegistrar(key, spirv);
     }
 
+    // std::for_each(policy, first, last, f) with 4 args, whether resolved (concrete
+    // call) or dependent (inside a generic wrapper, callee = UnresolvedLookupExpr).
+    bool isStdForEachWithPolicy(clang::CallExpr* call) {
+        if (!call || call->getNumArgs() != 4) return false;
+        if (auto* fd = call->getDirectCallee())
+            return fd->getQualifiedNameAsString() == "std::for_each";
+        const clang::Expr* callee =
+            call->getCallee() ? call->getCallee()->IgnoreImplicit() : nullptr;
+        if (auto* ule = llvm::dyn_cast_or_null<clang::UnresolvedLookupExpr>(callee))
+            return ule->getName().getAsString() == "for_each";
+        return false;
+    }
+
     bool VisitCallExpr(clang::CallExpr* call) {
         // Debug: Log ALL call expressions to see if traversal is working
         static int call_count = 0;
@@ -1154,6 +1187,15 @@ public:
 
         if (call_count == 1) {
             llvm::errs() << "[ParallaxCollector] VisitCallExpr is being called!\n";
+        }
+
+        // Transparent routing (opt-in): rewrite std::for_each(par,...) callee to
+        // parallax::for_each so it funnels through device_invoke. Skip the old
+        // call-site codegen for it (the funnel path handles codegen on a later pass).
+        static const bool plx_transparent = std::getenv("PARALLAX_TRANSPARENT") != nullptr;
+        if (plx_transparent && isStdForEachWithPolicy(call)) {
+            rewriter_.routeForEachCallee(call);
+            return true;
         }
 
         if (call && call->getDirectCallee()) {

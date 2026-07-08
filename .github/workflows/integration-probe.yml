@@ -1412,6 +1412,55 @@ jobs:
             || { echo "::error::capturing funnel produced a wrong result (capture binding)"; exit 1; }
           echo "PASS(2/2): capturing pSTL-Bench-shape generic par call offloaded correctly via the funnel"
 
+      - name: "GATE (transparent): UNMODIFIED std::for_each(std::execution::par,...) offloads"
+        run: |
+          # nvc++-parity: source uses stock std::for_each(std::execution::par,...) with
+          # NO parallax:: names. Transparent routing (PARALLAX_TRANSPARENT=1) rewrites the
+          # callee to parallax::for_each; a second plugin pass funnels device_invoke. This
+          # is what lets UNMODIFIED pSTL-Bench code offload.
+          cat > probe_trans.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          #include <cstddef>
+          // pSTL-Bench shape, verbatim std::for_each(std::execution::par,...):
+          const auto for_each_std = [](auto&& policy, auto& input, auto&& f) {
+              std::for_each(policy, input.begin(), input.end(), f);
+          };
+          int main() {
+              std::vector<float> v(64, 1.0f);
+              auto myf = [](auto& elem) { elem = elem * 2.0f + 1.0f; };
+              for_each_std(std::execution::par, v, myf);
+              std::printf("transparent result=%.1f expected=3.0\n", v[0]);
+              return v[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          cp probe_trans.cpp work_trans.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          # Pass 1: route std::for_each -> parallax::for_each in the source.
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_trans.cpp -o /dev/null 2> tr1.log || true
+          echo "routed refs: $(grep -c 'parallax::for_each' work_trans.cpp)"; grep -aE 'ParallaxRoute' tr1.log | head
+          grep -q 'parallax::for_each' work_trans.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::for_each'; exit 1; }
+          # Pass 2: funnel device_invoke (now instantiated) -> appends registrar.
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_trans.cpp -o /dev/null 2> tr2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_trans.cpp)"; grep -aE 'ParallaxFunnel' tr2.log | head
+          grep -q 'parallax_kernel_register' work_trans.cpp \
+            || { echo '::error::funnel did not register a kernel after routing'; exit 1; }
+          # Build the routed+funneled source (no -ltbb) and run.
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_trans.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_trans 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_trans 2>&1)" || true
+          echo "$out" | grep -aE "transparent result=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::transparent std::par did not offload"; exit 1; }
+          echo "$out" | grep -q "transparent result=3.0" \
+            || { echo "::error::transparent std::par produced a wrong result"; exit 1; }
+          echo "PASS: UNMODIFIED std::for_each(std::execution::par,...) offloaded to the GPU"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
