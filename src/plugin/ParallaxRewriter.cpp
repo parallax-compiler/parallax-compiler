@@ -218,10 +218,15 @@ public:
      */
     void routeCallee(clang::CallExpr* call, const char* target) {
         if (!call || !call->getCallee()) return;
-        // NEVER route calls inside the parallax stdpar header — those are the funnel's
-        // OWN serial std:: fallbacks (parallax::sort -> std::sort(first,last), etc.).
-        // Rewriting them would corrupt the header (self-recursion) and route spuriously.
-        llvm::StringRef fname = SM_.getFilename(SM_.getExpansionLoc(call->getBeginLoc()));
+        clang::SourceLocation loc = call->getBeginLoc();
+        // NEVER route calls in SYSTEM headers — the C++ standard library's own
+        // std::sort/std::reduce/etc. implementations call same-named overloads with
+        // matching arg counts (e.g. reduce(pol,f,l) -> reduce(pol,f,l,init)); rewriting
+        // those to parallax:: corrupts <algorithm>/<numeric>. Also skip our own stdpar
+        // header (its serial std:: fallbacks). Only user TU + non-system algorithm
+        // headers (e.g. pSTL-Bench's *_std.h, included via -I) get routed.
+        if (SM_.isInSystemHeader(loc)) return;
+        llvm::StringRef fname = SM_.getFilename(SM_.getExpansionLoc(loc));
         if (fname.contains("stdpar.hpp")) return;
         unsigned key = call->getBeginLoc().getRawEncoding();
         if (!seen_route_locs_.insert(key).second) return;
