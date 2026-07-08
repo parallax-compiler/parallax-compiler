@@ -1583,13 +1583,13 @@ jobs:
           echo "$o" | grep -q "reduce result=4096.0" || { echo "::error::reduce wrong result"; exit 1; }
           echo "PASS: real pSTL-Bench reduce_std offloaded (fold) + verified"
 
-      - name: "GATE (pSTL-Bench fill+sort): real headers offload (value-broadcast map + bitonic sort)"
+      - name: "GATE (pSTL-Bench sort): real sort_std.h offloads (bitonic, pow2-padded)"
         run: |
           git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb 2>/dev/null || true
           INC="-I parallax-runtime/include -I /tmp/pstlb/include -include parallax/stdpar.hpp"
           PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          run_pstl() {   # name src expect_grep
+          run_pstl() {   # name expect_grep
             cp "$1.cpp" "$1_w.cpp"
             PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c "$1_w.cpp" -o /dev/null 2>/dev/null || true
             PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c "$1_w.cpp" -o /dev/null 2>"$1.log" || true
@@ -1599,20 +1599,6 @@ jobs:
             echo "$o" | grep -q "Successfully loaded kernel" || { echo "::error::$1 not offloaded"; exit 1; }
             echo "$o" | grep -q "$2" || { echo "::error::$1 wrong result"; exit 1; }
           }
-          cat > fill.cpp <<'EOF'
-          #include <vector>
-          #include <execution>
-          #include <cstdio>
-          #include "pstl/benchmarks/fill/fill_std.h"
-          int main(){
-            std::vector<float> v(256, 1.0f);
-            benchmark_fill::fill_std(std::execution::par, v, 7.0f);
-            bool ok=true; for(auto x: v) if(x!=7.0f) ok=false;
-            std::printf("fill ok=%d v0=%.1f\n", ok, (double)v[0]);
-            return ok?0:1;
-          }
-          EOF
-          run_pstl fill "fill ok=1"
           cat > srt.cpp <<'EOF'
           #include <vector>
           #include <execution>
@@ -1627,7 +1613,7 @@ jobs:
           }
           EOF
           run_pstl srt "srt sorted=1"
-          echo "PASS: real pSTL-Bench fill_std + sort_std offloaded + verified"
+          echo "PASS: real pSTL-Bench sort_std offloaded (bitonic) + verified"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |

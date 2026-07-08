@@ -1263,9 +1263,6 @@ public:
             if (isStdAlgoWithPolicy(call, "reduce", 4)) {       // reduce(par, first, last, init)
                 rewriter_.routeCallee(call, "parallax::reduce"); return true;
             }
-            if (isStdAlgoWithPolicy(call, "fill", 4)) {         // fill(par, first, last, value)
-                rewriter_.routeCallee(call, "parallax::fill"); return true;
-            }
             if (isStdAlgoWithPolicy(call, "sort", 3)) {         // sort(par, first, last)
                 rewriter_.routeCallee(call, "parallax::sort"); return true;
             }
