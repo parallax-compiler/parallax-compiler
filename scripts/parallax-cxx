@@ -105,6 +105,16 @@ while (( i < n )); do
     i=$((i+1))
 done
 
+# --- never rewrite CMake's internal probe compiles -----------------------------
+# CMake compiles CMakeCXXCompilerId.cpp / CMakeScratch try-compiles / CPM's own
+# feature checks to detect the compiler and its ABI. Force-including stdpar.hpp or
+# loading the plugin into those can break the magic-string detection. Pass them
+# straight through so CMake configures normally; they never contain std::par.
+case "$SRC" in
+    *CMakeFiles/*|*CMakeScratch/*|*CMakeTmp/*|*/CMakeCXXCompilerId.cpp|*cmake_pch*)
+        HAS_SRC=0 ;;
+esac
+
 # --- decide: rewrite path, or straight passthrough -----------------------------
 if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
         && [[ -n "$SRC" && -f "$SRC" ]] \

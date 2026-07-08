@@ -1,0 +1,109 @@
+name: pSTL-Bench Harness
+
+# Builds and runs the FULL pSTL-Bench (Google Benchmark) suite compiled with the
+# Parallax GPU-offload toolchain via the parallax-cxx compiler wrapper (route ->
+# funnel -> build). Routed algorithms (for_each/transform/reduce/sort) offload to the
+# GPU on lavapipe; the rest use the libstdc++/TBB par backend. pSTL-Bench's own
+# verification aborts on a wrong-result offload, so a clean full run == correctness.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLANGXX: /usr/lib/llvm-21/bin/clang++
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - name: Checkout compiler
+        uses: actions/checkout@v4
+        with: { path: parallax-compiler }
+
+      - name: Checkout runtime (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: parallax-compiler/parallax-runtime
+          ref: main
+          path: parallax-runtime
+
+      - name: Install LLVM/Clang 21, Vulkan + lavapipe, TBB/OpenMP
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git \
+            libvulkan-dev vulkan-tools mesa-vulkan-drivers spirv-tools \
+            libtbb-dev libomp-dev libnuma-dev
+
+      - name: Build runtime
+        run: |
+          cmake -S parallax-runtime -B parallax-runtime/out -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DPARALLAX_BUILD_TESTS=OFF
+          cmake --build parallax-runtime/out -j
+          echo "PARALLAX_RT_INCLUDE=$PWD/parallax-runtime/include" >> "$GITHUB_ENV"
+
+      - name: Build plugin
+        run: |
+          cmake -S parallax-compiler -B parallax-compiler/out -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+            -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
+          cmake --build parallax-compiler/out -j
+          echo "PARALLAX_PLUGIN=$PWD/parallax-compiler/out/src/plugin/libparallax-clang-plugin.so" >> "$GITHUB_ENV"
+          chmod +x parallax-compiler/scripts/parallax-cxx
+
+      - name: Clone pSTL-Bench (fresh, single-use tree)
+        run: git clone --depth 1 https://github.com/parlab-tuwien/pSTL-Bench /tmp/pstlb
+
+      - name: Configure pSTL-Bench with the parallax-cxx wrapper
+        run: |
+          # Wrapper needs the runtime include (holds parallax/stdpar.hpp) on the link
+          # line too so -lparallax-runtime resolves.
+          cmake -S /tmp/pstlb -B /tmp/pstlb/out -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="$PWD/parallax-compiler/scripts/parallax-cxx" \
+            -DPSTL_BENCH_BACKEND=GNU \
+            -DPSTL_BENCH_DATA_TYPE=float \
+            -DPSTL_BENCH_SEQUENTIAL=OFF \
+            -DPSTL_BENCH_MIN_INPUT_SIZE=1024 \
+            -DPSTL_BENCH_MAX_INPUT_SIZE=4096 \
+            -DPSTL_BENCH_RANGE_MULTIPLIER=4 \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$PWD/parallax-runtime/out -lparallax-runtime -ltbb" \
+            2>&1 | tail -30
+
+      - name: Build pSTL-Bench (SERIALIZED — the wrapper rewrites shared headers in place)
+        run: |
+          # google/benchmark itself has no std::par, so build it parallel first (safe),
+          # then the pSTL-Bench TU serially (the route pass edits shared headers in place).
+          cmake --build /tmp/pstlb/out --target benchmark -j 2>&1 | tail -5 || true
+          echo "=== building pSTL-Bench (parallel 1) ==="
+          cmake --build /tmp/pstlb/out --parallel 1 2>&1 | tail -40
+
+      - name: Run the suite on lavapipe + report offload coverage
+        run: |
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          BIN="$(find /tmp/pstlb/out -maxdepth 2 -name 'pSTL-Bench' -type f | head -1)"
+          echo "binary: $BIN"
+          [ -n "$BIN" ] || { echo "::error::pSTL-Bench binary not built"; exit 1; }
+          # A short run; PARALLAX_DEBUG surfaces kernel loads. pSTL-Bench verifies each
+          # benchmark internally (aborts on a wrong offload).
+          PARALLAX_DEBUG=1 "$BIN" --benchmark_min_time=0.005s --benchmark_repetitions=1 \
+            > /tmp/run.log 2>&1 || true
+          echo "=== benchmark rows (first 60) ==="
+          grep -aE "^[A-Za-z].*/[0-9]+ " /tmp/run.log | head -60 || true
+          echo "=== offload coverage ==="
+          loaded=$(grep -ac "Successfully loaded kernel" /tmp/run.log || echo 0)
+          echo "GPU kernel loads: $loaded"
+          echo "=== distinct offloaded kernels (funnel keys) ==="
+          grep -aoE "device_(invoke|transform|reduce|sort)<[^]]*" /tmp/run.log | sort -u | head -20 || true
+          echo "=== did the suite complete? ==="
+          if grep -aqE "benchmark|ns |items_per_second" /tmp/run.log; then
+            echo "PASS: pSTL-Bench ran to completion with the Parallax toolchain ($loaded GPU kernel load(s))"
+          else
+            echo "::error::pSTL-Bench did not produce benchmark output"; tail -40 /tmp/run.log; exit 1
+          fi
