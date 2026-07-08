@@ -62,27 +62,31 @@ jobs:
 
       - name: Configure pSTL-Bench with the parallax-cxx wrapper
         run: |
-          # Wrapper needs the runtime include (holds parallax/stdpar.hpp) on the link
-          # line too so -lparallax-runtime resolves.
+          set -o pipefail
+          # No explicit backend: the *_std.h wrappers call std::execution::par directly,
+          # which resolves to libstdc++'s PSTL (linked against TBB) for the algorithms
+          # Parallax doesn't route; the routed ones (for_each/transform/reduce/sort) offload.
+          # (The GNU backend needs OpenMP_CXX, which CMake can't detect through the wrapper.)
           cmake -S /tmp/pstlb -B /tmp/pstlb/out -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER="$PWD/parallax-compiler/scripts/parallax-cxx" \
-            -DPSTL_BENCH_BACKEND=GNU \
+            -DPSTL_BENCH_BACKEND="" \
             -DPSTL_BENCH_DATA_TYPE=float \
             -DPSTL_BENCH_SEQUENTIAL=OFF \
             -DPSTL_BENCH_MIN_INPUT_SIZE=1024 \
             -DPSTL_BENCH_MAX_INPUT_SIZE=4096 \
             -DPSTL_BENCH_RANGE_MULTIPLIER=4 \
             -DCMAKE_EXE_LINKER_FLAGS="-L$PWD/parallax-runtime/out -lparallax-runtime -ltbb" \
-            2>&1 | tail -30
+            2>&1 | tail -40
 
       - name: Build pSTL-Bench (SERIALIZED — the wrapper rewrites shared headers in place)
         run: |
+          set -o pipefail
           # google/benchmark itself has no std::par, so build it parallel first (safe),
           # then the pSTL-Bench TU serially (the route pass edits shared headers in place).
           cmake --build /tmp/pstlb/out --target benchmark -j 2>&1 | tail -5 || true
           echo "=== building pSTL-Bench (parallel 1) ==="
-          cmake --build /tmp/pstlb/out --parallel 1 2>&1 | tail -40
+          cmake --build /tmp/pstlb/out --parallel 1 2>&1 | tail -60
 
       - name: Run the suite on lavapipe + report offload coverage
         run: |
