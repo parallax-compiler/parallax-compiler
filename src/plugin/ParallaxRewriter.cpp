@@ -1059,8 +1059,11 @@ public:
         return qn == "parallax::detail::device_invoke" ||
                qn == "parallax::detail::device_transform";
     }
-    static bool isReduceFunnel(const std::string& qn) {
-        return qn == "parallax::detail::device_reduce";
+    // Fixed-kernel funnels: no functor, one element-type arg. The kernel shape is chosen
+    // by the template name (reduce -> tree reduction, sort -> bitonic stage).
+    static bool isFixedKernelFunnel(const std::string& qn) {
+        return qn == "parallax::detail::device_reduce" ||
+               qn == "parallax::detail::device_sort";
     }
 
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
@@ -1069,7 +1072,7 @@ public:
             return true;
         std::string qn = FD->getQualifiedNameAsString();
         if (isFunnelTemplate(qn)) processDeviceInvoke(FD);
-        else if (isReduceFunnel(qn)) processDeviceReduce(FD);
+        else if (isFixedKernelFunnel(qn)) processFixedKernel(FD, qn);
         return true;
     }
 
@@ -1079,21 +1082,22 @@ public:
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
         if (!FTD) return true;
         std::string qn = FTD->getQualifiedNameAsString();
-        const bool funnel = isFunnelTemplate(qn), reduce = isReduceFunnel(qn);
-        if (!funnel && !reduce) return true;
+        const bool funnel = isFunnelTemplate(qn), fixed = isFixedKernelFunnel(qn);
+        if (!funnel && !fixed) return true;
         int n = 0;
         for (clang::FunctionDecl* spec : FTD->specializations()) {
             ++n;
-            if (funnel) processDeviceInvoke(spec); else processDeviceReduce(spec);
+            if (funnel) processDeviceInvoke(spec); else processFixedKernel(spec, qn);
         }
         llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl "
                      << FTD->getNameAsString() << ": " << n << " specialization(s)\n";
         return true;
     }
 
-    // device_reduce<T>: no functor — generate the fixed workgroup tree-reduction kernel
-    // for element type T (default '+'), keyed by __PRETTY_FUNCTION__.
-    void processDeviceReduce(clang::FunctionDecl* FD) {
+    // device_reduce<T> / device_sort<T>: no functor — generate the fixed kernel for
+    // element type T (reduce=default '+' tree reduction; sort=bitonic compare-exchange),
+    // keyed by __PRETTY_FUNCTION__.
+    void processFixedKernel(clang::FunctionDecl* FD, const std::string& qn) {
         if (!FD) return;
         const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
         if (!targs || targs->size() < 1 ||
@@ -1107,7 +1111,7 @@ public:
         else if (elemT->isIntegerType())
             ek = context_.getTypeSize(elemT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
                                                    : SPIRVGenerator::ReduceElemType::I32;
-        else { llvm::errs() << "[ParallaxFunnel] reduce: unsupported element type; host fallback\n"; return; }
+        else { llvm::errs() << "[ParallaxFunnel] fixed-kernel: unsupported element type; host fallback\n"; return; }
 
         std::string key = clang::PredefinedExpr::ComputeName(
             clang::PredefinedIdentKind::PrettyFunction, FD);
@@ -1115,10 +1119,12 @@ public:
 
         SPIRVGenerator gen;
         gen.set_target_vulkan_version(1, 2);
-        auto spirv = gen.generate_reduce_kernel(ek);
-        if (spirv.empty()) { llvm::errs() << "[ParallaxFunnel] reduce kernel gen failed; host fallback\n"; return; }
-        llvm::errs() << "[ParallaxFunnel] device_reduce<" << elemT.getAsString() << "> "
-                     << spirv.size() << " SPIR-V words; registering\n  key=" << key << "\n";
+        const bool is_sort = qn == "parallax::detail::device_sort";
+        auto spirv = is_sort ? gen.generate_sort_kernel(ek) : gen.generate_reduce_kernel(ek);
+        if (spirv.empty()) { llvm::errs() << "[ParallaxFunnel] fixed-kernel gen failed; host fallback\n"; return; }
+        llvm::errs() << "[ParallaxFunnel] " << FD->getQualifiedNameAsString() << "<"
+                     << elemT.getAsString() << "> " << spirv.size()
+                     << " SPIR-V words; registering\n  key=" << key << "\n";
         rewriter_.emitFunnelRegistrar(key, spirv);
     }
 
@@ -1246,6 +1252,12 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "reduce", 4)) {       // reduce(par, first, last, init)
                 rewriter_.routeCallee(call, "parallax::reduce"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "fill", 4)) {         // fill(par, first, last, value)
+                rewriter_.routeCallee(call, "parallax::fill"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "sort", 3)) {         // sort(par, first, last)
+                rewriter_.routeCallee(call, "parallax::sort"); return true;
             }
         }
 
