@@ -1624,11 +1624,16 @@ jobs:
           cat > scan.cpp <<'EOF'
           #include <vector>
           #include <execution>
+          #include <numeric>
           #include <cstdio>
-          #include "pstl/benchmarks/inclusive_scan/inclusive_scan_std.h"
+          // Identical to pSTL-Bench's inclusive_scan_std.h (its real header also #includes
+          // <benchmark/benchmark.h>, which this standalone gate doesn't link).
+          const auto inclusive_scan_std = [](auto&& policy, const auto& input, auto& output) {
+              std::inclusive_scan(policy, input.begin(), input.end(), output.begin());
+          };
           int main(){
             std::vector<int> in(1000, 1), out(1000, 0);
-            benchmark_inclusive_scan::inclusive_scan_std(std::execution::par, in, out);
+            inclusive_scan_std(std::execution::par, in, out);
             std::printf("scan out0=%d out999=%d expected 1,1000\n", out[0], out[999]);
             return (out[0]==1 && out[999]==1000 && out[500]==501) ? 0 : 1;
           }
