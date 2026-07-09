@@ -1081,11 +1081,19 @@ public:
     static bool isTransformReduceFunnel(const std::string& qn) {
         return qn == "parallax::detail::device_transform_reduce";
     }
+    static bool isCountIfFunnel(const std::string& qn) {
+        return qn == "parallax::detail::device_count_if";
+    }
+    static bool isAnyFunnel(const std::string& qn) {
+        return isFunnelTemplate(qn) || isFixedKernelFunnel(qn) ||
+               isTransformReduceFunnel(qn) || isCountIfFunnel(qn);
+    }
 
     void dispatchFunnel(clang::FunctionDecl* spec, const std::string& qn) {
         if (isFunnelTemplate(qn)) processDeviceInvoke(spec);
         else if (isFixedKernelFunnel(qn)) processFixedKernel(spec, qn);
         else if (isTransformReduceFunnel(qn)) processTransformReduce(spec);
+        else if (isCountIfFunnel(qn)) processCountIf(spec);
     }
 
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
@@ -1102,7 +1110,7 @@ public:
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
         if (!FTD) return true;
         std::string qn = FTD->getQualifiedNameAsString();
-        if (!isFunnelTemplate(qn) && !isFixedKernelFunnel(qn) && !isTransformReduceFunnel(qn))
+        if (!isAnyFunnel(qn))
             return true;
         int n = 0;
         for (clang::FunctionDecl* spec : FTD->specializations()) { ++n; dispatchFunnel(spec, qn); }
@@ -1162,8 +1170,11 @@ public:
 
     // Compile a functor's operator() (applied to an element of type elemT) to a SPIR-V
     // kernel. generate_from_lambda auto-detects for_each (void -> in-place) vs transform
-    // (non-void -> in/out) from the return type. Returns empty on any failure.
-    std::vector<uint32_t> compileFunctorKernel(clang::QualType funcT, clang::QualType elemT) {
+    // (non-void -> in/out) from the return type. predicate_count: a T->bool predicate
+    // becomes a transform storing int 1/0 per element (so a '+' reduce yields the count).
+    // Returns empty on any failure.
+    std::vector<uint32_t> compileFunctorKernel(clang::QualType funcT, clang::QualType elemT,
+                                               bool predicate_count = false) {
         std::vector<uint32_t> spirv;
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
         if (!functor) {
@@ -1192,8 +1203,35 @@ public:
         if (!kf) return spirv;
         SPIRVGenerator gen;
         gen.set_target_vulkan_version(1, 2);
+        if (predicate_count) gen.set_predicate_count(true);
         std::vector<std::string> pt = {elemT.getUnqualifiedType().getAsString() + "&"};
         return gen.generate_from_lambda(kf, pt);
+    }
+
+    // device_count_if<T,Pred>: a predicate-count transform kernel (Pred -> int 1/0) under
+    // ":pred" + an I32 '+' reduce under ":reduce".
+    void processCountIf(clang::FunctionDecl* FD) {
+        if (!FD) return;
+        const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
+        if (!targs || targs->size() < 2 ||
+            targs->get(0).getKind() != clang::TemplateArgument::Type ||
+            targs->get(1).getKind() != clang::TemplateArgument::Type)
+            return;
+        clang::QualType elemT = targs->get(0).getAsType();
+        clang::QualType funcT = targs->get(1).getAsType();
+        std::string key = clang::PredefinedExpr::ComputeName(
+            clang::PredefinedIdentKind::PrettyFunction, FD);
+        if (!seen_funnel_keys_.insert(key).second) return;
+        auto pspv = compileFunctorKernel(funcT, elemT, /*predicate_count=*/true);
+        SPIRVGenerator rgen; rgen.set_target_vulkan_version(1, 2);
+        auto rspv = rgen.generate_reduce_kernel(SPIRVGenerator::ReduceElemType::I32);
+        if (pspv.empty() || rspv.empty()) {
+            llvm::errs() << "[ParallaxFunnel] count_if codegen failed; host fallback\n"; return;
+        }
+        llvm::errs() << "[ParallaxFunnel] device_count_if<" << elemT.getAsString() << "> "
+                     << pspv.size() << "+" << rspv.size() << " SPIR-V words; registering\n";
+        rewriter_.emitFunnelRegistrar(key + ":pred", pspv);
+        rewriter_.emitFunnelRegistrar(key + ":reduce", rspv);
     }
 
     // Compile one device_invoke<T,F> / device_transform<Tin,Tout,F> instantiation to
@@ -1302,6 +1340,18 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "transform_reduce", 6)) {  // (par,f,l,init,binop,unop)
                 rewriter_.routeCallee(call, "parallax::transform_reduce"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "count_if", 4)) {     // count_if(par,f,l,pred)
+                rewriter_.routeCallee(call, "parallax::count_if"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "all_of", 4)) {
+                rewriter_.routeCallee(call, "parallax::all_of"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "any_of", 4)) {
+                rewriter_.routeCallee(call, "parallax::any_of"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "none_of", 4)) {
+                rewriter_.routeCallee(call, "parallax::none_of"); return true;
             }
         }
 

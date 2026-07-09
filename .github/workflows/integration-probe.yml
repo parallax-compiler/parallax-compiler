@@ -1683,6 +1683,42 @@ jobs:
           echo "$o" | grep -q "trd result=1024.0" || { echo "::error::transform_reduce wrong result"; exit 1; }
           echo "PASS: transform_reduce offloaded (transform+reduce funnel) + verified"
 
+      - name: "GATE (pSTL-Bench count_if/all_of): predicate+reduce funnel offloads"
+        run: |
+          INC="-I parallax-runtime/include -include parallax/stdpar.hpp"
+          PLG="-Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          cat > cif.cpp <<'EOF'
+          #include <vector>
+          #include <execution>
+          #include <algorithm>
+          #include <cstdio>
+          // pSTL-Bench count_if/all_of shape: captureless generic predicate
+          const auto count_if_std = [](auto&& policy, const auto& input, auto&& cond) {
+              return std::count_if(policy, input.begin(), input.end(), cond);
+          };
+          const auto all_of_std = [](auto&& policy, const auto& input, auto&& cond) {
+              return std::all_of(policy, input.begin(), input.end(), cond);
+          };
+          int main(){
+            std::vector<int> v(1000); for (int i=0;i<1000;++i) v[i]=i;
+            auto c = count_if_std(std::execution::par, v, [](const auto& i){ return i%2==0; });
+            bool a = all_of_std(std::execution::par, v, [](const auto& x){ return x>=0; });
+            std::printf("count_if=%ld all_of=%d expected 500,1\n", (long)c, (int)a);
+            return (c==500 && a) ? 0 : 1;
+          }
+          EOF
+          cp cif.cpp cif_w.cpp
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c cif_w.cpp -o /dev/null 2>/dev/null || true
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" -std=c++20 $INC $PLG -c cif_w.cpp -o /dev/null 2>cif2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' cif_w.cpp)"; grep -aE 'ParallaxFunnel|SPIR-V words' cif2.log | head
+          "$CLANGXX" -std=c++20 -O2 $INC cif_w.cpp -L parallax-runtime/out -lparallax-runtime -o cifbin 2>&1 | tail -2
+          o="$(PARALLAX_DEBUG=1 ./cifbin 2>&1)" || true
+          echo "$o" | grep -aE "count_if=|Successfully loaded kernel|MISS" | head
+          echo "$o" | grep -q "Successfully loaded kernel" || { echo "::error::count_if not offloaded"; exit 1; }
+          echo "$o" | grep -q "count_if=500 all_of=1" || { echo "::error::count_if/all_of wrong result"; exit 1; }
+          echo "PASS: count_if + all_of offloaded (predicate+reduce funnel) + verified"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
