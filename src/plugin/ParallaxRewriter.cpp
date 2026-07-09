@@ -1078,13 +1078,21 @@ public:
                qn == "parallax::detail::device_scan";
     }
 
+    static bool isTransformReduceFunnel(const std::string& qn) {
+        return qn == "parallax::detail::device_transform_reduce";
+    }
+
+    void dispatchFunnel(clang::FunctionDecl* spec, const std::string& qn) {
+        if (isFunnelTemplate(qn)) processDeviceInvoke(spec);
+        else if (isFixedKernelFunnel(qn)) processFixedKernel(spec, qn);
+        else if (isTransformReduceFunnel(qn)) processTransformReduce(spec);
+    }
+
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
         if (!FD || FD->getTemplatedKind() !=
                        clang::FunctionDecl::TK_FunctionTemplateSpecialization)
             return true;
-        std::string qn = FD->getQualifiedNameAsString();
-        if (isFunnelTemplate(qn)) processDeviceInvoke(FD);
-        else if (isFixedKernelFunnel(qn)) processFixedKernel(FD, qn);
+        dispatchFunnel(FD, FD->getQualifiedNameAsString());
         return true;
     }
 
@@ -1094,13 +1102,10 @@ public:
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD) {
         if (!FTD) return true;
         std::string qn = FTD->getQualifiedNameAsString();
-        const bool funnel = isFunnelTemplate(qn), fixed = isFixedKernelFunnel(qn);
-        if (!funnel && !fixed) return true;
+        if (!isFunnelTemplate(qn) && !isFixedKernelFunnel(qn) && !isTransformReduceFunnel(qn))
+            return true;
         int n = 0;
-        for (clang::FunctionDecl* spec : FTD->specializations()) {
-            ++n;
-            if (funnel) processDeviceInvoke(spec); else processFixedKernel(spec, qn);
-        }
+        for (clang::FunctionDecl* spec : FTD->specializations()) { ++n; dispatchFunnel(spec, qn); }
         llvm::errs() << "[FUNNEL-DBG] VisitFunctionTemplateDecl "
                      << FTD->getNameAsString() << ": " << n << " specialization(s)\n";
         return true;
@@ -1155,9 +1160,45 @@ public:
         rewriter_.emitFunnelRegistrar(key, spirv);
     }
 
-    // Compile one funnel instantiation to SPIR-V and register it under the
-    // instantiation's __PRETTY_FUNCTION__ (the key the runtime funnel recomputes). The
-    // functor is the LAST type template arg; the element type is the first.
+    // Compile a functor's operator() (applied to an element of type elemT) to a SPIR-V
+    // kernel. generate_from_lambda auto-detects for_each (void -> in-place) vs transform
+    // (non-void -> in/out) from the return type. Returns empty on any failure.
+    std::vector<uint32_t> compileFunctorKernel(clang::QualType funcT, clang::QualType elemT) {
+        std::vector<uint32_t> spirv;
+        clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
+        if (!functor) {
+            llvm::errs() << "[ParallaxFunnel] F not a record (" << funcT.getAsString() << ")\n";
+            return spirv;
+        }
+        // Generic lambda's operator() is a FunctionTemplateDecl (methods() hides it);
+        // use getLambdaCallOperator, then pick the concrete operator()<T&> instantiation.
+        clang::CXXMethodDecl* op_call =
+            functor->isLambda() ? functor->getLambdaCallOperator()
+                                : getFunctionCallOperator(functor);
+        if (!op_call) return spirv;
+        if (clang::FunctionTemplateDecl* ft = op_call->getDescribedFunctionTemplate()) {
+            clang::CXXMethodDecl* concrete = nullptr;
+            for (clang::FunctionDecl* s : ft->specializations())
+                if (s->hasBody()) { concrete = llvm::dyn_cast<clang::CXXMethodDecl>(s); break; }
+            if (concrete) op_call = concrete;
+        }
+        if (!op_call->hasBody()) return spirv;
+        auto module = ir_generator_.generateIR(op_call, context_);
+        if (!module) return spirv;
+        llvm::Function* kf = nullptr;
+        for (auto& f : *module)
+            if (f.getName().str().rfind("kernel_", 0) == 0) { kf = &f; break; }
+        if (!kf) for (auto& f : *module) if (!f.isDeclaration()) { kf = &f; break; }
+        if (!kf) return spirv;
+        SPIRVGenerator gen;
+        gen.set_target_vulkan_version(1, 2);
+        std::vector<std::string> pt = {elemT.getUnqualifiedType().getAsString() + "&"};
+        return gen.generate_from_lambda(kf, pt);
+    }
+
+    // Compile one device_invoke<T,F> / device_transform<Tin,Tout,F> instantiation to
+    // SPIR-V and register it under the instantiation's __PRETTY_FUNCTION__. The functor
+    // is the LAST type template arg; the element type is the first.
     void processDeviceInvoke(clang::FunctionDecl* FD) {
         if (!FD) return;
         const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
@@ -1168,80 +1209,53 @@ public:
             return;
         clang::QualType elemT = targs->get(0).getAsType();
         clang::QualType funcT = targs->get(func_idx).getAsType();
-        clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
-        if (!functor) {
-            llvm::errs() << "[ParallaxFunnel] F is not a record type (" << funcT.getAsString()
-                         << "); host fallback\n";
+        std::string key = clang::PredefinedExpr::ComputeName(
+            clang::PredefinedIdentKind::PrettyFunction, FD);
+        if (!seen_funnel_keys_.insert(key).second) return;
+        auto spirv = compileFunctorKernel(funcT, elemT);
+        if (spirv.empty()) {
+            llvm::errs() << "[ParallaxFunnel] functor codegen failed; host fallback\n  key=" << key << "\n";
             return;
         }
-        // A generic lambda's call operator is a FunctionTemplateDecl, which
-        // CXXRecordDecl::methods() does NOT surface — so getFunctionCallOperator would
-        // return null. Use getLambdaCallOperator() for lambdas (it returns the templated
-        // pattern for generic lambdas); fall back to the methods() scan for plain functors.
-        clang::CXXMethodDecl* op_call =
-            functor->isLambda() ? functor->getLambdaCallOperator()
-                                : getFunctionCallOperator(functor);
-        if (!op_call) {
-            llvm::errs() << "[ParallaxFunnel] no operator() on " << functor->getNameAsString()
-                         << " (isLambda=" << functor->isLambda() << "); host fallback\n";
-            return;
-        }
-        // Generic lambda / templated functor: operator() is a function template whose
-        // pattern is dependent (no compilable body). device_invoke<T,F> odr-uses the
-        // concrete operator()<T&>, so pick that instantiation instead of the pattern.
-        if (clang::FunctionTemplateDecl* ft = op_call->getDescribedFunctionTemplate()) {
-            clang::CXXMethodDecl* concrete = nullptr;
-            for (clang::FunctionDecl* s : ft->specializations()) {
-                if (s->hasBody()) { concrete = llvm::dyn_cast<clang::CXXMethodDecl>(s); break; }
-            }
-            if (concrete) op_call = concrete;
-            llvm::errs() << "[FUNNEL-DBG] generic functor: "
-                         << (concrete ? "using operator() instantiation" : "no instantiation found")
-                         << "\n";
-        }
-        if (!op_call->hasBody()) {
-            llvm::errs() << "[ParallaxFunnel] functor operator() has no body; host fallback\n";
-            return;
-        }
+        llvm::errs() << "[ParallaxFunnel] " << FD->getQualifiedNameAsString() << " "
+                     << spirv.size() << " SPIR-V words; registering\n  key=" << key << "\n";
+        rewriter_.emitFunnelRegistrar(key, spirv);
+    }
+
+    // device_transform_reduce<T,U,F>: a transform kernel (from F, T->U) PLUS a reduce
+    // kernel (for U), registered under ":xform" and ":reduce".
+    void processTransformReduce(clang::FunctionDecl* FD) {
+        if (!FD) return;
+        const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
+        if (!targs || targs->size() < 3) return;
+        for (unsigned i = 0; i < 3; ++i)
+            if (targs->get(i).getKind() != clang::TemplateArgument::Type) return;
+        clang::QualType elemT = targs->get(0).getAsType();
+        clang::QualType accT  = targs->get(1).getAsType();
+        clang::QualType funcT = targs->get(2).getAsType();
+        SPIRVGenerator::ReduceElemType ek;
+        if (accT->isRealFloatingType())
+            ek = context_.getTypeSize(accT) >= 64 ? SPIRVGenerator::ReduceElemType::F64
+                                                  : SPIRVGenerator::ReduceElemType::F32;
+        else if (accT->isIntegerType())
+            ek = context_.getTypeSize(accT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
+                                                  : SPIRVGenerator::ReduceElemType::I32;
+        else { llvm::errs() << "[ParallaxFunnel] transform_reduce: unsupported accum type\n"; return; }
 
         std::string key = clang::PredefinedExpr::ComputeName(
             clang::PredefinedIdentKind::PrettyFunction, FD);
         if (!seen_funnel_keys_.insert(key).second) return;
-
-        llvm::errs() << "[ParallaxFunnel] device_invoke<" << elemT.getAsString()
-                     << ", " << functor->getNameAsString() << ">\n  key=" << key << "\n";
-
-        // Use the real clang sub-compilation path (handles arbitrary bodies: loops,
-        // compound assigns, captures) rather than the hand-rolled manual translator.
-        auto module = ir_generator_.generateIR(op_call, context_);
-        if (!module) {
-            llvm::errs() << "[ParallaxFunnel] IR gen failed; host fallback\n";
-            return;
+        auto xspv = compileFunctorKernel(funcT, elemT);  // T -> U transform (non-void)
+        SPIRVGenerator rgen; rgen.set_target_vulkan_version(1, 2);
+        auto rspv = rgen.generate_reduce_kernel(ek);
+        if (xspv.empty() || rspv.empty()) {
+            llvm::errs() << "[ParallaxFunnel] transform_reduce codegen failed; host fallback\n"; return;
         }
-        llvm::Function* kernel_func = nullptr;
-        for (auto& f : *module) {
-            if (f.getName().str().rfind("kernel_", 0) == 0) { kernel_func = &f; break; }
-        }
-        if (!kernel_func)
-            for (auto& f : *module)
-                if (!f.isDeclaration()) { kernel_func = &f; break; }
-        if (!kernel_func) {
-            llvm::errs() << "[ParallaxFunnel] no kernel function; host fallback\n";
-            return;
-        }
-
-        SPIRVGenerator spirv_gen;
-        spirv_gen.set_target_vulkan_version(1, 2);
-        std::vector<std::string> param_types = {
-            elemT.getUnqualifiedType().getAsString() + "&"};
-        auto spirv = spirv_gen.generate_from_lambda(kernel_func, param_types);
-        if (spirv.empty()) {
-            llvm::errs() << "[ParallaxFunnel] SPIR-V gen failed; host fallback\n";
-            return;
-        }
-        llvm::errs() << "[ParallaxFunnel] Generated " << spirv.size()
+        llvm::errs() << "[ParallaxFunnel] device_transform_reduce<" << elemT.getAsString()
+                     << "," << accT.getAsString() << "> " << xspv.size() << "+" << rspv.size()
                      << " SPIR-V words; registering\n";
-        rewriter_.emitFunnelRegistrar(key, spirv);
+        rewriter_.emitFunnelRegistrar(key + ":xform", xspv);
+        rewriter_.emitFunnelRegistrar(key + ":reduce", rspv);
     }
 
     // std::<name>(policy, ...) with nargs args, whether resolved (concrete call) or
@@ -1285,6 +1299,9 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "inclusive_scan", 4)) {  // inclusive_scan(par, first, last, d_first)
                 rewriter_.routeCallee(call, "parallax::inclusive_scan"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "transform_reduce", 6)) {  // (par,f,l,init,binop,unop)
+                rewriter_.routeCallee(call, "parallax::transform_reduce"); return true;
             }
         }
 
