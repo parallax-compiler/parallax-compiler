@@ -1341,18 +1341,15 @@ public:
             if (isStdAlgoWithPolicy(call, "transform_reduce", 6)) {  // (par,f,l,init,binop,unop)
                 rewriter_.routeCallee(call, "parallax::transform_reduce"); return true;
             }
-            if (isStdAlgoWithPolicy(call, "count_if", 4)) {     // count_if(par,f,l,pred)
-                rewriter_.routeCallee(call, "parallax::count_if"); return true;
-            }
-            if (isStdAlgoWithPolicy(call, "all_of", 4)) {
-                rewriter_.routeCallee(call, "parallax::all_of"); return true;
-            }
-            if (isStdAlgoWithPolicy(call, "any_of", 4)) {
-                rewriter_.routeCallee(call, "parallax::any_of"); return true;
-            }
-            if (isStdAlgoWithPolicy(call, "none_of", 4)) {
-                rewriter_.routeCallee(call, "parallax::none_of"); return true;
-            }
+            // count_if/all_of/any_of/none_of: routing + funnel + runtime overloads are
+            // wired (see parallax::count_if / processCountIf), but the predicate-count
+            // transform kernel for INTEGER elements emits an i32/i64-mismatched OpLoad
+            // (invalid SPIR-V). Not routed until that codegen is fixed, so these run on
+            // the TBB/libstdc++ backend meanwhile. Re-enable by restoring these four lines.
+            // if (isStdAlgoWithPolicy(call, "count_if", 4)) { rewriter_.routeCallee(call, "parallax::count_if"); return true; }
+            // if (isStdAlgoWithPolicy(call, "all_of", 4))   { rewriter_.routeCallee(call, "parallax::all_of");   return true; }
+            // if (isStdAlgoWithPolicy(call, "any_of", 4))   { rewriter_.routeCallee(call, "parallax::any_of");   return true; }
+            // if (isStdAlgoWithPolicy(call, "none_of", 4))  { rewriter_.routeCallee(call, "parallax::none_of");  return true; }
         }
 
         if (call && call->getDirectCallee()) {
