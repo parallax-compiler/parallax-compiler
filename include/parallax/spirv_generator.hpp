@@ -180,6 +180,10 @@ private:
     bool        predicate_count_ = false;
     bool        predicate_flags_ = false;
     bool        predicate_negate_ = false;
+    // A transform/predicate functor whose INPUT is taken by reference (const T&), so its
+    // first parameter is a pointer to the element (not the value). The kernel must pass
+    // the input buffer element POINTER, not a loaded value. Set per generate_from_lambda.
+    bool        transform_byref_input_ = false;
     uint32_t    pc_var_id_ = 0;
     uint32_t    pc_int32_id_ = 0;
     uint32_t    reloc_host_base_id_ = 0;

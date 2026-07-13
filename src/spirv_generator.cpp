@@ -1252,9 +1252,20 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     reloc_host_base_id_ = 0;
     reloc_dev_base_id_ = 0;
     const llvm::Argument* elem_ptr_arg = nullptr;  // for_each element pointer (if any)
+    transform_byref_input_ = false;
     if (is_transform) {
         if (lambda_func->arg_size() > 0) {
-            active_element_type_ = lambda_func->getArg(0)->getType();
+            llvm::Argument* a0 = lambda_func->getArg(0);
+            if (a0->getType()->isPointerTy()) {
+                // by-reference input, e.g. a predicate [](const T& x){...}: arg0 is a
+                // pointer to the element. Recover the element (pointee) type from the
+                // loads/GEPs on it (same as for_each) rather than mistaking it for a
+                // pointer-chasing element. The kernel passes the element pointer.
+                active_element_type_ = infer_pointee_type(lambda_func, a0);
+                transform_byref_input_ = true;
+            } else {
+                active_element_type_ = a0->getType();  // by-value input
+            }
         }
     } else {
         for (auto& a : lambda_func->args()) {
@@ -3202,15 +3213,21 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
     // Note: is_transform was already determined earlier
 
     if (is_transform && data_buffer_ptrs.size() >= 2) {
-        // Transform: lambda returns value, has separate input/output
-        // Load from input buffer[0] using the input element type
-        uint32_t input_val = builder.get_next_id();
-        builder.emit_op(SPIRVOp::OpLoad, {data_elem_id, input_val, data_buffer_ptrs[0]});
+        // Transform: lambda returns value, has separate input/output. Pass the input
+        // element by VALUE (by-value functor) or by POINTER (by-reference functor, e.g.
+        // a predicate [](const T& x){...}, whose first param is a pointer to the element).
+        uint32_t input_arg;
+        if (transform_byref_input_) {
+            input_arg = data_buffer_ptrs[0];  // element pointer
+        } else {
+            input_arg = builder.get_next_id();
+            builder.emit_op(SPIRVOp::OpLoad, {data_elem_id, input_arg, data_buffer_ptrs[0]});
+        }
 
-        // Call lambda with value (not pointer), captured buffers, and scalar parameters
+        // Call lambda with the input arg, captured buffers, and scalar parameters
         uint32_t result_type_id = get_type_id(builder, lambda_func->getReturnType());
         uint32_t result_id = builder.get_next_id();
-        std::vector<uint32_t> call_ops = {result_type_id, result_id, lambda_func_id, input_val};
+        std::vector<uint32_t> call_ops = {result_type_id, result_id, lambda_func_id, input_arg};
         // Append captured buffer pointers
         call_ops.insert(call_ops.end(), captured_buffer_ptrs.begin(), captured_buffer_ptrs.end());
         // Append scalar parameters
