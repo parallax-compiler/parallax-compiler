@@ -1880,6 +1880,20 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     }
     std::string source_path = file_ref->getName().str();
 
+    // Sub-compile the ORIGINAL translation unit, not the file the lambda textually
+    // lives in. A user's for_each lambda lives in the main .cpp, so those coincide —
+    // but a library-internal lambda (e.g. fill's setter `[v](E& x){ x = v; }`) lives
+    // in stdpar.hpp, and compiling that header STANDALONE never instantiates the
+    // enclosing fill/device_invoke templates, so operator() is never emitted (empty
+    // module → selection fails → captures dropped). Compiling the main TU instantiates
+    // fill→device_invoke→the lambda, emitting operator() with debug line info that
+    // still points at stdpar.hpp:289, so the line-based selection below still works.
+    const auto& orig_inputs = CI_.getInvocation().getFrontendOpts().Inputs;
+    std::string main_tu = source_path;
+    for (const auto& in : orig_inputs) {
+        if (in.isFile() && !in.getFile().empty()) { main_tu = in.getFile().str(); break; }
+    }
+
     // Clone the current invocation, retargeting it to emit LLVM IR only for just
     // this file, with optimizations and plugins disabled (avoid plugin recursion).
     auto inv = std::make_shared<clang::CompilerInvocation>(CI_.getInvocation());
@@ -1890,7 +1904,7 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
     inv->getFrontendOpts().PluginArgs.clear();
     inv->getFrontendOpts().Inputs.clear();
     inv->getFrontendOpts().Inputs.emplace_back(
-        source_path, clang::InputKind(clang::Language::CXX));
+        main_tu, clang::InputKind(clang::Language::CXX));
     inv->getCodeGenOpts().OptimizationLevel = 0;
     // Emit line-table debug info so each emitted operator() carries its source line.
     // We select the target lambda by source location (robust), because mangled-name
@@ -2020,8 +2034,31 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
                             return st;
             return nullptr;
         };
-        closure_ty = from_gep(this_arg);
-        if (!closure_ty) {  // -O0: 'this' is stored to an alloca, loaded, then GEP'd.
+        // A SINGLE-member closure { m0 } has its offset-0 field GEP elided by LLVM
+        // (this->m0 -> a bare `load m0, ptr this`), so from_gep finds nothing. Recover a
+        // one-member closure from that bare scalar load/store on 'this'.
+        auto from_bare = [&](llvm::Value* base) -> llvm::StructType* {
+            for (llvm::User* u : base->users()) {
+                if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(u))
+                    if (ld->getPointerOperand() == base && !ld->getType()->isAggregateType()) {
+                        llvm::Type* m[] = {ld->getType()};
+                        return llvm::StructType::get(*llvm_context_, m);
+                    }
+                if (auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+                    if (st->getPointerOperand() == base &&
+                        !st->getValueOperand()->getType()->isAggregateType()) {
+                        llvm::Type* m[] = {st->getValueOperand()->getType()};
+                        return llvm::StructType::get(*llvm_context_, m);
+                    }
+            }
+            return nullptr;
+        };
+        auto recover = [&](llvm::Value* v) -> llvm::StructType* {
+            if (auto* s = from_gep(v)) return s;      // multi-member: a real GEP exists
+            return from_bare(v);                       // single member: offset-0 GEP elided
+        };
+        closure_ty = recover(this_arg);
+        if (!closure_ty) {  // -O0: 'this' is stored to an alloca, loaded, then accessed.
             for (llvm::User* u : this_arg->users()) {
                 auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
                 if (!st || st->getValueOperand() != this_arg) continue;
@@ -2029,7 +2066,7 @@ std::unique_ptr<llvm::Module> LambdaIRGenerator::generateWithCodeGen(
                 if (!slot) continue;
                 for (llvm::User* su : slot->users())
                     if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(su))
-                        if ((closure_ty = from_gep(ld))) break;
+                        if ((closure_ty = recover(ld))) break;
                 if (closure_ty) break;
             }
         }

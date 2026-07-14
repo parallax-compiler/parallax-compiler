@@ -1461,6 +1461,94 @@ jobs:
             || { echo "::error::transparent std::par produced a wrong result"; exit 1; }
           echo "PASS: UNMODIFIED std::for_each(std::execution::par,...) offloaded to the GPU"
 
+      - name: "GATE (fill): std::fill(par) offloads a value-capturing setter"
+        run: |
+          # fill = a device_invoke map whose setter [v](E& x){ x = v; } CAPTURES the
+          # fill value. This exercises library-internal-lambda codegen: the setter lives
+          # in stdpar.hpp, so the sub-compilation must compile the MAIN TU (not the header
+          # standalone, which never instantiates fill) for the operator() to be emitted,
+          # AND recover a single-member closure (offset-0 GEP elided). Result must be the
+          # captured 7.0, proving the capture is bound (a dropped capture writes 0).
+          cat > probe_fill.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(64, 1.0f);
+              std::fill(std::execution::par, v.begin(), v.end(), 7.0f);
+              std::printf("fill result=%.1f expected=7.0\n", v[0]);
+              return v[0] == 7.0f ? 0 : 1;
+          }
+          EOF
+          cp probe_fill.cpp work_fill.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          # Pass 1: route std::fill -> parallax::fill.
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_fill.cpp -o /dev/null 2> fl1.log || true
+          echo "routed refs: $(grep -c 'parallax::fill' work_fill.cpp)"
+          grep -q 'parallax::fill' work_fill.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::fill'; exit 1; }
+          # Pass 2: funnel device_invoke (the setter) -> appends registrar.
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_fill.cpp -o /dev/null 2> fl2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_fill.cpp)"
+          grep -aE 'Lambda captures|scalar captures' fl2.log | head
+          grep -q 'parallax_kernel_register' work_fill.cpp \
+            || { echo '::error::fill funnel did not register a kernel after routing'; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_fill.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_fill 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_fill 2>&1)" || true
+          echo "$out" | grep -aE "fill result=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::std::fill(par) did not offload"; exit 1; }
+          echo "$out" | grep -q "fill result=7.0" \
+            || { echo "::error::std::fill(par) produced a wrong result (capture dropped?)"; exit 1; }
+          echo "PASS: std::fill(par) offloaded with its captured value bound correctly"
+
+      - name: "GATE (generate): std::generate(par) inlines a nullary generator"
+        run: |
+          # generate = device_invoke map whose setter [gen](E& x){ x = gen(); } calls the
+          # user's nullary generator. Exercises NESTED library-internal-lambda codegen: the
+          # setter (in stdpar.hpp) calls gen()'s operator() (in the main TU), which must be
+          # located + inlined into one kernel. Constant generator -> every element == 5.0.
+          cat > probe_gen.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(64, 0.0f);
+              float c = 5.0f;
+              std::generate(std::execution::par, v.begin(), v.end(), [c](){ return c; });
+              std::printf("generate result=%.1f expected=5.0\n", v[0]);
+              return v[0] == 5.0f ? 0 : 1;
+          }
+          EOF
+          cp probe_gen.cpp work_gen.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_gen.cpp -o /dev/null 2> gn1.log || true
+          echo "routed refs: $(grep -c 'parallax::generate' work_gen.cpp)"
+          grep -q 'parallax::generate' work_gen.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::generate'; exit 1; }
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_gen.cpp -o /dev/null 2> gn2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_gen.cpp)"
+          grep -aE 'Lambda captures|scalar captures' gn2.log | head
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_gen.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_gen 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_gen 2>&1)" || true
+          echo "$out" | grep -aE "generate result=|Successfully loaded kernel|MISS" | head
+          # generate offload is best-effort (nested inline); require correctness either way.
+          echo "$out" | grep -q "generate result=5.0" \
+            || { echo "::error::std::generate(par) produced a wrong result"; exit 1; }
+          if echo "$out" | grep -q "Successfully loaded kernel"; then
+            echo "PASS: std::generate(par) offloaded and is correct"
+          else
+            echo "PASS (host fallback): std::generate(par) stayed correct on the CPU"
+          fi
+
       - name: "GATE (pSTL-Bench for_each): the REAL kernel offloads correctly (+ codegen isolation)"
         run: |
           # Compiles the REAL pSTL-Bench for_each_std.h kernel (nested generic lambda with a

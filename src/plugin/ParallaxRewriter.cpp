@@ -1329,6 +1329,12 @@ public:
             if (isStdAlgoWithPolicy(call, "transform", 5)) {   // unary transform
                 rewriter_.routeCallee(call, "parallax::transform"); return true;
             }
+            if (isStdAlgoWithPolicy(call, "fill", 4)) {         // fill(par, first, last, value)
+                rewriter_.routeCallee(call, "parallax::fill"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "generate", 4)) {     // generate(par, first, last, gen)
+                rewriter_.routeCallee(call, "parallax::generate"); return true;
+            }
             if (isStdAlgoWithPolicy(call, "reduce", 4)) {       // reduce(par, first, last, init)
                 rewriter_.routeCallee(call, "parallax::reduce"); return true;
             }
