@@ -427,6 +427,49 @@ jobs:
             || { echo "::error::std::transform produced wrong result"; exit 1; }
           echo "PASS: std::transform offloaded (synthesized in/out buffers)"
 
+      - name: "GATE (transform capture): a CAPTURING transform op binds captures@2"
+        run: |
+          # std::transform with a by-value CAPTURING op [k,c](x){return x*k+c;}. The kernel
+          # synthesizes in@0/out@1 and reads k,c from the uniform@2 captures block (bound by
+          # launch_transform's captures path). Must OFFLOAD (host fallback would mask a broken
+          # capture bind), so assert "Successfully loaded kernel". in=1, k=3, c=2 -> out=5.
+          cat > probe_xfc.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> in(64, 1.0f), out(64, 0.0f);
+              float k = 3.0f, c = 2.0f;
+              std::transform(std::execution::par, in.begin(), in.end(), out.begin(),
+                             [k,c](float x){ return x * k + c; });
+              std::printf("xfc result=%.1f expected=5.0\n", out[0]);
+              return (out[0] == 5.0f) ? 0 : 1;
+          }
+          EOF
+          cp probe_xfc.cpp work_xfc.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_xfc.cpp -o /dev/null 2> xfc1.log || true
+          echo "routed refs: $(grep -c 'parallax::transform' work_xfc.cpp)"
+          grep -q 'parallax::transform' work_xfc.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::transform'; exit 1; }
+          PARALLAX_DUMP_SPIRV="$PWD/xfc.spv" PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS \
+            -c work_xfc.cpp -o /dev/null 2> xfc2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_xfc.cpp)"
+          grep -aE 'scalar captures' xfc2.log | head -1
+          [ -f xfc.spv ] && { spirv-val xfc.spv || { echo "::error::capturing transform SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_xfc.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_xfc 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_xfc 2>&1)" || true
+          echo "$out" | grep -aE "xfc result=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::capturing transform was not offloaded"; exit 1; }
+          echo "$out" | grep -q "xfc result=5.0" \
+            || { echo "::error::capturing transform wrong result (capture bind broken?)"; exit 1; }
+          echo "PASS: a capturing std::transform op offloaded with its captures bound"
+
       - name: "GATE (transform_reduce): map then reduce on the GPU"
         run: |
           # transform_reduce = transform(top) into scratch, then reduce(rop). Sum of
