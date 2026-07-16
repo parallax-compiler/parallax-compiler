@@ -1529,6 +1529,55 @@ jobs:
             || { echo "::error::double unique produced a wrong result"; exit 1; }
           echo "PASS: std::unique(par) over double elements offloaded"
 
+      - name: "GATE (copy_if funnel): compaction offloads through a GENERIC wrapper (pSTL-Bench shape)"
+        run: |
+          # THE pSTL-Bench gap: copy_if/partition/unique used the concrete-only collector path,
+          # which does NOT fire in a generic lambda wrapper (dependent types) — so they stayed on
+          # TBB in the real suite. Funnelling them (parallax::copy_if -> device_copy_if) makes them
+          # offload deterministically here, exactly like for_each/reduce. This probe uses the
+          # pSTL-Bench wrapper shape verbatim and asserts OFFLOAD via the funnel.
+          cat > probe_cif.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          // pSTL-Bench copy_if_std.h shape, verbatim generic lambda:
+          const auto copy_if_std = [](auto&& policy, const auto& input, auto& output, auto&& cond) {
+              return std::copy_if(policy, input.begin(), input.end(), output.begin(), cond);
+          };
+          int main() {
+              std::vector<float> v(1000), out(1000, -1.0f);
+              for (int i = 0; i < 1000; ++i) v[i] = (float)i;
+              auto e = copy_if_std(std::execution::par, v, out, [](float x){ return x > 0.5f; });
+              size_t kept = (size_t)std::distance(out.begin(), e);
+              std::printf("cif kept=%zu out[0]=%.1f out[998]=%.1f\n", kept, out[0], out[998]);
+              return (kept==999 && out[0]==1.0f && out[998]==999.0f) ? 0 : 1;
+          }
+          EOF
+          cp probe_cif.cpp work_cif.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_cif.cpp -o /dev/null 2> cif1.log || true
+          echo "routed refs: $(grep -c 'parallax::copy_if' work_cif.cpp)"
+          grep -q 'parallax::copy_if' work_cif.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::copy_if in a generic wrapper'; exit 1; }
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_cif.cpp -o /dev/null 2> cif2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_cif.cpp)"
+          grep -aE 'device_copy_if<' cif2.log | head -1
+          grep -q 'parallax_kernel_register' work_cif.cpp \
+            || { echo '::error::copy_if funnel registered no kernels for the generic wrapper'; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_cif.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_cif 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_cif 2>&1)" || true
+          echo "$out" | grep -aE "cif kept=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::copy_if did NOT offload through the generic wrapper (funnel miss)"; exit 1; }
+          echo "$out" | grep -q "cif kept=999 out\[0\]=1.0 out\[998\]=999.0" \
+            || { echo "::error::funnel copy_if produced a wrong result"; exit 1; }
+          echo "PASS: copy_if offloads through a GENERIC pSTL-Bench-style wrapper via the funnel"
+
       - name: "GATE (funnel): pSTL-Bench-style generic par call offloads via device_invoke (DETERMINISTIC)"
         run: |
           # Layer A (nvc++/dpc++ shape): interception rides ordinary C++ overload

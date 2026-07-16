@@ -1085,9 +1085,16 @@ public:
     static bool isCountIfFunnel(const std::string& qn) {
         return qn == "parallax::detail::device_count_if";
     }
+    static bool isCompactionFunnel(const std::string& qn) {
+        return qn == "parallax::detail::device_copy_if" ||
+               qn == "parallax::detail::device_remove_if" ||
+               qn == "parallax::detail::device_partition" ||
+               qn == "parallax::detail::device_unique";
+    }
     static bool isAnyFunnel(const std::string& qn) {
         return isFunnelTemplate(qn) || isFixedKernelFunnel(qn) ||
-               isTransformReduceFunnel(qn) || isCountIfFunnel(qn);
+               isTransformReduceFunnel(qn) || isCountIfFunnel(qn) ||
+               isCompactionFunnel(qn);
     }
 
     void dispatchFunnel(clang::FunctionDecl* spec, const std::string& qn) {
@@ -1095,6 +1102,7 @@ public:
         else if (isFixedKernelFunnel(qn)) processFixedKernel(spec, qn);
         else if (isTransformReduceFunnel(qn)) processTransformReduce(spec);
         else if (isCountIfFunnel(qn)) processCountIf(spec);
+        else if (isCompactionFunnel(qn)) processCompactionFunnel(spec, qn);
     }
 
     bool VisitFunctionDecl(clang::FunctionDecl* FD) {
@@ -1195,7 +1203,9 @@ public:
     // becomes a transform storing int 1/0 per element (so a '+' reduce yields the count).
     // Returns empty on any failure.
     std::vector<uint32_t> compileFunctorKernel(clang::QualType funcT, clang::QualType elemT,
-                                               bool predicate_count = false) {
+                                               bool predicate_count = false,
+                                               bool predicate_flags = false,
+                                               bool predicate_negate = false) {
         std::vector<uint32_t> spirv;
         clang::CXXRecordDecl* functor = funcT->getAsCXXRecordDecl();
         if (!functor) {
@@ -1225,6 +1235,8 @@ public:
         SPIRVGenerator gen;
         gen.set_target_vulkan_version(1, 2);
         if (predicate_count) gen.set_predicate_count(true);
+        if (predicate_flags) gen.set_predicate_flags(true);
+        if (predicate_negate) gen.set_predicate_negate(true);
         std::vector<std::string> pt = {elemT.getUnqualifiedType().getAsString() + "&"};
         return gen.generate_from_lambda(kf, pt);
     }
@@ -1253,6 +1265,67 @@ public:
                      << pspv.size() << "+" << rspv.size() << " SPIR-V words; registering\n";
         rewriter_.emitFunnelRegistrar(key + ":pred", pspv);
         rewriter_.emitFunnelRegistrar(key + ":reduce", rspv);
+    }
+
+    // device_copy_if<T,Pred> / device_remove_if<T,Pred> / device_partition<T,Pred> /
+    // device_unique<T>: the compaction family as a deterministic funnel (so it offloads in
+    // GENERIC pSTL-Bench wrappers, unlike the concrete-only collector path). Registers four
+    // kernels under ":flags"/":scan"/":add"/":scatter". flags = predicate->element-typed 1/0
+    // (negated for remove_if) or the unique adjacent-run flags; scatter = plain compaction
+    // or the partition scatter (writes every element). 32/64-bit float/int.
+    void processCompactionFunnel(clang::FunctionDecl* FD, const std::string& qn) {
+        if (!FD) return;
+        const clang::TemplateArgumentList* targs = FD->getTemplateSpecializationArgs();
+        if (!targs || targs->size() < 1 || targs->get(0).getKind() != clang::TemplateArgument::Type)
+            return;
+        clang::QualType elemT = targs->get(0).getAsType();
+        SPIRVGenerator::ReduceElemType ek;
+        const unsigned esz = context_.getTypeSize(elemT);
+        if (elemT->isRealFloatingType())
+            ek = esz >= 64 ? SPIRVGenerator::ReduceElemType::F64 : SPIRVGenerator::ReduceElemType::F32;
+        else if (elemT->isIntegerType())
+            ek = esz >= 64 ? SPIRVGenerator::ReduceElemType::I64 : SPIRVGenerator::ReduceElemType::I32;
+        else { llvm::errs() << "[ParallaxFunnel] compaction: unsupported element type; host fallback\n"; return; }
+        if (esz != 32 && esz != 64) { llvm::errs() << "[ParallaxFunnel] compaction: only 32/64-bit; host\n"; return; }
+
+        const bool is_unique = qn == "parallax::detail::device_unique";
+        const bool is_remove = qn == "parallax::detail::device_remove_if";
+        const bool is_part   = qn == "parallax::detail::device_partition";
+
+        std::string key = clang::PredefinedExpr::ComputeName(
+            clang::PredefinedIdentKind::PrettyFunction, FD);
+        if (!seen_funnel_keys_.insert(key).second) return;
+
+        // flags: unique uses the adjacent-run kernel (no predicate); the rest compile the
+        // predicate (last type arg) to an element-typed 1/0 flags kernel (negated=remove_if).
+        std::vector<uint32_t> flags;
+        if (is_unique) {
+            SPIRVGenerator ug; ug.set_target_vulkan_version(1, 2);
+            flags = ug.generate_unique_flags_kernel(ek);
+        } else {
+            if (targs->size() < 2 || targs->get(targs->size() - 1).getKind() != clang::TemplateArgument::Type) {
+                llvm::errs() << "[ParallaxFunnel] compaction: missing predicate arg; host\n"; return;
+            }
+            clang::QualType predT = targs->get(targs->size() - 1).getAsType();
+            flags = compileFunctorKernel(predT, elemT, /*count=*/false, /*flags=*/true, /*negate=*/is_remove);
+        }
+        SPIRVGenerator gs; gs.set_target_vulkan_version(1, 2);
+        SPIRVGenerator ga; ga.set_target_vulkan_version(1, 2);
+        SPIRVGenerator gc; gc.set_target_vulkan_version(1, 2);
+        auto scan = gs.generate_scan_kernel(ek);
+        auto add  = ga.generate_scan_add_kernel(ek);
+        auto scat = is_part ? gc.generate_partition_scatter_kernel(ek)
+                            : gc.generate_scatter_kernel(ek);
+        if (flags.empty() || scan.empty() || add.empty() || scat.empty()) {
+            llvm::errs() << "[ParallaxFunnel] compaction codegen failed; host fallback\n"; return;
+        }
+        llvm::errs() << "[ParallaxFunnel] " << qn << "<" << elemT.getAsString() << "> "
+                     << flags.size() << "+" << scan.size() << "+" << add.size() << "+"
+                     << scat.size() << " SPIR-V words; registering\n";
+        rewriter_.emitFunnelRegistrar(key + ":flags", flags);
+        rewriter_.emitFunnelRegistrar(key + ":scan", scan);
+        rewriter_.emitFunnelRegistrar(key + ":add", add);
+        rewriter_.emitFunnelRegistrar(key + ":scatter", scat);
     }
 
     // Compile one device_invoke<T,F> / device_transform<Tin,Tout,F> instantiation to
@@ -1367,6 +1440,20 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "exclusive_scan", 5)) {  // exclusive_scan(par, first, last, d_first, init)
                 rewriter_.routeCallee(call, "parallax::exclusive_scan"); return true;
+            }
+            // Compaction family — funnelled so it offloads in GENERIC wrappers (unlike the
+            // concrete-only collector path, which still handles direct concrete-type calls).
+            if (isStdAlgoWithPolicy(call, "copy_if", 5)) {    // copy_if(par, first, last, d_first, pred)
+                rewriter_.routeCallee(call, "parallax::copy_if"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "remove_if", 4)) {  // remove_if(par, first, last, pred)
+                rewriter_.routeCallee(call, "parallax::remove_if"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "partition", 4)) {  // partition(par, first, last, pred)
+                rewriter_.routeCallee(call, "parallax::partition"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "unique", 3)) {     // unique(par, first, last)
+                rewriter_.routeCallee(call, "parallax::unique"); return true;
             }
             if (isStdAlgoWithPolicy(call, "transform_reduce", 6)) {  // (par,f,l,init,binop,unop)
                 rewriter_.routeCallee(call, "parallax::transform_reduce"); return true;
