@@ -2401,12 +2401,15 @@ std::vector<uint32_t> SPIRVGenerator::generate_scatter_kernel(ReduceElemType ele
         B.set_section(SPIRVBuilder::Section::Types);
         if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0, 0});
         else         B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0});
+        // 0.5 threshold (flags are exactly 0.0/1.0, so 0.5 separates them); 0 for ints.
+        // A 64-bit OpConstant needs TWO literal words (low, high) — 0.5 double is
+        // 0x3FE0000000000000 -> {0x00000000, 0x3FE00000}.
         if (is_float) {
-            // 0.5f threshold (flags are exactly 0.0/1.0, so 0.5 separates them).
-            uint32_t half_bits = 0x3f000000u;
-            B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, half_bits});
+            if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0x00000000u, 0x3FE00000u});
+            else         B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0x3f000000u});  // 0.5f
         } else {
-            B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0});  // int: flag > 0
+            if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0, 0});  // int64: flag > 0
+            else         B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0});     // int32: flag > 0
         }
         B.set_section(prev);
     }
@@ -2598,7 +2601,12 @@ std::vector<uint32_t> SPIRVGenerator::generate_unique_flags_kernel(ReduceElemTyp
     {
         SPIRVBuilder::Section prev = B.get_current_section();
         B.set_section(SPIRVBuilder::Section::Types);
-        if (is_float) {
+        // one/zero of the element type. 64-bit constants need TWO literal words:
+        // 1.0 double = 0x3FF0000000000000 -> {0, 0x3FF00000}; int64 1 -> {1, 0}.
+        if (is_float && is_wide) {
+            B.emit_op(SPIRVOp::OpConstant, {elem_t, one_elem, 0x00000000u, 0x3FF00000u});  // 1.0 double
+            B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0, 0});
+        } else if (is_float) {
             B.emit_op(SPIRVOp::OpConstant, {elem_t, one_elem, 0x3f800000u});  // 1.0f
             B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0});
         } else if (is_wide) {
@@ -2770,8 +2778,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_partition_scatter_kernel(ReduceEl
         B.set_section(SPIRVBuilder::Section::Types);
         if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0, 0});
         else         B.emit_op(SPIRVOp::OpConstant, {elem_t, zero_elem, 0});
-        if (is_float) B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0x3f000000u});  // 0.5f
-        else          B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0});
+        // 0.5 threshold (0.5 double = {0, 0x3FE00000}); 0 for ints. 64-bit -> two words.
+        if (is_float) {
+            if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0x00000000u, 0x3FE00000u});
+            else         B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0x3f000000u});  // 0.5f
+        } else {
+            if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0, 0});  // int64
+            else         B.emit_op(SPIRVOp::OpConstant, {elem_t, thresh, 0});     // int32
+        }
         B.set_section(prev);
     }
 

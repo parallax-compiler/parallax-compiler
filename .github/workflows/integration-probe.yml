@@ -1410,6 +1410,125 @@ jobs:
             || { echo "::error::partition produced a wrong result"; exit 1; }
           echo "PASS: std::partition(par) offloaded GPU partitioning"
 
+      - name: "GATE (copy_if double): 64-bit compaction (pSTL-Bench's default elem type)"
+        run: |
+          # pSTL-Bench's default PSTL_ELEM_T is double, so 64-bit compaction is what makes
+          # its copy_if/partition/unique benchmarks offload. The scatter kernel's element-
+          # typed constants (0.5 threshold, 0 pad) must be TWO words for a double, else the
+          # SPIR-V is malformed. Assert spirv-val + OFFLOAD + result (host fallback would hide
+          # a broken kernel). v[i]=i as double, keep x>0.5 -> 999 kept, out=[1..999].
+          cat > probe_cid.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<double> v(N), out(N, -1.0);
+              for (int i = 0; i < N; ++i) v[i] = (double)i;
+              auto end = std::copy_if(std::execution::par, v.begin(), v.end(), out.begin(),
+                                      [](double x){ return x > 0.5; });
+              size_t kept = (size_t)std::distance(out.begin(), end);
+              std::printf("cid kept=%zu out[0]=%.1f out[998]=%.1f\n", kept, out[0], out[998]);
+              return (kept==999 && out[0]==1.0 && out[998]==999.0) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_SCATTER="$PWD/cid_scat.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_cid.cpp -o /dev/null 2> cid.log || true
+          grep -E "copy_if: generated" cid.log | head -1 \
+            || { echo "::error::double copy_if not detected (still gated to 32-bit?)"; exit 1; }
+          [ -f cid_scat.spv ] && { spirv-val cid_scat.spv || { echo "::error::double scatter SPIR-V invalid (F64 constant width?)"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_cid.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_cid 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_cid 2>&1)" || true
+          echo "$out" | grep -aE "cid kept=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::double copy_if was not offloaded"; exit 1; }
+          echo "$out" | grep -q "cid kept=999 out\[0\]=1.0 out\[998\]=999.0" \
+            || { echo "::error::double copy_if produced a wrong result"; exit 1; }
+          echo "PASS: std::copy_if(par) over double elements offloaded (64-bit flags/scan/scatter)"
+
+      - name: "GATE (partition double): 64-bit partition scatter"
+        run: |
+          # Exercises generate_partition_scatter_kernel for F64 (0.5 threshold as a double).
+          # v[i]=i, pred x<500 -> partition point 500; first 500 all <500, last 500 >=500.
+          cat > probe_ptd.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<double> v(N);
+              for (int i = 0; i < N; ++i) v[i] = (double)i;
+              auto pp = std::partition(std::execution::par, v.begin(), v.end(),
+                                       [](double x){ return x < 500.0; });
+              size_t nt = (size_t)std::distance(v.begin(), pp);
+              bool ok = (nt == 500);
+              for (int i = 0; i < 500 && ok; ++i) if (!(v[i] < 500.0)) ok = false;
+              for (int i = 500; i < N && ok; ++i) if (v[i] < 500.0) ok = false;
+              std::printf("ptd pp=%zu groups_ok=%d\n", nt, ok ? 1 : 0);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_PART="$PWD/ptd.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_ptd.cpp -o /dev/null 2> ptd.log || true
+          grep -E "partition: generated" ptd.log | head -1 \
+            || { echo "::error::double partition not detected"; exit 1; }
+          [ -f ptd.spv ] && { spirv-val ptd.spv || { echo "::error::double partition scatter SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_ptd.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_ptd 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_ptd 2>&1)" || true
+          echo "$out" | grep -aE "ptd pp=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::double partition was not offloaded"; exit 1; }
+          echo "$out" | grep -q "ptd pp=500 groups_ok=1" \
+            || { echo "::error::double partition produced a wrong result"; exit 1; }
+          echo "PASS: std::partition(par) over double elements offloaded"
+
+      - name: "GATE (unique double): 64-bit unique flags"
+        run: |
+          # Exercises generate_unique_flags_kernel for F64 (1.0/0.0 as doubles).
+          # [0,0,1,1,...,499,499] -> unique [0..499], kept 500.
+          cat > probe_und.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <iterator>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<double> v(N);
+              for (int i = 0; i < N; ++i) v[i] = (double)(i / 2);
+              auto e = std::unique(std::execution::par, v.begin(), v.end());
+              size_t kept = (size_t)std::distance(v.begin(), e);
+              std::printf("und kept=%zu v[0]=%.1f v[499]=%.1f\n", kept, v[0], v[499]);
+              return (kept==500 && v[0]==0.0 && v[499]==499.0) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV_UNIQUE="$PWD/und.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_und.cpp -o /dev/null 2> und.log || true
+          grep -E "unique: generated" und.log | head -1 \
+            || { echo "::error::double unique not detected"; exit 1; }
+          [ -f und.spv ] && { spirv-val und.spv || { echo "::error::double unique flags SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_und.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_und 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_und 2>&1)" || true
+          echo "$out" | grep -aE "und kept=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::double unique was not offloaded"; exit 1; }
+          echo "$out" | grep -q "und kept=500 v\[0\]=0.0 v\[499\]=499.0" \
+            || { echo "::error::double unique produced a wrong result"; exit 1; }
+          echo "PASS: std::unique(par) over double elements offloaded"
+
       - name: "GATE (funnel): pSTL-Bench-style generic par call offloads via device_invoke (DETERMINISTIC)"
         run: |
           # Layer A (nvc++/dpc++ shape): interception rides ordinary C++ overload

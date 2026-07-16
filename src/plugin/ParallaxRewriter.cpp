@@ -1620,9 +1620,9 @@ public:
                 if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
             }
             SPIRVGenerator::ReduceElemType ek;
-            if (elemQT.isNull() || context_.getTypeSize(elemQT) != 32 || !elem_kind(elemQT, ek) ||
-                (ek != SPIRVGenerator::ReduceElemType::F32 && ek != SPIRVGenerator::ReduceElemType::I32)) {
-                llvm::errs() << "[ParallaxCollector] unique: MVP supports 32-bit float/int only; CPU\n";
+            const unsigned uesz = elemQT.isNull() ? 0 : context_.getTypeSize(elemQT);
+            if (elemQT.isNull() || (uesz != 32 && uesz != 64) || !elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] unique: supports 32/64-bit float/int only; CPU\n";
                 return true;
             }
             info.element_type = elemQT;
@@ -1685,13 +1685,15 @@ public:
                     if (!hasParallaxAllocator(oc->getType())) rewriter_.markContainerForAllocation(oc);
                 }
             }
-            // MVP: 32-bit float or int elements (one scan/scatter type; the predicate's
-            // element type is inferred from its compiled argument).
+            // 32- or 64-bit float/int elements (the flags/scan/scatter kernels are all
+            // type-parametric in ek; the predicate's element type is inferred from its
+            // compiled argument). pSTL-Bench's default element type is double, so 64-bit
+            // support is what makes the default copy_if/remove_if/partition benchmarks offload.
             SPIRVGenerator::ReduceElemType ek;
-            if (elemQT.isNull() || context_.getTypeSize(elemQT) != 32 || !elem_kind(elemQT, ek) ||
-                (ek != SPIRVGenerator::ReduceElemType::F32 && ek != SPIRVGenerator::ReduceElemType::I32)) {
+            const unsigned esz = elemQT.isNull() ? 0 : context_.getTypeSize(elemQT);
+            if (elemQT.isNull() || (esz != 32 && esz != 64) || !elem_kind(elemQT, ek)) {
                 llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
-                             << ": MVP supports 32-bit float/int elements only; CPU\n";
+                             << ": supports 32/64-bit float/int elements only; CPU\n";
                 return true;
             }
             info.element_type = elemQT;
