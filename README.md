@@ -4,59 +4,78 @@ Clang plugin and LLVM-to-SPIR-V compiler for automatic GPU offloading of C++ par
 
 ## Overview
 
-The Parallax compiler is a Clang plugin that transforms standard C++20 parallel algorithms into GPU-accelerated code. It performs compile-time AST transformations to:
+The Parallax compiler is a Clang plugin that offloads standard C++20 parallel algorithms
+(`std::algo(std::execution::par, …)`) to Vulkan/SPIR-V — the nvc++/dpc++ shape, but for
+Vulkan compute. It **separates interception from codegen**, the way mature stdpar
+toolchains do:
 
-1. **Automatically inject GPU allocators** into standard containers
-2. **Extract lambda expressions** from parallel algorithm calls
-3. **Generate LLVM IR** from lambda bodies
-4. **Convert IR to SPIR-V** compute shaders
-5. **Embed GPU kernels** directly in the compiled binary
+1. **Interception (a library, not pattern-matching).** Unmodified `std::execution::par`
+   calls are transparently routed to `parallax::` overloads that funnel every call through a
+   small set of named templates (`parallax::detail::device_*`). The plugin keys on those
+   template *instantiations* — deterministic, and robust inside the generic lambda wrappers
+   real benchmark suites use (where AST call-site matching is not).
+2. **Codegen (our own C++ → SPIR-V backend).** For each funnel instantiation the plugin runs
+   Clang CodeGen on the user callable, lowers the LLVM IR to a SPIR-V compute kernel, and
+   embeds it in the binary. Heavy primitives (reduce/scan/sort/compaction) are our own
+   fixed SPIR-V skeletons.
+3. **Software unified memory.** A single host-mapped, GPU-addressable arena stages data;
+   pointer values are relocated in-shader (`gpu = dev_base + (host - host_base)`), so the
+   model is correct on both integrated (UMA) and discrete GPUs.
 
-## Features
+No source changes are required: the same ISO C++ that runs on the CPU offloads to the GPU,
+and anything the backend can't lower cleanly falls back to a correct CPU execution.
 
-### ✨ Automatic Allocator Injection (v1.0)
+## What works now
 
-The compiler automatically rewrites standard containers to use GPU-accessible memory:
+Everything below offloads to the GPU from **unmodified** `std::execution::par` code and is
+verified end-to-end on software Vulkan (lavapipe) in CI — a 49-gate integration probe plus
+the real [pSTL-Bench](https://github.com/parlab-tuwien/pSTL-Bench) suite, which runs to
+completion with **20 algorithm instances offloaded** to the GPU.
 
-**You write:**
-```cpp
-std::vector<float> data(1000);
-std::for_each(std::execution::par, data.begin(), data.end(),
-             [](float& x) { x *= 2.0f; });
-```
+### Offloading algorithms
 
-**Compiler generates:**
-```cpp
-std::vector<float, parallax::allocator<float>> data(1000);
-// ... GPU kernel code ...
-```
+| Family | Algorithms | Notes |
+|---|---|---|
+| **Map (in place)** | `for_each`, `fill`, `generate` | element-wise; `fill`/`generate` bind their captured value/generator |
+| **Map (in→out)** | `transform` | unary; **capturing** ops supported; input/output types may differ (e.g. `float`→`double`) |
+| **Fold** | `reduce`, `transform_reduce` | default `+`, or a **custom binary op** for `reduce` |
+| **Prefix scan** | `inclusive_scan`, `exclusive_scan` | multi-block, default `+` |
+| **Sort** | `sort` | bitonic, ascending (default `<`) |
+| **Predicate fold** | `count_if`, `all_of`, `any_of`, `none_of` | predicate → count on the GPU |
+| **Compaction** | `copy_if`, `remove_if`, `partition`, `unique` | flags → scan → scatter; returns the kept count / partition point |
 
-No source code changes required!
+**Element types:** 32- and 64-bit `float` and integer (`float`, `double`, `int`, `int64`).
 
-### Supported Operations
+### Callable codegen (the C++ → SPIR-V backend)
 
-**Compound Assignment Operators:**
-- `*=` (multiply-assign)
-- `+=` (add-assign)
-- `-=` (subtract-assign)
-- `/=` (divide-assign)
+Arbitrary user lambdas/functors compile directly to SPIR-V, including:
 
-**Binary Operators:**
-- `+`, `-`, `*`, `/`
-- Complex expressions: `x = x * 2.0f + 1.0f`
+- **Captures** — scalar, 8-byte (`double`/`int64`), and by-value POD **structs** (flattened)
+- **Control flow** — `if`/`else` and `for`/`while` loops (structured `OpSelectionMerge` /
+  `OpLoopMerge`); ternaries via `OpSelect`
+- **Helper calls** — free/member functions inlined into the kernel body
+- **Numeric casts** and `<cmath>` math (`sqrt`, `sin`, … → `GLSL.std.450`)
+- **Struct elements** — `for_each` over a container of a POD struct
+- **Pointer-chasing** — dereferencing a host pointer stored in the data (software UM)
 
-**Algorithms:**
-- `std::for_each` - Full support
-- `std::transform` - Full support
-- `std::reduce` - In progress
+Anything the backend can't lower is left on the CPU (correct ISO fallback), never
+mis-compiled.
+
+### Not yet offloaded
+
+- Custom **sort comparator** / custom **scan op** (default `<` / `+` only) → CPU
+- Algorithms without a GPU skeleton (search, merge, set operations, `min`/`max_element`,
+  `partial_sort`, `transform_{in,ex}clusive_scan`, …) → CPU backend
 
 ## Building
 
 ### Prerequisites
 
-- **LLVM/Clang:** 15+ (tested with 15, 17, 18)
+- **LLVM/Clang:** 21 (CI builds and verifies against LLVM 21; opaque pointers required)
 - **CMake:** 3.20+
 - **C++ Compiler:** C++20 support
+- **SPIR-V Tools** (`spirv-val`/`spirv-dis`) for validating emitted kernels
+- A Vulkan 1.2+ device to run (CI uses **lavapipe**, the software rasterizer)
 
 ### Build Instructions
 
@@ -72,20 +91,13 @@ make -j$(nproc)
 
 ## Usage
 
-### Basic Compilation
-
-```bash
-clang++ -std=c++20 \
-  -fplugin=/path/to/libparallax-clang-plugin.so \
-  -I /path/to/parallax-runtime/include \
-  -L /path/to/parallax-runtime/build \
-  -lparallax-runtime \
-  your-code.cpp -o your-program
-```
+The plugin is a Clang **ReplaceAction** (it rewrites the source in place: transparent
+routing + embedded SPIR-V), so it is driven with `-Xclang -plugin -Xclang parallax`, **not**
+`-fplugin`.
 
 ### Example
 
-**Input (your-code.cpp):**
+**Input (your-code.cpp) — stock ISO C++, no `parallax::` names:**
 ```cpp
 #include <vector>
 #include <algorithm>
@@ -94,25 +106,34 @@ clang++ -std=c++20 \
 int main() {
     std::vector<float> data(10000, 1.0f);
 
-    // Runs on GPU automatically!
+    // Offloads to the GPU; identical CPU semantics if no device is present.
     std::for_each(std::execution::par, data.begin(), data.end(),
-                 [](float& x) { x *= 2.0f; });
+                  [](float& x) { x = x * 2.0f + 1.0f; });
 
     return 0;
 }
 ```
 
-**Compilation:**
+**Transparent offload** (`PARALLAX_TRANSPARENT=1`) runs the plugin in two passes — pass 1
+routes `std::…(par, …)` to the `parallax::` funnels, pass 2 compiles the now-instantiated
+funnels and embeds the SPIR-V — then links against the runtime:
+
 ```bash
-clang++ -std=c++20 \
-  -fplugin=libparallax-clang-plugin.so \
-  -I ../parallax-runtime/include \
-  -L ../parallax-runtime/build \
-  -lparallax-runtime \
-  your-code.cpp -o program
+PLUGIN=build/src/plugin/libparallax-clang-plugin.so
+FLAGS="-std=c++20 -I ../parallax-runtime/include -include parallax/stdpar.hpp \
+  -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+
+PARALLAX_TRANSPARENT=1 clang++ $FLAGS -c your-code.cpp -o /dev/null   # pass 1: route
+PARALLAX_TRANSPARENT=1 clang++ $FLAGS -c your-code.cpp -o /dev/null   # pass 2: funnel + embed
+clang++ -std=c++20 -include parallax/stdpar.hpp your-code.cpp \
+  -I ../parallax-runtime/include -L ../parallax-runtime/out -lparallax-runtime -o program
 ```
 
-**Output:** Binary with embedded SPIR-V GPU kernels
+For whole projects, `scripts/parallax-cxx` is a drop-in `CMAKE_CXX_COMPILER` wrapper that
+performs the route → funnel → build passes per translation unit (this is how the pSTL-Bench
+harness builds the suite).
+
+**Output:** a native binary with the GPU kernels embedded as SPIR-V.
 
 ## Architecture
 
@@ -283,16 +304,15 @@ clang++ -std=c++20 -fplugin=build/src/plugin/libparallax-clang-plugin.so \
 cat test.cpp | grep "parallax::allocator"
 ```
 
-## Performance
+## Compilation model
 
-The compiler performs all transformations at compile-time:
-- **No runtime overhead** - All GPU code pre-generated
-- **No dynamic compilation** - SPIR-V embedded in binary
-- **Zero-cost abstraction** - Same performance as hand-written GPU code
-
-**Compilation time:**
-- Small files (<1000 lines): ~2-5 seconds
-- Large files (>5000 lines): ~10-30 seconds
+- **Kernels generated at compile time** — SPIR-V is embedded in the binary; there is no
+  runtime shader compilation or dynamic translation layer.
+- **Two-pass transparent build** — routing then funnel codegen (see Usage); a project
+  wrapper (`scripts/parallax-cxx`) hides this behind a normal compiler invocation.
+- **Correctness first** — every emitted kernel is `spirv-val`-clean, and coverage is gated
+  in CI on lavapipe. Performance tuning (subgroup reductions, spec-constant workgroup
+  sizing, discrete-GPU migration) is on the roadmap, not the current focus.
 
 ## Contributing
 
