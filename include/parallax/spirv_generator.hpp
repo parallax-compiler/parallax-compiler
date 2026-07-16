@@ -61,6 +61,13 @@ public:
     std::vector<uint32_t> generate_scan_kernel(ReduceElemType elem);
     std::vector<uint32_t> generate_scan_add_kernel(ReduceElemType elem);
 
+    // Phase 5: exclusive-scan finalize/shift. in@0 holds an INCLUSIVE scan; out@1 receives
+    // the exclusive scan: out[i] = init + (i>0 ? in[i-1] : 0), so out[0]=init and
+    // out[i]=init+sum(src[0..i-1]). push { uint count@0, elem init@8 } (16 bytes). Pairs
+    // with the two inclusive-scan kernels (run over a scratch copy of the input) to give a
+    // fully-on-GPU std::exclusive_scan (default '+').
+    std::vector<uint32_t> generate_exclusive_shift_kernel(ReduceElemType elem);
+
     // Phase 5: one global bitonic compare-exchange stage (ascending). data@0, push
     // { uint count, uint k, uint j }. The runtime (launch_sort) dispatches it over
     // the O(log^2 n) (k,j) schedule. No shared memory or barriers. Default '<' only.

@@ -2006,6 +2006,167 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
     return spirv;
 }
 
+// Phase 5: exclusive-scan finalize. in@0 = an INCLUSIVE scan; out@1 = the exclusive scan.
+// out[gid] = init + (gid>0 ? in[gid-1] : 0). Branchless (no shared mem/barriers): the
+// previous index and addend are picked with OpSelect, so out[0]=init and
+// out[i]=init+in[i-1]. push { uint count@0, elem init@8 }.
+std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElemType elem) {
+    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
+    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
+    const uint32_t stride = is_wide ? 8 : 4;
+
+    type_cache_.clear();
+    constant_cache_.clear();
+    pointer_type_cache_.clear();
+
+    SPIRVBuilder B;
+    B.set_section(SPIRVBuilder::Section::Header);
+    emit_header(B.get_header());
+
+    B.set_section(SPIRVBuilder::Section::Capabilities);
+    B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
+    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
+    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+
+    B.set_section(SPIRVBuilder::Section::Preamble);
+    B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
+
+    B.set_section(SPIRVBuilder::Section::Types);
+    uint32_t void_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVoid, {void_t});
+    uint32_t fn_t   = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeFunction, {fn_t, void_t});
+    uint32_t uint_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeInt, {uint_t, 32, 0});
+    uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
+
+    uint32_t elem_t = B.get_next_id();
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+
+    uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
+    uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
+
+    uint32_t rarray = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeRuntimeArray, {rarray, elem_t});
+    uint32_t sb_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {sb_struct, rarray});
+    uint32_t ptr_sb_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_sb_struct, 12, sb_struct});
+    uint32_t ptr_sb_elem = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_sb_elem, 12, elem_t});
+
+    std::unordered_map<uint32_t, uint32_t> uconst;
+    auto U = [&](uint32_t v) -> uint32_t {
+        auto it = uconst.find(v);
+        if (it != uconst.end()) return it->second;
+        SPIRVBuilder::Section prev = B.get_current_section();
+        B.set_section(SPIRVBuilder::Section::Types);
+        uint32_t id = B.get_next_id();
+        B.emit_op(SPIRVOp::OpConstant, {uint_t, id, v});
+        uconst[v] = id;
+        B.set_section(prev);
+        return id;
+    };
+    // elem-typed zero (0.0 / 0) — the addend for gid==0.
+    uint32_t elem_zero = B.get_next_id();
+    if (is_wide) B.emit_op(SPIRVOp::OpConstant, {elem_t, elem_zero, 0, 0});
+    else         B.emit_op(SPIRVOp::OpConstant, {elem_t, elem_zero, 0});
+
+    // push { uint count@0, elem init@8 }.
+    uint32_t pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {pc_struct, uint_t, elem_t});
+    uint32_t ptr_pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_struct, 9, pc_struct});
+    uint32_t ptr_pc_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_uint, 9, uint_t});
+    uint32_t ptr_pc_elem = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_elem, 9, elem_t});
+
+    uint32_t gid_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_in_v3, gid_var, 1});
+    uint32_t in_var   = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_sb_struct, in_var, 12});
+    uint32_t out_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_sb_struct, out_var, 12});
+    uint32_t pc_var   = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_pc_struct, pc_var, 9});
+
+    uint32_t main_id = B.get_next_id();
+
+    B.set_section(SPIRVBuilder::Section::Decorations);
+    B.emit_op(SPIRVOp::OpDecorate, {rarray, 6, stride});
+    B.emit_op(SPIRVOp::OpMemberDecorate, {sb_struct, 0, 35, 0});
+    B.emit_op(SPIRVOp::OpDecorate, {sb_struct, 2});
+    B.emit_op(SPIRVOp::OpDecorate, {in_var, 34, 0});
+    B.emit_op(SPIRVOp::OpDecorate, {in_var, 33, 0});
+    B.emit_op(SPIRVOp::OpDecorate, {out_var, 34, 0});
+    B.emit_op(SPIRVOp::OpDecorate, {out_var, 33, 1});
+    B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 0, 35, 0});   // count offset 0
+    B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 1, 35, 8});   // init  offset 8
+    B.emit_op(SPIRVOp::OpDecorate, {pc_struct, 2});
+    B.emit_op(SPIRVOp::OpDecorate, {gid_var, 11, 28});
+
+    B.set_section(SPIRVBuilder::Section::EntryPoints);
+    uint32_t iface[] = {gid_var, in_var, out_var, pc_var};
+    uint32_t ep_wc = 1 + 1 + 1 + 2 + static_cast<uint32_t>(sizeof(iface) / sizeof(iface[0]));
+    B.emit_word((ep_wc << 16) | static_cast<uint32_t>(SPIRVOp::OpEntryPoint));
+    B.emit_word(5);
+    B.emit_word(main_id);
+    B.emit_word(0x6e69616d);
+    B.emit_word(0x00000000);
+    for (uint32_t id : iface) B.emit_word(id);
+    B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17, 256, 1, 1});
+
+    B.set_section(SPIRVBuilder::Section::Code);
+    B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
+    B.emit_op(SPIRVOp::OpLabel, {B.get_next_id()});
+
+    uint32_t gvec = B.get_next_id();
+    B.emit_op(SPIRVOp::OpLoad, {v3uint, gvec, gid_var});
+    uint32_t gid = B.get_next_id();
+    B.emit_op(SPIRVOp::OpCompositeExtract, {uint_t, gid, gvec, 0});
+
+    uint32_t pc_count_ptr = B.get_next_id();
+    B.emit_op(SPIRVOp::OpAccessChain, {ptr_pc_uint, pc_count_ptr, pc_var, U(0)});
+    uint32_t count = B.get_next_id();
+    B.emit_op(SPIRVOp::OpLoad, {uint_t, count, pc_count_ptr});
+    uint32_t pc_init_ptr = B.get_next_id();
+    B.emit_op(SPIRVOp::OpAccessChain, {ptr_pc_elem, pc_init_ptr, pc_var, U(1)});
+    uint32_t init = B.get_next_id();
+    B.emit_op(SPIRVOp::OpLoad, {elem_t, init, pc_init_ptr});
+
+    // is_first = (gid == 0); prev_idx = is_first ? 0 : gid-1 (branchless, avoids underflow OOB).
+    uint32_t is_first = B.get_next_id();
+    B.emit_op(SPIRVOp::OpIEqual, {bool_t, is_first, gid, U(0)});
+    uint32_t gid_m1 = B.get_next_id();
+    B.emit_op(SPIRVOp::OpISub, {uint_t, gid_m1, gid, U(1)});
+    uint32_t prev_idx = B.get_next_id();
+    B.emit_op(SPIRVOp::OpSelect, {uint_t, prev_idx, is_first, U(0), gid_m1});
+    uint32_t p_prev = B.get_next_id();
+    B.emit_op(SPIRVOp::OpAccessChain, {ptr_sb_elem, p_prev, in_var, U(0), prev_idx});
+    uint32_t prevv = B.get_next_id();
+    B.emit_op(SPIRVOp::OpLoad, {elem_t, prevv, p_prev});
+    // addend = is_first ? 0 : in[gid-1]; val = init + addend.
+    uint32_t addend = B.get_next_id();
+    B.emit_op(SPIRVOp::OpSelect, {elem_t, addend, is_first, elem_zero, prevv});
+    uint32_t val = B.get_next_id();
+    B.emit_op(is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd, {elem_t, val, init, addend});
+
+    // if (gid < count) out[gid] = val;
+    uint32_t in_range = B.get_next_id();
+    B.emit_op(SPIRVOp::OpULessThan, {bool_t, in_range, gid, count});
+    uint32_t thenb = B.get_next_id();
+    uint32_t mb = B.get_next_id();
+    B.emit_op(SPIRVOp::OpSelectionMerge, {mb, 0});
+    B.emit_op(SPIRVOp::OpBranchConditional, {in_range, thenb, mb});
+    B.emit_op(SPIRVOp::OpLabel, {thenb});
+    {
+        uint32_t p_out = B.get_next_id();
+        B.emit_op(SPIRVOp::OpAccessChain, {ptr_sb_elem, p_out, out_var, U(0), gid});
+        B.emit_op(SPIRVOp::OpStore, {p_out, val});
+        B.emit_op(SPIRVOp::OpBranch, {mb});
+    }
+    B.emit_op(SPIRVOp::OpLabel, {mb});
+    B.emit_op(SPIRVOp::OpReturn, {});
+    B.emit_op(SPIRVOp::OpFunctionEnd, {});
+
+    B.get_header()[3] = B.get_next_id();
+
+    std::vector<uint32_t> spirv = B.get_spirv();
+    if (const char* dump_path = std::getenv("PARALLAX_DUMP_SPIRV_SHIFT")) {
+        std::ofstream out(dump_path, std::ios::binary);
+        if (out) out.write(reinterpret_cast<const char*>(spirv.data()),
+                           static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+    }
+    return spirv;
+}
+
 // Phase 5: one global bitonic compare-exchange stage (ascending). Each invocation i
 // pairs with i^j; only the lower index swaps. Direction is ascending when the k-bit
 // of i is 0. No shared memory or barriers — the runtime sequences the stages.

@@ -1075,7 +1075,8 @@ public:
     static bool isFixedKernelFunnel(const std::string& qn) {
         return qn == "parallax::detail::device_reduce" ||
                qn == "parallax::detail::device_sort" ||
-               qn == "parallax::detail::device_scan";
+               qn == "parallax::detail::device_scan" ||
+               qn == "parallax::detail::device_exclusive_scan";
     }
 
     static bool isTransformReduceFunnel(const std::string& qn) {
@@ -1157,6 +1158,26 @@ public:
                          << scan_spv.size() << "+" << add_spv.size() << " SPIR-V words; registering\n";
             rewriter_.emitFunnelRegistrar(key + ":scan", scan_spv);
             rewriter_.emitFunnelRegistrar(key + ":add", add_spv);
+            return;
+        }
+        if (qn == "parallax::detail::device_exclusive_scan") {
+            // exclusive scan = the inclusive-scan pair (:scan/:add) + a finalize/shift
+            // kernel (:shift). The funnel looks each up by appending the same suffix.
+            SPIRVGenerator gs; gs.set_target_vulkan_version(1, 2);
+            SPIRVGenerator ga; ga.set_target_vulkan_version(1, 2);
+            SPIRVGenerator gh; gh.set_target_vulkan_version(1, 2);
+            auto scan_spv  = gs.generate_scan_kernel(ek);
+            auto add_spv   = ga.generate_scan_add_kernel(ek);
+            auto shift_spv = gh.generate_exclusive_shift_kernel(ek);
+            if (scan_spv.empty() || add_spv.empty() || shift_spv.empty()) {
+                llvm::errs() << "[ParallaxFunnel] exclusive_scan kernel gen failed; host fallback\n"; return;
+            }
+            llvm::errs() << "[ParallaxFunnel] device_exclusive_scan<" << elemT.getAsString() << "> "
+                         << scan_spv.size() << "+" << add_spv.size() << "+" << shift_spv.size()
+                         << " SPIR-V words; registering\n";
+            rewriter_.emitFunnelRegistrar(key + ":scan", scan_spv);
+            rewriter_.emitFunnelRegistrar(key + ":add", add_spv);
+            rewriter_.emitFunnelRegistrar(key + ":shift", shift_spv);
             return;
         }
         const bool is_sort = qn == "parallax::detail::device_sort";
@@ -1343,6 +1364,9 @@ public:
             }
             if (isStdAlgoWithPolicy(call, "inclusive_scan", 4)) {  // inclusive_scan(par, first, last, d_first)
                 rewriter_.routeCallee(call, "parallax::inclusive_scan"); return true;
+            }
+            if (isStdAlgoWithPolicy(call, "exclusive_scan", 5)) {  // exclusive_scan(par, first, last, d_first, init)
+                rewriter_.routeCallee(call, "parallax::exclusive_scan"); return true;
             }
             if (isStdAlgoWithPolicy(call, "transform_reduce", 6)) {  // (par,f,l,init,binop,unop)
                 rewriter_.routeCallee(call, "parallax::transform_reduce"); return true;

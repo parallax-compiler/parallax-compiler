@@ -1071,6 +1071,51 @@ jobs:
             || { echo "::error::scan wrong result (block-offset add failed)"; exit 1; }
           echo "PASS: std::inclusive_scan(par) offloaded a multi-block GPU prefix scan"
 
+      - name: "GATE (exclusive_scan): fully-on-GPU exclusive prefix scan (inclusive + shift)"
+        run: |
+          # exclusive_scan(par,first,last,d_first,init) offloads via the device_exclusive_scan
+          # funnel: it inclusive-scans a scratch copy (:scan/:add) then a finalize kernel (:shift)
+          # writes out[i] = init + (i>0 ? incl[i-1] : 0). Fully on-GPU (no host shift). 1000 ones,
+          # init=0 -> out[i]=i, so out[0]=0, out[1]=1, out[256]=256, out[999]=999.
+          cat > probe_exscan.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(1000, 1.0f), o(1000, -1.0f);
+              std::exclusive_scan(std::execution::par, v.begin(), v.end(), o.begin(), 0.0f);
+              std::printf("exscan o[0]=%.1f o[1]=%.1f o[256]=%.1f o[999]=%.1f exp 0/1/256/999\n",
+                          o[0], o[1], o[256], o[999]);
+              bool ok = (o[0]==0.0f) && (o[1]==1.0f) && (o[256]==256.0f) && (o[999]==999.0f);
+              return ok ? 0 : 1;
+          }
+          EOF
+          cp probe_exscan.cpp work_exscan.cpp
+          FLAGS="-std=c++20 -I parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang $PLUGIN -Xclang -plugin -Xclang parallax"
+          PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS -c work_exscan.cpp -o /dev/null 2> ex1.log || true
+          echo "routed refs: $(grep -c 'parallax::exclusive_scan' work_exscan.cpp)"
+          grep -q 'parallax::exclusive_scan' work_exscan.cpp \
+            || { echo '::error::transparent routing did NOT rewrite std::exclusive_scan'; exit 1; }
+          PARALLAX_DUMP_SPIRV_SHIFT="$PWD/exshift.spv" PARALLAX_TRANSPARENT=1 "$CLANGXX" $FLAGS \
+            -c work_exscan.cpp -o /dev/null 2> ex2.log || true
+          echo "registrars: $(grep -c 'parallax_kernel_register' work_exscan.cpp)"
+          grep -aE 'device_exclusive_scan<' ex2.log | head -1
+          grep -q 'parallax_kernel_register' work_exscan.cpp \
+            || { echo '::error::exclusive_scan funnel did not register kernels'; exit 1; }
+          [ -f exshift.spv ] && { spirv-val exshift.spv || { echo "::error::shift SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 -include parallax/stdpar.hpp work_exscan.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime -o probe_exscan 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_exscan 2>&1)" || true
+          echo "$out" | grep -aE "exscan o\[|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::exclusive_scan was not offloaded"; exit 1; }
+          echo "$out" | grep -q "exscan o\[0\]=0.0 o\[1\]=1.0 o\[256\]=256.0 o\[999\]=999.0" \
+            || { echo "::error::exclusive_scan produced a wrong result"; exit 1; }
+          echo "PASS: std::exclusive_scan(par) offloaded fully on the GPU (inclusive + shift)"
+
       - name: "GATE (sort): std::sort(par) offloads a bitonic sort"
         run: |
           # Phase 5: the plugin detects std::sort, emits a bitonic compare-exchange
