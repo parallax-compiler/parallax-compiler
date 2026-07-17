@@ -66,6 +66,223 @@ jobs:
           cmake --build parallax-compiler/out -j
           echo "PLUGIN=$PWD/parallax-compiler/out/src/plugin/libparallax-clang-plugin.so" >> "$GITHUB_ENV"
 
+      - name: "PROBE (vulkan-caps): VK_EXT_external_memory_host + import smoke (Phase 0)"
+        continue-on-error: true
+        run: |
+          # Phase 0 spike for the whole-heap memory model: can lavapipe import an mmap'd
+          # anonymous host pool as a VkBuffer (VK_EXT_external_memory_host) with a BDA, and
+          # does the device observe host writes made AFTER the import (ongoing coherence)?
+          # Also records the limits the design consults (alignment, maxStorageBufferRange).
+          cat > caps.cpp <<'EOF'
+          #include <vulkan/vulkan.h>
+          #include <sys/mman.h>
+          #include <cstdio>
+          #include <cstring>
+          #include <cstdint>
+          #include <vector>
+          int main() {
+              VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+              app.apiVersion = VK_API_VERSION_1_2;
+              VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+              ici.pApplicationInfo = &app;
+              VkInstance inst;
+              if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) { printf("EXT_MEM_HOST=err-no-instance\n"); return 1; }
+              uint32_t n = 0; vkEnumeratePhysicalDevices(inst, &n, nullptr);
+              if (!n) { printf("EXT_MEM_HOST=err-no-device\n"); return 1; }
+              std::vector<VkPhysicalDevice> pds(n); vkEnumeratePhysicalDevices(inst, &n, pds.data());
+              VkPhysicalDevice pd = pds[0];
+              VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+              printf("DEVICE=%s\n", props.deviceName);
+              printf("MAXSSBO=%u MAXALLOC=%u\n", props.limits.maxStorageBufferRange, props.limits.maxMemoryAllocationCount);
+              uint32_t ec = 0; vkEnumerateDeviceExtensionProperties(pd, nullptr, &ec, nullptr);
+              std::vector<VkExtensionProperties> exts(ec);
+              vkEnumerateDeviceExtensionProperties(pd, nullptr, &ec, exts.data());
+              bool has_ext = false;
+              for (auto& e : exts) if (!strcmp(e.extensionName, "VK_EXT_external_memory_host")) has_ext = true;
+              VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+              VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+              p2.pNext = &emh;
+              vkGetPhysicalDeviceProperties2(pd, &p2);
+              printf("EXT_MEM_HOST=%s ALIGN=%llu\n", has_ext ? "yes" : "no",
+                     (unsigned long long)emh.minImportedHostPointerAlignment);
+              if (!has_ext) return 2;
+
+              VkPhysicalDeviceBufferDeviceAddressFeatures bdaq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+              f2.pNext = &bdaq;
+              vkGetPhysicalDeviceFeatures2(pd, &f2);
+              bool bda = bdaq.bufferDeviceAddress == VK_TRUE;
+              printf("BDA_FEATURE=%s\n", bda ? "yes" : "no");
+
+              uint32_t qfc = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfc, nullptr);
+              std::vector<VkQueueFamilyProperties> qf(qfc);
+              vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfc, qf.data());
+              uint32_t qi = 0;
+              for (uint32_t i = 0; i < qfc; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qi = i; break; }
+              float prio = 1.0f;
+              VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+              qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+              const char* dexts[] = {"VK_EXT_external_memory_host"};
+              VkPhysicalDeviceBufferDeviceAddressFeatures bdaf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+              bdaf.bufferDeviceAddress = VK_TRUE;
+              VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+              if (bda) dci.pNext = &bdaf;
+              dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+              dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = dexts;
+              VkDevice dev;
+              if (vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS) { printf("IMPORT=err-no-logical-device\n"); return 3; }
+
+              const size_t POOL = 64ull << 20;  // 64 MiB, multiple of any sane alignment
+              void* pool = mmap(nullptr, POOL, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+              if (pool == MAP_FAILED) { printf("IMPORT=err-mmap\n"); return 3; }
+              ((uint32_t*)pool)[0] = 0xC0FFEE01u;                              // pre-import write
+              *(uint32_t*)((char*)pool + POOL - 4096) = 0xC0FFEE02u;           // touch last page
+
+              auto pHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+                  vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+              VkMemoryHostPointerPropertiesEXT hpp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+              VkResult hr = pHostProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, pool, &hpp);
+              printf("HOSTPTR_PROPS=%d memoryTypeBits=0x%x\n", (int)hr, hpp.memoryTypeBits);
+              if (hr != VK_SUCCESS) { printf("IMPORT=err-hostptr-props\n"); return 3; }
+
+              VkExternalMemoryBufferCreateInfo embi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+              embi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+              VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+              bci.pNext = &embi;
+              bci.size = POOL;
+              bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+              bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+              VkBuffer buf;
+              if (vkCreateBuffer(dev, &bci, nullptr, &buf) != VK_SUCCESS) { printf("IMPORT=err-buffer\n"); return 3; }
+              VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
+              uint32_t bits = mr.memoryTypeBits & hpp.memoryTypeBits;
+              if (!bits) { printf("IMPORT=err-no-compatible-memtype\n"); return 3; }
+              uint32_t idx = 0; while (!(bits & (1u << idx))) ++idx;
+              VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+              imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+              imp.pHostPointer = pool;
+              VkMemoryAllocateFlagsInfo mafi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+              mafi.pNext = &imp;
+              mafi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+              VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+              mai.pNext = bda ? (void*)&mafi : (void*)&imp;
+              mai.allocationSize = POOL;
+              mai.memoryTypeIndex = idx;
+              VkDeviceMemory mem;
+              VkResult ar = vkAllocateMemory(dev, &mai, nullptr, &mem);
+              printf("IMPORT=%s (vr=%d)\n", ar == VK_SUCCESS ? "ok" : "FAIL", (int)ar);
+              if (ar != VK_SUCCESS) return 3;
+              vkBindBufferMemory(dev, buf, mem, 0);
+              if (bda) {
+                  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                  bai.buffer = buf;
+                  VkDeviceAddress addr = vkGetBufferDeviceAddress(dev, &bai);
+                  printf("BDA=0x%llx\n", (unsigned long long)addr);
+              }
+
+              // Post-import host write, then device-side copy-out: proves the device sees
+              // host stores made AFTER the import (the coherence the whole design rests on).
+              *(uint32_t*)((char*)pool + 4096) = 0xC0FFEE03u;
+              VkBufferCreateInfo rbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+              rbci.size = 8192; rbci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+              rbci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+              VkBuffer rb; vkCreateBuffer(dev, &rbci, nullptr, &rb);
+              VkMemoryRequirements rmr; vkGetBufferMemoryRequirements(dev, rb, &rmr);
+              VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+              uint32_t ridx = UINT32_MAX;
+              for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+                  if ((rmr.memoryTypeBits & (1u << i)) &&
+                      (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                      (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { ridx = i; break; }
+              VkMemoryAllocateInfo rmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+              rmai.allocationSize = rmr.size; rmai.memoryTypeIndex = ridx;
+              VkDeviceMemory rmem; vkAllocateMemory(dev, &rmai, nullptr, &rmem);
+              vkBindBufferMemory(dev, rb, rmem, 0);
+              VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
+              VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+              cpci.queueFamilyIndex = qi;
+              VkCommandPool cp; vkCreateCommandPool(dev, &cpci, nullptr, &cp);
+              VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+              cbai.commandPool = cp; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+              VkCommandBuffer cb; vkAllocateCommandBuffers(dev, &cbai, &cb);
+              VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+              vkBeginCommandBuffer(cb, &cbi);
+              VkBufferCopy regions[2] = {{0, 0, 8}, {4096, 8, 8}};
+              vkCmdCopyBuffer(cb, buf, rb, 2, regions);
+              vkEndCommandBuffer(cb);
+              VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+              si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+              vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+              vkQueueWaitIdle(q);
+              void* rp; vkMapMemory(dev, rmem, 0, 8192, 0, &rp);
+              uint32_t v0 = ((uint32_t*)rp)[0];
+              uint32_t v1 = ((uint32_t*)((char*)rp + 8))[0];
+              printf("READBACK pre-import=0x%x post-import=0x%x\n", v0, v1);
+              bool ok = (v0 == 0xC0FFEE01u) && (v1 == 0xC0FFEE03u);
+              printf("SMOKE=%s\n", ok ? "PASS" : "FAIL");
+              return ok ? 0 : 4;
+          }
+          EOF
+          "$CLANGXX" -std=c++17 caps.cpp -lvulkan -o caps
+          ./caps || echo "(probe exit=$? — informational for Phase 3 design selection)"
+
+      - name: "PROBE (vfs-overlay): -ivfsoverlay serves shadow content through original paths (Phase 0)"
+        continue-on-error: true
+        run: |
+          # Phase 1 spike: verify Clang's VFS overlay works with the EXACT plugin invocation
+          # shape (force-include + -Xclang plugin). A shadow copy of a header changes a
+          # #define; the overlaid compile must use the shadow value while the original file
+          # on disk stays byte-identical.
+          mkdir -p vfsprobe/shadow && cd vfsprobe
+          cat > vfshdr.h <<'EOF'
+          #pragma once
+          #define PLX_ADD 1.0f
+          EOF
+          cat > vfsmain.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          #include "vfshdr.h"
+          int main() {
+              std::vector<float> v(16, 1.0f);
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + PLX_ADD; });
+              std::printf("vfs result=%.1f\n", v[0]);
+              return 0;
+          }
+          EOF
+          sed 's/PLX_ADD 1.0f/PLX_ADD 3.0f/' vfshdr.h > shadow/vfshdr.h
+          HDR="$(realpath vfshdr.h)"; SHW="$(realpath shadow/vfshdr.h)"
+          cat > overlay.yaml <<EOF
+          {
+            "version": 0,
+            "use-external-names": true,
+            "roots": [
+              { "name": "$HDR", "type": "file", "external-contents": "$SHW" }
+            ]
+          }
+          EOF
+          BEFORE=$(sha256sum vfshdr.h | cut -d' ' -f1)
+          # Plugin invocation shape (routing off — this tests the overlay mechanism only).
+          cp vfsmain.cpp work_vfs.cpp
+          "$CLANGXX" -std=c++20 -I ../parallax-runtime/include -include parallax/stdpar.hpp \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -ivfsoverlay overlay.yaml -c work_vfs.cpp -o /dev/null 2> vfs_plugin.log || true
+          grep -q "Parallax Plugin V2 Loaded" vfs_plugin.log \
+            || { echo "::error::plugin did not load under -ivfsoverlay"; exit 1; }
+          # Final build through the overlay; binary must print the SHADOW value (1*2 + 3.0 = 5.0).
+          "$CLANGXX" -std=c++20 -O2 -ivfsoverlay overlay.yaml vfsmain.cpp -o vfsprobe_bin
+          out="$(./vfsprobe_bin)"
+          echo "$out"
+          echo "$out" | grep -q "vfs result=5.0" \
+            || { echo "::error::overlay content not used (expected 5.0 = 1*2+shadow 3.0)"; exit 1; }
+          AFTER=$(sha256sum vfshdr.h | cut -d' ' -f1)
+          [ "$BEFORE" = "$AFTER" ] || { echo "::error::original header was modified"; exit 1; }
+          echo "PASS: VFS overlay serves shadow content; original untouched; plugin loads under overlay"
+
       - name: Write probe program
         run: |
           cat > probe.cpp <<'EOF'
