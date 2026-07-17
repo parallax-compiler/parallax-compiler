@@ -2358,27 +2358,35 @@ jobs:
       - name: "GATE (idempotent-rerun): building twice back-to-back stays correct"
         run: |
           # Phase 1: since originals are never modified, a second identical build must be
-          # byte-for-byte reproducible — no duplicate registrars, no parallax::parallax::
-          # double-routing (the failure class the old in-place rewrite created on rebuild).
+          # reproducible — no duplicate registrars, no parallax::parallax:: double-routing
+          # (the failure class the old in-place rewrite created on rebuild). Uses the
+          # proven generic-wrapper shape (a header template), built twice.
           mkdir -p rerun && cd rerun
-          cat > rr.cpp <<'EOF'
-          #include <vector>
+          cat > rk.h <<'EOF'
+          #pragma once
           #include <algorithm>
           #include <execution>
+          template <class V>
+          void triple(V& v) {
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+          }
+          EOF
+          cat > rr.cpp <<'EOF'
+          #include <vector>
           #include <cstdio>
-          int main() { std::vector<float> v(64,1.0f);
-              std::for_each(std::execution::par, v.begin(), v.end(), [](float& x){ x = x*2.0f + 1.0f; });
+          #include "rk.h"
+          int main() { std::vector<float> v(64,1.0f); triple(v);
               std::printf("rr result=%.1f\n", v[0]); return v[0]==3.0f?0:1; }
           EOF
           export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/../parallax-runtime/include"
           WRAP=../parallax-compiler/scripts/parallax-cxx
           "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr1.o 2>/dev/null
           "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr2.o 2>/dev/null   # rebuild, same pristine source
-          nm rr2.o | grep -q "kernel_register" || { echo "::error::second build lost its registrar"; exit 1; }
-          # Registrar count identical across builds (no duplication).
           c1=$(nm rr1.o | grep -c "plx_funnel_.*_reg" || true)
           c2=$(nm rr2.o | grep -c "plx_funnel_.*_reg" || true)
           echo "registrar symbol counts: build1=$c1 build2=$c2"
+          [ "$c1" -ge 1 ] || { echo "::error::first build produced no registrar"; exit 1; }
           [ "$c1" = "$c2" ] || { echo "::error::registrar count changed across rebuilds ($c1 vs $c2) — double application"; exit 1; }
           "$CLANGXX" -std=c++20 -O2 rr2.o -L ../parallax-runtime/out -lparallax-runtime -o rr 2>&1 | tail -1
           export LD_LIBRARY_PATH="$PWD/../parallax-runtime/out:$LD_LIBRARY_PATH"
