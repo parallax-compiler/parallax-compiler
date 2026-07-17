@@ -2280,6 +2280,113 @@ jobs:
           echo "$o" | grep -q "count_if=500 all_of=1" || { echo "::error::count_if/all_of wrong result"; exit 1; }
           echo "PASS: count_if + all_of OFFLOADED (by-ref predicate-count + reduce funnel) + verified"
 
+      - name: "GATE (shadow-pristine): parallax-cxx never modifies source on disk"
+        run: |
+          # Phase 1: the wrapper rewrites into a per-TU shadow tree via a VFS overlay;
+          # the ORIGINAL .cpp and its included project header must be byte-identical
+          # before and after, yet the built binary must still offload + be correct.
+          mkdir -p shadowg && cd shadowg
+          cat > kern.h <<'EOF'
+          #pragma once
+          #include <algorithm>
+          #include <execution>
+          template <class V>
+          void scale(V& v) {
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+          }
+          EOF
+          cat > sp.cpp <<'EOF'
+          #include <vector>
+          #include <cstdio>
+          #include "kern.h"
+          int main() { std::vector<float> v(64,1.0f); scale(v);
+              std::printf("sp result=%.1f\n", v[0]); return v[0]==3.0f?0:1; }
+          EOF
+          H0=$(sha256sum kern.h | cut -d' ' -f1); S0=$(sha256sum sp.cpp | cut -d' ' -f1)
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" \
+                 PARALLAX_RT_INCLUDE="$PWD/../parallax-runtime/include" PARALLAX_CXX_DEBUG=1
+          WRAP=../parallax-compiler/scripts/parallax-cxx
+          "$WRAP" -std=c++20 -O2 -c sp.cpp -o sp.o 2> wrap.log || { echo "::error::wrapper compile failed"; cat wrap.log; exit 1; }
+          grep -aE "PASS1:|PASS2:|BUILD:" wrap.log | sed 's#-I [^ ]*##' | head
+          [ "$H0" = "$(sha256sum kern.h|cut -d' ' -f1)" ] || { echo "::error::header kern.h was MODIFIED on disk"; exit 1; }
+          [ "$S0" = "$(sha256sum sp.cpp|cut -d' ' -f1)" ] || { echo "::error::source sp.cpp was MODIFIED on disk"; exit 1; }
+          nm sp.o | grep -q "plx_funnel\|kernel_register" || { echo "::error::shadow-rewritten object has no registrar (routing/funnel lost through overlay)"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 sp.o -L ../parallax-runtime/out -lparallax-runtime -o sp 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/../parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./sp 2>&1)" || true
+          echo "$out" | grep -aE "sp result=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "Successfully loaded kernel" || { echo "::error::shadow-built binary did not offload"; exit 1; }
+          echo "$out" | grep -q "sp result=3.0" || { echo "::error::shadow-built binary wrong result"; exit 1; }
+          echo "PASS: parallax-cxx offloaded via shadow tree; original source + header byte-identical on disk"
+
+      - name: "GATE (parallel-shared-header): concurrent wrapper compiles of a shared header (no -j1)"
+        run: |
+          # Phase 1: two TUs including the SAME header (both with a par call) compiled
+          # CONCURRENTLY through the wrapper. In-place rewriting would clobber the shared
+          # header mid-build; per-TU shadow trees make this safe. Both objects must carry
+          # a registrar and the header must stay pristine.
+          mkdir -p parg && cd parg
+          cat > shared.h <<'EOF'
+          #pragma once
+          #include <algorithm>
+          #include <execution>
+          template <class V>
+          void bump(V& v) {
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+          }
+          EOF
+          for u in a b; do
+          cat > tu_$u.cpp <<EOF
+          #include <vector>
+          #include "shared.h"
+          void run_$u() { std::vector<float> v(32,1.0f); bump(v); }
+          EOF
+          done
+          H0=$(sha256sum shared.h | cut -d' ' -f1)
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/../parallax-runtime/include"
+          WRAP=../parallax-compiler/scripts/parallax-cxx
+          "$WRAP" -std=c++20 -O2 -c tu_a.cpp -o tu_a.o 2>/dev/null &
+          "$WRAP" -std=c++20 -O2 -c tu_b.cpp -o tu_b.o 2>/dev/null &
+          wait
+          [ "$H0" = "$(sha256sum shared.h|cut -d' ' -f1)" ] || { echo "::error::shared.h was clobbered by a concurrent compile"; exit 1; }
+          nm tu_a.o | grep -q "plx_funnel\|kernel_register" || { echo "::error::tu_a lost its registrar (shared-header race)"; exit 1; }
+          nm tu_b.o | grep -q "plx_funnel\|kernel_register" || { echo "::error::tu_b lost its registrar (shared-header race)"; exit 1; }
+          echo "PASS: two concurrent wrapper compiles of a shared header both offloaded; header pristine (no -j1 needed)"
+
+      - name: "GATE (idempotent-rerun): building twice back-to-back stays correct"
+        run: |
+          # Phase 1: since originals are never modified, a second identical build must be
+          # byte-for-byte reproducible — no duplicate registrars, no parallax::parallax::
+          # double-routing (the failure class the old in-place rewrite created on rebuild).
+          mkdir -p rerun && cd rerun
+          cat > rr.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() { std::vector<float> v(64,1.0f);
+              std::for_each(std::execution::par, v.begin(), v.end(), [](float& x){ x = x*2.0f + 1.0f; });
+              std::printf("rr result=%.1f\n", v[0]); return v[0]==3.0f?0:1; }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/../parallax-runtime/include"
+          WRAP=../parallax-compiler/scripts/parallax-cxx
+          "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr1.o 2>/dev/null
+          "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr2.o 2>/dev/null   # rebuild, same pristine source
+          nm rr2.o | grep -q "kernel_register" || { echo "::error::second build lost its registrar"; exit 1; }
+          # Registrar count identical across builds (no duplication).
+          c1=$(nm rr1.o | grep -c "plx_funnel_.*_reg" || true)
+          c2=$(nm rr2.o | grep -c "plx_funnel_.*_reg" || true)
+          echo "registrar symbol counts: build1=$c1 build2=$c2"
+          [ "$c1" = "$c2" ] || { echo "::error::registrar count changed across rebuilds ($c1 vs $c2) — double application"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 rr2.o -L ../parallax-runtime/out -lparallax-runtime -o rr 2>&1 | tail -1
+          export LD_LIBRARY_PATH="$PWD/../parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./rr 2>&1)" || true
+          echo "$out" | grep -q "rr result=3.0" || { echo "::error::rebuilt binary wrong result"; exit 1; }
+          echo "$out" | grep -q "Successfully loaded kernel" || { echo "::error::rebuilt binary did not offload"; exit 1; }
+          echo "PASS: back-to-back rebuild is stable (identical registrar count, correct offload)"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the

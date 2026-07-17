@@ -11,6 +11,8 @@
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/Expr.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <sstream>
 #include <iomanip>
 #include <set>
@@ -174,10 +176,52 @@ public:
     }
 
     /**
-     * Write rewritten files
+     * Write rewritten files.
+     *
+     * Shadow mode (PARALLAX_SHADOW_DIR set): the ORIGINAL sources are never touched.
+     * Every changed buffer — the main TU and any edited non-system header — is written
+     * to $PARALLAX_SHADOW_DIR/<original-absolute-path>. The wrapper then builds a Clang
+     * VFS overlay mapping originals -> shadow copies, so later passes and the final
+     * compile see the rewritten content through the original paths (include resolution,
+     * __FILE__, and diagnostics are untouched). This removes the in-place-rewrite
+     * hazards: shared-header clobbering under parallel builds and re-run corruption.
+     *
+     * Legacy mode (env unset): overwrite in place, as before.
      */
     bool writeRewrittenFiles() {
-        return !rewriter_.overwriteChangedFiles();
+        const char* shadow = std::getenv("PARALLAX_SHADOW_DIR");
+        if (!shadow || !*shadow)
+            return !rewriter_.overwriteChangedFiles();
+
+        bool ok = true;
+        for (auto it = rewriter_.buffer_begin(), e = rewriter_.buffer_end(); it != e; ++it) {
+            clang::FileID fid = it->first;
+            auto ref = SM_.getFileEntryRefForID(fid);
+            if (!ref) continue;  // built-ins / virtual buffers
+            // Prefer the resolved real path so the overlay key matches what the driver
+            // opens; fall back to the spelled name made absolute.
+            llvm::SmallString<256> abs;
+            llvm::StringRef real = ref->getFileEntry().tryGetRealPathName();
+            if (!real.empty()) abs = real;
+            else { abs = ref->getName(); llvm::sys::fs::make_absolute(abs); }
+            llvm::sys::path::remove_dots(abs, /*remove_dot_dot=*/true);
+
+            llvm::SmallString<512> dest(shadow);
+            dest += abs;  // abs starts with '/' -> $SHADOW/<abs-path>
+            if (llvm::sys::fs::create_directories(llvm::sys::path::parent_path(dest))) {
+                llvm::errs() << "[Parallax] shadow: cannot create dir for " << dest << "\n";
+                ok = false; continue;
+            }
+            std::error_code ec;
+            llvm::raw_fd_ostream os(dest, ec, llvm::sys::fs::OF_None);
+            if (ec) {
+                llvm::errs() << "[Parallax] shadow: cannot write " << dest << ": "
+                             << ec.message() << "\n";
+                ok = false; continue;
+            }
+            it->second.write(os);
+        }
+        return ok;
     }
 
     /**

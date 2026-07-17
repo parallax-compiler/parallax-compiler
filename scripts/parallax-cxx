@@ -7,25 +7,30 @@
 # WHAT IT DOES
 #   CMake invokes this exactly like it would invoke clang++. For a *compile of a
 #   single C++ translation unit into an object* we transparently run the Parallax
-#   plugin's two rewrite passes over the source BEFORE the real compile:
-#     PASS 1 (route)  : PARALLAX_TRANSPARENT=1 clang++ <plugin> ... -c SRC -o /dev/null
-#                       -> rewrites SRC (and any headers it #includes) IN PLACE,
-#                          turning std::for_each(par,...)/transform/reduce/... into
-#                          parallax::for_each/... .
-#     PASS 2 (funnel) : the SAME command again on the now-rewritten SRC
-#                       -> appends per-instantiation SPIR-V kernel registrars to SRC.
+#   plugin's two rewrite passes over the source BEFORE the real compile. The
+#   ORIGINAL sources are NEVER modified: the plugin writes rewritten content to a
+#   per-TU SHADOW tree (PARALLAX_SHADOW_DIR) mirroring absolute paths, and the passes
+#   + final build see it through a Clang VFS overlay (-ivfsoverlay) that maps each
+#   original path to its shadow copy.
+#     PASS 1 (route)  : PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$S clang++ <plugin> …
+#                       -> writes routed copies of SRC (+ any edited headers) into $S,
+#                          turning std::for_each(par,…)/transform/reduce/… into
+#                          parallax::for_each/… . Originals untouched.
+#     (build overlay.yaml from $S)
+#     PASS 2 (funnel) : SAME command + -ivfsoverlay overlay.yaml
+#                       -> parses the routed content through original paths (so
+#                          device_invoke<T,F> is instantiated) and writes SRC's shadow
+#                          copy back with per-instantiation SPIR-V kernel registrars.
+#     (regenerate overlay.yaml from $S)
 #     BUILD (real)    : clang++ <ALL original args, NO plugin> -include parallax/stdpar.hpp
-#                       -> compiles the rewritten SRC into the requested object.
+#                       -ivfsoverlay overlay.yaml
+#                       -> compiles the shadow (rewritten) SRC into the requested object.
 #   Any non-compile invocation (link, -E/-M preprocess, --version probe, no source)
 #   is passed straight through to the real clang++ with its args UNCHANGED.
 #
-# !!! CONCURRENCY CAVEAT !!!
-#   PASS 1 rewrites *shared headers in place*. Two compiles running at once can
-#   observe / clobber a half-rewritten header, corrupting the build. THE BUILD
-#   MUST BE SERIALIZED: configure with Unix Makefiles or Ninja and build with
-#   `cmake --build <dir> --parallel 1` (a.k.a. -j1). Do NOT run a parallel build.
-#   (pSTL-Bench compiles essentially one big TU — src/main.cpp — but google/benchmark
-#   and any future multi-TU layout would race, hence -j1 is mandatory.)
+#   Because each TU rewrites its OWN shadow copy of any shared header and never touches
+#   the tree on disk, parallel builds are safe (no `-j1` requirement) and re-running a
+#   build cannot corrupt sources (every invocation starts from pristine originals).
 #
 # REQUIRED ENV
 #   PARALLAX_PLUGIN      abs path to libparallax-clang-plugin.so   (the CI $PLUGIN)
@@ -33,6 +38,7 @@
 # OPTIONAL ENV
 #   CLANGXX              real clang++ (default /usr/lib/llvm-21/bin/clang++)
 #   PARALLAX_CXX_DEBUG   if set, echo the sub-commands to stderr for tracing
+#   PARALLAX_KEEP_SHADOW if set, keep the per-TU shadow tree (debugging) instead of rm
 ###############################################################################
 set -u
 
@@ -136,29 +142,63 @@ if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
     # Plugin driver flags (identical to the CI probe invocation).
     PLG=( -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax )
 
-    # PASS 1 (route) and PASS 2 (funnel): same command twice. Both compile to
-    # /dev/null; PARALLAX_TRANSPARENT=1 enables the std::par -> parallax:: rewrite.
-    # We feed the *same* parse-affecting flags the real compile got, plus FORCE,
-    # so the plugin sees exactly the declarations the object build will see.
-    #
-    # NOTE: FORCE already contains `-include parallax/stdpar.hpp`; if the original
-    # args ALSO force-include it (unlikely from CMake) the duplicate is harmless.
-    PASS_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -c "$SRC" -o /dev/null )
+    # Per-TU shadow tree: the plugin writes rewritten copies here (mirroring absolute
+    # paths); originals on disk are never touched. Cleaned up on exit unless kept.
+    SHADOW="$(mktemp -d "${TMPDIR:-/tmp}/plx-shadow.XXXXXX")"
+    OVERLAY="$SHADOW.overlay.yaml"
+    cleanup() { [[ -n "${PARALLAX_KEEP_SHADOW:-}" ]] || rm -rf "$SHADOW" "$OVERLAY"; }
+    trap cleanup EXIT
 
-    dbg "PASS1: PARALLAX_TRANSPARENT=1 ${PASS_CMD[*]}"
-    PARALLAX_TRANSPARENT=1 "${PASS_CMD[@]}" 2> >(cat >&2) || \
+    # Build a Clang VFS overlay YAML mapping each original absolute path (the shadow
+    # file's path with the $SHADOW prefix stripped) to its shadow copy. Emits nothing
+    # useful when the tree is empty (caller checks). JSON-escape \ and " for safety.
+    gen_overlay() {
+        local first=1
+        printf '{\n  "version": 0,\n  "use-external-names": true,\n  "roots": [\n'
+        while IFS= read -r f; do
+            local orig="${f#"$SHADOW"}"
+            local eo="${orig//\\/\\\\}"; eo="${eo//\"/\\\"}"
+            local ef="${f//\\/\\\\}";   ef="${ef//\"/\\\"}"
+            (( first )) || printf ',\n'
+            first=0
+            printf '    { "name": "%s", "type": "file", "external-contents": "%s" }' "$eo" "$ef"
+        done < <(find "$SHADOW" -type f 2>/dev/null)
+        printf '\n  ]\n}\n'
+    }
+
+    # PASS 1 (route): write routed copies of SRC (+ any edited headers) into $SHADOW.
+    # PARALLAX_TRANSPARENT=1 enables std::par -> parallax::; PARALLAX_SHADOW_DIR makes
+    # the plugin emit to the shadow tree instead of overwriting in place.
+    PASS_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -c "$SRC" -o /dev/null )
+    dbg "PASS1: PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS_CMD[*]}"
+    PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS_CMD[@]}" 2> >(cat >&2) || \
         dbg "PASS1 returned non-zero (route pass errors are often benign; continuing)"
 
-    dbg "PASS2: PARALLAX_TRANSPARENT=1 ${PASS_CMD[*]}"
-    PARALLAX_TRANSPARENT=1 "${PASS_CMD[@]}" 2> >(cat >&2) || \
-        dbg "PASS2 returned non-zero (funnel pass errors are often benign; continuing)"
+    if [[ -n "$(find "$SHADOW" -type f 2>/dev/null | head -1)" ]]; then
+        gen_overlay > "$OVERLAY"
+        # PASS 2 (funnel): parse the routed content through original paths (overlay), so
+        # device_invoke<T,F> is instantiated; write SRC's shadow copy back with the SPIR-V
+        # registrars appended. Headers stay routed (idempotent) and persist in the tree.
+        PASS2_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -ivfsoverlay "$OVERLAY" -c "$SRC" -o /dev/null )
+        dbg "PASS2: PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS2_CMD[*]}"
+        PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS2_CMD[@]}" 2> >(cat >&2) || \
+            dbg "PASS2 returned non-zero (funnel pass errors are often benign; continuing)"
+        gen_overlay > "$OVERLAY"   # PASS 2 may have added SRC's registrar copy
+        OVERLAY_ARGS=( -ivfsoverlay "$OVERLAY" )
+    else
+        # Nothing was rewritten (no par calls) — compile the pristine original.
+        dbg "no shadow output; compiling original unchanged"
+        OVERLAY_ARGS=()
+    fi
 
-    # REAL COMPILE: every original arg, UNTOUCHED, NO plugin, but with the runtime
-    # include dir + the stdpar force-include so parallax:: names + the arena hooks
-    # resolve. The rewritten SRC is what actually gets compiled here.
-    REAL_CMD=( "$REAL_CXX" "${FORCE[@]}" "${ORIG_ARGS[@]}" )
+    # REAL COMPILE: every original arg, UNTOUCHED, NO plugin, plus the runtime include +
+    # stdpar force-include (so parallax:: names + arena hooks resolve) and the overlay
+    # (so the rewritten shadow SRC/headers are what actually get compiled).
+    REAL_CMD=( "$REAL_CXX" "${FORCE[@]}" "${OVERLAY_ARGS[@]}" "${ORIG_ARGS[@]}" )
     dbg "BUILD: ${REAL_CMD[*]}"
-    exec "${REAL_CMD[@]}"
+    # Not exec: run so the EXIT trap can clean up the shadow tree, then propagate status.
+    "${REAL_CMD[@]}"
+    exit $?
 fi
 
 # --- passthrough (link / preprocess / probe / no-source / missing env) ---------
