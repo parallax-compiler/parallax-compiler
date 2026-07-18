@@ -2383,11 +2383,16 @@ jobs:
           WRAP=../parallax-compiler/scripts/parallax-cxx
           "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr1.o 2>/dev/null
           "$WRAP" -std=c++20 -O2 -c rr.cpp -o rr2.o 2>/dev/null   # rebuild, same pristine source
-          c1=$(nm rr1.o | grep -c "plx_funnel_.*_reg" || true)
-          c2=$(nm rr2.o | grep -c "plx_funnel_.*_reg" || true)
-          echo "registrar symbol counts: build1=$c1 build2=$c2"
-          [ "$c1" -ge 1 ] || { echo "::error::first build produced no registrar"; exit 1; }
-          [ "$c1" = "$c2" ] || { echo "::error::registrar count changed across rebuilds ($c1 vs $c2) — double application"; exit 1; }
+          # The registrar's static-init call to the extern-C parallax_kernel_register is the
+          # reliable (unmangled) marker that a kernel was funneled in. Demangled funnel-array
+          # count catches double application (a re-run appending a second registrar).
+          for o in rr1.o rr2.o; do
+            nm "$o" | grep -q "parallax_kernel_register" || { echo "::error::$o has no registrar (funnel lost)"; exit 1; }
+          done
+          c1=$(nm -C rr1.o 2>/dev/null | grep -c "plx_funnel" || true)
+          c2=$(nm -C rr2.o 2>/dev/null | grep -c "plx_funnel" || true)
+          echo "demangled funnel-symbol counts: build1=$c1 build2=$c2"
+          [ "$c1" = "$c2" ] || { echo "::error::funnel symbol count changed across rebuilds ($c1 vs $c2) — double application"; exit 1; }
           "$CLANGXX" -std=c++20 -O2 rr2.o -L ../parallax-runtime/out -lparallax-runtime -o rr 2>&1 | tail -1
           export LD_LIBRARY_PATH="$PWD/../parallax-runtime/out:$LD_LIBRARY_PATH"
           out="$(PARALLAX_DEBUG=1 ./rr 2>&1)" || true
