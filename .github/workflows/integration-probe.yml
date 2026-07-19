@@ -2400,6 +2400,137 @@ jobs:
           echo "$out" | grep -q "Successfully loaded kernel" || { echo "::error::rebuilt binary did not offload"; exit 1; }
           echo "PASS: back-to-back rebuild is stable (identical registrar count, correct offload)"
 
+      - name: "GATE (heap-capture): link-time capture routes the whole heap into the pool"
+        run: |
+          # Phase 2: linking libparallax-heap.a into the program makes its strong operator
+          # new / malloc overrides route EVERY allocation into the heap pool — a global
+          # vector built during static init (before main/Vulkan), a raw malloc, and a
+          # posix_memalign must all report parallax_heap_contains(), and the program must
+          # still offload correctly (captured storage stages today; Phase 3 makes it
+          # zero-copy). This is the nvc++ "any heap pointer is device memory" foundation.
+          cat > probe_heap.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdlib>
+          #include <cstdint>
+          #include <cstdio>
+          extern "C" int parallax_heap_contains(const void*);
+          std::vector<float> g_v(64, 1.0f);   // allocated during static init, pre-main
+          int main() {
+              void* m = std::malloc(4096);
+              void* pm = nullptr;
+              if (posix_memalign(&pm, 256, 8192) != 0) pm = nullptr;
+              int gc = parallax_heap_contains(g_v.data());
+              int mc = parallax_heap_contains(m);
+              int pc = pm ? parallax_heap_contains(pm) : 0;
+              int pa = pm ? (((uintptr_t)pm % 256) == 0) : 0;
+              std::printf("heap: gvec=%d malloc=%d pmemalign=%d aligned=%d\n", gc, mc, pc, pa);
+              std::for_each(std::execution::par, g_v.begin(), g_v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("heap result=%.1f\n", g_v[0]);
+              std::free(m); std::free(pm);
+              return (gc && mc && pc && pa && g_v[0] == 3.0f) ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          WRAP=parallax-compiler/scripts/parallax-cxx
+          "$WRAP" -std=c++20 -O2 -c probe_heap.cpp -o probe_heap.o 2>/dev/null
+          # Link the capture archive BEFORE the runtime + implicit libs so its strong
+          # operator new/malloc are pulled in and override the (weak) libstdc++/glibc ones.
+          "$CLANGXX" -std=c++20 -O2 probe_heap.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_heap 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_heap 2>&1)" || true
+          echo "$out" | grep -aE "heap:|heap result=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "heap: gvec=1 malloc=1 pmemalign=1 aligned=1" \
+            || { echo "::error::link-time capture failed (heap allocations not in the pool)"; exit 1; }
+          echo "$out" | grep -q "heap result=3.0" || { echo "::error::captured-heap offload wrong result"; exit 1; }
+          echo "PASS: link-time capture put the whole heap (global vector, malloc, posix_memalign) in the pool; offload correct"
+
+      - name: "GATE (heap-stress): allocator survives concurrent random alloc/free/realloc"
+        run: |
+          # Phase 2: hammer the pool from 4 threads with checksum-verified random
+          # alloc/free/realloc, PARALLAX_HEAP_CHECK on, then confirm invariants hold.
+          cat > probe_stress.cpp <<'EOF'
+          #include <parallax/heap_pool.hpp>
+          #include <cstdint>
+          #include <cstring>
+          #include <cstdio>
+          #include <vector>
+          #include <thread>
+          #include <random>
+          #include <atomic>
+          static std::atomic<long> fails{0};
+          static void work(int id) {
+              std::mt19937 rng(id * 7919 + 1);
+              struct A { void* p; size_t n; uint8_t s; };
+              std::vector<A> live;
+              for (int i = 0; i < 60000; ++i) {
+                  unsigned op = rng() % 3;
+                  if ((op == 1 || op == 2) && live.size() > 20) {
+                      size_t k = rng() % live.size(); A a = live[k];
+                      for (size_t j = 0; j < a.n; ++j) if (((uint8_t*)a.p)[j] != a.s) { ++fails; break; }
+                      if (op == 1) { px_pool_free(a.p); live[k] = live.back(); live.pop_back(); }
+                      else { size_t nn = 1 + (rng() % 8192); void* np = px_pool_realloc(a.p, nn);
+                             if (np) { size_t keep = a.n < nn ? a.n : nn;
+                                 for (size_t j = 0; j < keep; ++j) if (((uint8_t*)np)[j] != a.s) { ++fails; break; }
+                                 std::memset(np, a.s, nn); live[k] = {np, nn, a.s}; } }
+                  } else {
+                      size_t n = 1 + (rng() % 4096); uint8_t s = (uint8_t)((id << 4) ^ (rng() & 0xF));
+                      void* p = px_pool_alloc(n, 1u << (rng() % 5));
+                      if (p) { std::memset(p, s, n); live.push_back({p, n, s}); }
+                  }
+              }
+              for (A& a : live) { for (size_t j = 0; j < a.n; ++j) if (((uint8_t*)a.p)[j] != a.s) { ++fails; break; } px_pool_free(a.p); }
+          }
+          int main() {
+              std::vector<std::thread> t;
+              for (int i = 0; i < 4; ++i) t.emplace_back(work, i);
+              for (auto& x : t) x.join();
+              int ok = px_pool_check();
+              std::printf("stress fails=%ld check=%d\n", fails.load(), ok);
+              return (fails.load() == 0 && ok) ? 0 : 1;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -O2 -pthread -I parallax-runtime/include probe_stress.cpp \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_stress 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_HEAP_POOL=512 PARALLAX_HEAP_CHECK=1 ./probe_stress 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "stress fails=0 check=1" || { echo "::error::allocator corruption under concurrency"; exit 1; }
+          echo "PASS: heap pool survived 4-thread checksum-verified stress with invariants intact"
+
+      - name: "GATE (foreign-free): free() of a non-pool pointer routes to the system heap"
+        run: |
+          # Phase 2: a pointer the pool did NOT hand out (allocated straight from glibc, as a
+          # prebuilt .so or the pre-pool bootstrap would) must be freed via __libc_free, not
+          # mis-treated as a pool block. Must not crash.
+          cat > probe_foreign.cpp <<'EOF'
+          #include <cstdio>
+          #include <cstdlib>
+          extern "C" { void* __libc_malloc(size_t); int parallax_heap_contains(const void*); }
+          int main() {
+              void* f = __libc_malloc(4096);           // foreign: bypasses our override
+              std::printf("foreign contains=%d\n", parallax_heap_contains(f));
+              std::free(f);                            // our free() must route to __libc_free
+              void* p = std::malloc(4096);             // ours: in the pool
+              std::printf("pool contains=%d\n", parallax_heap_contains(p));
+              std::free(p);
+              std::printf("foreign-free OK\n");
+              return 0;
+          }
+          EOF
+          "$CLANGXX" -std=c++20 -O2 probe_foreign.cpp \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_foreign 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_foreign 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q "foreign contains=0" || { echo "::error::foreign pointer wrongly reported in-pool"; exit 1; }
+          echo "$out" | grep -q "pool contains=1" || { echo "::error::pool malloc not captured"; exit 1; }
+          echo "$out" | grep -q "foreign-free OK" || { echo "::error::crash freeing a foreign pointer"; exit 1; }
+          echo "PASS: foreign pointers route to the system allocator; pool pointers stay in the pool"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
