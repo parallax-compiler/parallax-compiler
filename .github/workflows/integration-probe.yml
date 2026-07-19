@@ -2635,6 +2635,50 @@ jobs:
           echo "$out" | grep -q "legacy result=3.0" || { echo "::error::legacy-arena offload wrong result"; exit 1; }
           echo "PASS: forced-legacy arena path stays correct (no pool import)"
 
+      - name: "GATE (funnel zero-copy): pool-resident data offloads with NO staging copy"
+        run: |
+          # Phase 4: a captured (pool-resident) std::vector goes through the funnel's
+          # zero-copy fast path — the launcher binds it directly and the kernel writes IN
+          # PLACE, so parallax_arena_alloc (the staging marker) is NEVER called. A stack
+          # std::array is NOT pool-resident, so it still stages (marker present). Both correct.
+          cat > probe_zc4.cpp <<'EOF'
+          #include <vector>
+          #include <array>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          const auto for_each_std = [](auto&& pol, auto b, auto e, auto&& f) {
+              std::for_each(pol, b, e, f);
+          };
+          int main() {
+              std::vector<float> heap(4096, 1.0f);     // captured -> pool-resident
+              for_each_std(std::execution::par, heap.begin(), heap.end(),
+                           [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("zc heap=%.1f\n", heap[0]);
+              static std::array<float, 4096> stk;      // stack/static -> NOT pool-resident
+              stk.fill(1.0f);
+              for_each_std(std::execution::par, stk.begin(), stk.end(),
+                           [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("zc stk=%.1f\n", stk[0]);
+              return (heap[0] == 3.0f && stk[0] == 3.0f) ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_zc4.cpp -o probe_zc4.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_zc4.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_zc4 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_HEAP_POOL=1024 PARALLAX_DEBUG=1 ./probe_zc4 2>&1)" || true
+          echo "$out" | grep -aE "zc heap=|zc stk=|Pool-backed: imported|Successfully loaded kernel|parallax_arena_alloc. staging" | head
+          echo "$out" | grep -q "Pool-backed: imported" || { echo "::error::pool not imported"; exit 1; }
+          echo "$out" | grep -q "zc heap=3.0" || { echo "::error::zero-copy heap for_each wrong result"; exit 1; }
+          echo "$out" | grep -q "zc stk=3.0"  || { echo "::error::staged stack for_each wrong result"; exit 1; }
+          # Exactly ONE staging alloc — for the stack array; the heap vector was zero-copy.
+          nstage=$(echo "$out" | grep -c "parallax_arena_alloc. staging" || true)
+          echo "staging allocations observed: $nstage (expect 1 — only the stack array stages)"
+          [ "$nstage" = "1" ] || { echo "::error::expected exactly 1 staging alloc (heap should be zero-copy), got $nstage"; exit 1; }
+          echo "PASS: pool-resident data offloaded zero-copy (no staging); non-pool data staged"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
