@@ -231,6 +231,12 @@ public:
      * time under the key the runtime funnel computes identically (__PRETTY_FUNCTION__).
      */
     void emitFunnelRegistrar(const std::string& key, const std::vector<uint32_t>& spirv) {
+        // Route-only pass (wrapper PASS 1): rewrite std::->parallax:: callees but do NOT
+        // append kernel registrars. This keeps registration to the single funnel pass
+        // (PASS 2), so a source that already calls parallax:: (device_invoke instantiated
+        // in BOTH passes) doesn't get a duplicate registrar / redefinition.
+        static const bool route_only = std::getenv("PARALLAX_ROUTE_ONLY") != nullptr;
+        if (route_only) return;
         int n = funnel_counter_++;
         std::string arr = "__plx_funnel_" + std::to_string(n);
         std::string esc;

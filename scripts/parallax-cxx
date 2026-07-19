@@ -152,9 +152,18 @@ if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
     # Build a Clang VFS overlay YAML mapping each original absolute path (the shadow
     # file's path with the $SHADOW prefix stripped) to its shadow copy. Emits nothing
     # useful when the tree is empty (caller checks). JSON-escape \ and " for safety.
+    #
+    # use-external-names MUST be false: the compiler then reports the ORIGINAL (virtual)
+    # path as each file's identity while still reading the shadow content. This keeps
+    # __FILE__ / __PRETTY_FUNCTION__ pointing at the original path — critical because the
+    # funnel key is __PRETTY_FUNCTION__ (which embeds the lambda's source path). With
+    # external names, the final binary's lookup key would carry the ephemeral shadow path
+    # (/tmp/plx-shadow.XXXX/...) while the plugin registered under the original path, so
+    # the lookup would MISS and the kernel would silently run on the CPU. false also makes
+    # the key deterministic across builds.
     gen_overlay() {
         local first=1
-        printf '{\n  "version": 0,\n  "use-external-names": true,\n  "roots": [\n'
+        printf '{\n  "version": 0,\n  "use-external-names": false,\n  "roots": [\n'
         while IFS= read -r f; do
             local orig="${f#"$SHADOW"}"
             local eo="${orig//\\/\\\\}"; eo="${eo//\"/\\\"}"
@@ -170,31 +179,40 @@ if (( IS_COMPILE == 1 && HAS_SRC == 1 && PREPROCESS_ONLY == 0 )) \
     # PARALLAX_TRANSPARENT=1 enables std::par -> parallax::; PARALLAX_SHADOW_DIR makes
     # the plugin emit to the shadow tree instead of overwriting in place.
     PASS_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -c "$SRC" -o /dev/null )
-    dbg "PASS1: PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS_CMD[*]}"
-    PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS_CMD[@]}" 2> >(cat >&2) || \
+    dbg "PASS1: PARALLAX_TRANSPARENT=1 PARALLAX_ROUTE_ONLY=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS_CMD[*]}"
+    # PARALLAX_ROUTE_ONLY: PASS 1 only rewrites callees; registrars are emitted solely by
+    # PASS 2, so a source already calling parallax:: can't get a duplicate registrar.
+    PARALLAX_TRANSPARENT=1 PARALLAX_ROUTE_ONLY=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS_CMD[@]}" 2> >(cat >&2) || \
         dbg "PASS1 returned non-zero (route pass errors are often benign; continuing)"
 
+    # PASS 2 (funnel) ALWAYS runs — it emits the kernel registrars (PASS 1 was route-only).
+    # If PASS 1 produced routed shadow copies, PASS 2 reads them through the overlay (so the
+    # now-parallax:: source instantiates device_invoke); otherwise (source already calls
+    # parallax::, nothing to route) PASS 2 reads the pristine original. Either way PASS 2
+    # writes SRC's shadow copy back with the registrars appended.
+    P2_OVL=()
     if [[ -n "$(find "$SHADOW" -type f 2>/dev/null | head -1)" ]]; then
-        gen_overlay > "$OVERLAY"
-        # PASS 2 (funnel): parse the routed content through original paths (overlay), so
-        # device_invoke<T,F> is instantiated; write SRC's shadow copy back with the SPIR-V
-        # registrars appended. Headers stay routed (idempotent) and persist in the tree.
-        PASS2_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" -ivfsoverlay "$OVERLAY" -c "$SRC" -o /dev/null )
-        dbg "PASS2: PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS2_CMD[*]}"
-        PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS2_CMD[@]}" 2> >(cat >&2) || \
-            dbg "PASS2 returned non-zero (funnel pass errors are often benign; continuing)"
-        gen_overlay > "$OVERLAY"   # PASS 2 may have added SRC's registrar copy
-        OVERLAY_ARGS=( -ivfsoverlay "$OVERLAY" )
+        gen_overlay > "$OVERLAY"; P2_OVL=( -ivfsoverlay "$OVERLAY" )
+    fi
+    PASS2_CMD=( "$REAL_CXX" "${PARSE_FLAGS[@]}" "${FORCE[@]}" "${PLG[@]}" "${P2_OVL[@]+"${P2_OVL[@]}"}" -c "$SRC" -o /dev/null )
+    dbg "PASS2: PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR=$SHADOW ${PASS2_CMD[*]}"
+    PARALLAX_TRANSPARENT=1 PARALLAX_SHADOW_DIR="$SHADOW" "${PASS2_CMD[@]}" 2> >(cat >&2) || \
+        dbg "PASS2 returned non-zero (funnel pass errors are often benign; continuing)"
+
+    # Final build reads the shadow (rewritten) sources through the overlay, if any exist.
+    OVERLAY_ARGS=()
+    if [[ -n "$(find "$SHADOW" -type f 2>/dev/null | head -1)" ]]; then
+        gen_overlay > "$OVERLAY"; OVERLAY_ARGS=( -ivfsoverlay "$OVERLAY" )
     else
-        # Nothing was rewritten (no par calls) — compile the pristine original.
         dbg "no shadow output; compiling original unchanged"
-        OVERLAY_ARGS=()
     fi
 
     # REAL COMPILE: every original arg, UNTOUCHED, NO plugin, plus the runtime include +
     # stdpar force-include (so parallax:: names + arena hooks resolve) and the overlay
-    # (so the rewritten shadow SRC/headers are what actually get compiled).
-    REAL_CMD=( "$REAL_CXX" "${FORCE[@]}" "${OVERLAY_ARGS[@]}" "${ORIG_ARGS[@]}" )
+    # (so the rewritten shadow SRC/headers are what actually get compiled). The
+    # "${ARR[@]+"${ARR[@]}"}" form expands to nothing (not an error) for an empty array
+    # under `set -u` on old bash (macOS 3.2).
+    REAL_CMD=( "$REAL_CXX" "${FORCE[@]}" "${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"}" "${ORIG_ARGS[@]}" )
     dbg "BUILD: ${REAL_CMD[*]}"
     # Not exec: run so the EXIT trap can clean up the shadow tree, then propagate status.
     "${REAL_CMD[@]}"
