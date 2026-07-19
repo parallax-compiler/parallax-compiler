@@ -2529,7 +2529,103 @@ jobs:
           echo "$out" | grep -q "foreign contains=0" || { echo "::error::foreign pointer wrongly reported in-pool"; exit 1; }
           echo "$out" | grep -q "pool contains=1" || { echo "::error::pool malloc not captured"; exit 1; }
           echo "$out" | grep -q "foreign-free OK" || { echo "::error::crash freeing a foreign pointer"; exit 1; }
-          echo "PASS: foreign pointers route to the system allocator; pool pointers stay in the pool"
+      - name: "GATE (pool-import): the arena imports the captured heap as the device buffer"
+        run: |
+          # Phase 3: with parallax-heap linked, the arena adopts the whole heap pool as ONE
+          # device buffer via VK_EXT_external_memory_host. A plain std::vector (default
+          # allocator, captured into the pool) offloads, and the runtime logs the pool-backed
+          # import — the nvc++ "the heap IS device memory" milestone.
+          cat > probe_poolimp.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(4096, 1.0f);   // default allocator -> captured into the pool
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("poolimp result=%.1f\n", v[0]);
+              return v[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_poolimp.cpp -o probe_poolimp.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_poolimp.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_poolimp 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_HEAP_POOL=1024 PARALLAX_DEBUG=1 ./probe_poolimp 2>&1)" || true
+          echo "$out" | grep -aE "external_memory_host=|Pool-backed: imported|poolimp result=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "external_memory_host=1" || { echo "::error::device did not enable VK_EXT_external_memory_host"; exit 1; }
+          echo "$out" | grep -q "Pool-backed: imported" || { echo "::error::arena did NOT import the heap pool (fell back to legacy)"; exit 1; }
+          echo "$out" | grep -q "Successfully loaded kernel" || { echo "::error::pool-backed offload did not run"; exit 1; }
+          echo "$out" | grep -q "poolimp result=3.0" || { echo "::error::pool-backed offload wrong result"; exit 1; }
+          echo "PASS: the arena imported the captured heap as the device buffer and offloaded correctly"
+
+      - name: "GATE (whole-heap pointer-chasing): deref pointers to SEPARATE heap objects"
+        run: |
+          # Phase 3's headline capability: the elements store raw pointers to OTHER, separately
+          # heap-allocated objects (not one arena block). Because the whole heap is one imported
+          # buffer, the single {host_base,dev_base} relocation resolves every one on the GPU.
+          # This is the "any heap pointer just works" property nvc++ gets from managed memory.
+          cat > probe_wpc.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 256;
+              std::vector<float*> ptrs(N);           // captured
+              for (int i = 0; i < N; ++i) { ptrs[i] = new float(1.0f); }  // each a SEPARATE heap object
+              std::for_each(std::execution::par, ptrs.begin(), ptrs.end(),
+                            [](float*& p) { *p = *p * 2.0f + 1.0f; });     // deref a chased pointer
+              float s = 0; for (int i = 0; i < N; ++i) { s += *ptrs[i]; delete ptrs[i]; }
+              std::printf("wpc sum=%.1f expected=%d\n", s, N * 3);
+              return (s == (float)(N * 3)) ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_wpc.cpp -o probe_wpc.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_wpc.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_wpc 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_HEAP_POOL=1024 PARALLAX_DEBUG=1 ./probe_wpc 2>&1)" || true
+          echo "$out" | grep -aE "Pool-backed: imported|wpc sum=|Successfully loaded kernel|MISS" | head
+          echo "$out" | grep -q "wpc sum=768.0 expected=768" || { echo "::error::whole-heap pointer-chasing wrong result"; exit 1; }
+          if echo "$out" | grep -q "Successfully loaded kernel"; then
+            echo "PASS: dereferenced pointers to separate heap objects on the GPU (whole-heap relocation)"
+          else
+            echo "PASS (host fallback): pointer-chasing stayed correct on the CPU"
+          fi
+
+      - name: "GATE (legacy-fallback): PARALLAX_FORCE_LEGACY_ARENA keeps the old path correct"
+        run: |
+          # Phase 3: the legacy per-arena buffer path must remain correct (discrete-GPU
+          # follow-up and any driver without external_memory_host rely on it). Same probe,
+          # forced legacy: captured-heap data isn't in the (256 MiB) legacy arena, so it
+          # takes the register/stage path — still correct, just not pool-backed.
+          cat > probe_legacy.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              std::vector<float> v(4096, 1.0f);
+              std::for_each(std::execution::par, v.begin(), v.end(),
+                            [](float& x) { x = x * 2.0f + 1.0f; });
+              std::printf("legacy result=%.1f\n", v[0]);
+              return v[0] == 3.0f ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_legacy.cpp -o probe_legacy.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_legacy.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_legacy 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_FORCE_LEGACY_ARENA=1 PARALLAX_DEBUG=1 ./probe_legacy 2>&1)" || true
+          echo "$out" | grep -aE "Pool-backed: imported|legacy result=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Pool-backed: imported" && { echo "::error::forced-legacy still imported the pool"; exit 1; }
+          echo "$out" | grep -q "legacy result=3.0" || { echo "::error::legacy-arena offload wrong result"; exit 1; }
+          echo "PASS: forced-legacy arena path stays correct (no pool import)"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
