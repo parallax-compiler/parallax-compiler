@@ -2540,10 +2540,13 @@ jobs:
           #include <algorithm>
           #include <execution>
           #include <cstdio>
+          // Generic-wrapper shape (the reliable transparent-routing form).
+          const auto for_each_std = [](auto&& pol, auto& c, auto&& f) {
+              std::for_each(pol, c.begin(), c.end(), f);
+          };
           int main() {
               std::vector<float> v(4096, 1.0f);   // default allocator -> captured into the pool
-              std::for_each(std::execution::par, v.begin(), v.end(),
-                            [](float& x) { x = x * 2.0f + 1.0f; });
+              for_each_std(std::execution::par, v, [](float& x) { x = x * 2.0f + 1.0f; });
               std::printf("poolimp result=%.1f\n", v[0]);
               return v[0] == 3.0f ? 0 : 1;
           }
@@ -2572,12 +2575,14 @@ jobs:
           #include <algorithm>
           #include <execution>
           #include <cstdio>
+          const auto for_each_std = [](auto&& pol, auto& c, auto&& f) {
+              std::for_each(pol, c.begin(), c.end(), f);
+          };
           int main() {
               const int N = 256;
               std::vector<float*> ptrs(N);           // captured
               for (int i = 0; i < N; ++i) { ptrs[i] = new float(1.0f); }  // each a SEPARATE heap object
-              std::for_each(std::execution::par, ptrs.begin(), ptrs.end(),
-                            [](float*& p) { *p = *p * 2.0f + 1.0f; });     // deref a chased pointer
+              for_each_std(std::execution::par, ptrs, [](float*& p) { *p = *p * 2.0f + 1.0f; });  // deref a chased pointer
               float s = 0; for (int i = 0; i < N; ++i) { s += *ptrs[i]; delete ptrs[i]; }
               std::printf("wpc sum=%.1f expected=%d\n", s, N * 3);
               return (s == (float)(N * 3)) ? 0 : 1;
@@ -2608,10 +2613,12 @@ jobs:
           #include <algorithm>
           #include <execution>
           #include <cstdio>
+          const auto for_each_std = [](auto&& pol, auto& c, auto&& f) {
+              std::for_each(pol, c.begin(), c.end(), f);
+          };
           int main() {
               std::vector<float> v(4096, 1.0f);
-              std::for_each(std::execution::par, v.begin(), v.end(),
-                            [](float& x) { x = x * 2.0f + 1.0f; });
+              for_each_std(std::execution::par, v, [](float& x) { x = x * 2.0f + 1.0f; });
               std::printf("legacy result=%.1f\n", v[0]);
               return v[0] == 3.0f ? 0 : 1;
           }
