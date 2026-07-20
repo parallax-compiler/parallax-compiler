@@ -2687,6 +2687,35 @@ jobs:
           [ "$nstage" = "1" ] || { echo "::error::expected exactly 1 staging alloc (heap ops should be zero-copy), got $nstage"; exit 1; }
           echo "PASS: pool-resident for_each/reduce/sort offloaded zero-copy (no staging); non-pool data staged"
 
+      - name: "GATE (zero-copy int64): 8-byte elements offload correctly zero-copy"
+        continue-on-error: true
+        run: |
+          # Diagnostic: an int64 for_each on pool-resident data (funnel zero-copy). The
+          # collector-path int64 regressed under pool-backed (x+=1 lost) — this isolates
+          # whether the FUNNEL zero-copy path has the same 8-byte bug, and logs the SSBO
+          # offset alignment (a misaligned pool offset would bind the wrong device range).
+          cat > probe_zci64.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          const auto for_each_std = [](auto&& pol, auto b, auto e, auto&& f) { std::for_each(pol, b, e, f); };
+          int main() {
+              std::vector<long long> v(4096, (long long)1 << 40);   // captured -> pool-resident
+              for_each_std(std::execution::par, v.begin(), v.end(), [](long long& x) { x += 1; });
+              long long exp = ((long long)1 << 40) + 1;
+              std::printf("zci64 v[0]=%lld v[4095]=%lld expected=%lld\n", v[0], v[4095], exp);
+              return (v[0] == exp && v[4095] == exp) ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_zci64.cpp -o probe_zci64.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_zci64.o -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_zci64 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_HEAP_POOL=1024 PARALLAX_DEBUG=1 ./probe_zci64 2>&1)" || true
+          echo "$out" | grep -aE "minSSBOoffsetAlign|Pool-backed|zci64 |Successfully loaded|parallax_arena_alloc. staging" | head
+          echo "$out" | grep -q "zci64 v\[0\]=1099511627777" && echo "INT64 ZERO-COPY OK" || echo "INT64 ZERO-COPY BUG CONFIRMED (funnel path)"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the
