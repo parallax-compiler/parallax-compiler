@@ -1323,7 +1323,16 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     // Generate Kernel Entry Point
     uint32_t entry_id = builder.get_next_id();
     generate_kernel_wrapper(builder, entry_id, lambda_id, lambda_func);
-    
+
+    // The wrapper can also bail (e.g. a pointer-typed capture we don't relocate yet) —
+    // return empty so the algorithm stays on the CPU rather than shipping a kernel that
+    // reads an unbound descriptor.
+    if (translation_failed_) {
+        std::cerr << "[SPIRVGenerator] kernel wrapper bailed (unsupported capture); "
+                     "returning empty SPIR-V (algorithm stays on CPU)\n";
+        return {};
+    }
+
     // Update Bound
     builder.get_header()[3] = builder.get_next_id();
 
@@ -3158,11 +3167,17 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
 
     for (auto* param : scalar_params) {
         if (param->getType()->isPointerTy()) {
-            llvm::errs() << "  Param " << param->getArgNo() << " is a captured buffer pointer\n";
-            captured_buffers.push_back(param);
-        } else {
-            true_scalars.push_back(param);
+            // A POINTER-typed capture (e.g. a captured std::vector's data pointer). We do
+            // not yet relocate captured pointers in-kernel (that needs the element-chasing
+            // relocation extended to capture leaves + GEP propagation), so rather than the
+            // old fragile void**-scan heuristic — which guessed {ptr,size} pairs and could
+            // bind the wrong buffer / produce silent wrong results — bail cleanly to the CPU.
+            llvm::errs() << "  Param " << param->getArgNo()
+                         << " is a captured pointer; not yet relocatable -> CPU fallback\n";
+            translation_failed_ = true;
+            return;
         }
+        true_scalars.push_back(param);
     }
 
     // Total number of buffer bindings = data buffers + captured buffers

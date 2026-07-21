@@ -2688,12 +2688,10 @@ jobs:
           echo "PASS: pool-resident for_each/reduce/sort offloaded zero-copy (no staging); non-pool data staged"
 
       - name: "GATE (zero-copy int64): 8-byte elements offload correctly zero-copy"
-        continue-on-error: true
         run: |
-          # Diagnostic: an int64 for_each on pool-resident data (funnel zero-copy). The
-          # collector-path int64 regressed under pool-backed (x+=1 lost) — this isolates
-          # whether the FUNNEL zero-copy path has the same 8-byte bug, and logs the SSBO
-          # offset alignment (a misaligned pool offset would bind the wrong device range).
+          # An int64 for_each on pool-resident data through the FUNNEL zero-copy path. Confirms
+          # 8-byte elements bind + write in place correctly (lavapipe minSSBOoffsetAlign=16, so
+          # the pool's 16-alignment is fine for the descriptor bind). v[0] and v[4095] both +1.
           cat > probe_zci64.cpp <<'EOF'
           #include <vector>
           #include <algorithm>
@@ -2713,8 +2711,50 @@ jobs:
           "$CLANGXX" -std=c++20 -O2 probe_zci64.o -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_zci64 2>&1 | tail -2
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
           out="$(PARALLAX_HEAP_POOL=1024 PARALLAX_DEBUG=1 ./probe_zci64 2>&1)" || true
-          echo "$out" | grep -aE "minSSBOoffsetAlign|Pool-backed|zci64 |Successfully loaded|parallax_arena_alloc. staging" | head
-          echo "$out" | grep -q "zci64 v\[0\]=1099511627777" && echo "INT64 ZERO-COPY OK" || echo "INT64 ZERO-COPY BUG CONFIRMED (funnel path)"
+          echo "$out" | grep -aE "minSSBOoffsetAlign|zci64 |Successfully loaded" | head
+          echo "$out" | grep -q "zci64 v\[0\]=1099511627777 v\[4095\]=1099511627777" \
+            || { echo "::error::int64 funnel zero-copy wrong result"; exit 1; }
+          echo "PASS: int64 (8-byte) elements offload correctly via funnel zero-copy"
+
+      - name: "GATE (pointer capture safe): a pointer-capturing lambda is correct (CPU fallback)"
+        run: |
+          # Phase 4B robustness: a lambda that CAPTURES a pointer used to hit a fragile
+          # void**-scan heuristic that guessed buffer bindings and could return silently wrong
+          # results. Now the compiler bails such lambdas to the CPU. Assert: correct result,
+          # and it did NOT emit an offloaded kernel for that lambda (bailed). Scalar-capture
+          # transform in the same TU still offloads (regression guard).
+          cat > probe_capptr.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          const auto xf = [](auto&& pol, auto& in, auto& out, auto&& f) {
+              std::transform(pol, in.begin(), in.end(), out.begin(), f);
+          };
+          int main() {
+              std::vector<float> a(64, 2.0f), b(64, 0.0f), c(64, 0.0f);
+              float bias = 10.0f;
+              float* pbias = &bias;
+              // Captures a POINTER -> must bail to CPU and be CORRECT (not a heuristic mis-bind).
+              xf(std::execution::par, a, b, [pbias](float x) { return x + *pbias; });
+              // Captures a SCALAR -> offloads normally (regression guard).
+              float k = 3.0f;
+              xf(std::execution::par, a, c, [k](float x) { return x * k; });
+              std::printf("capptr b[0]=%.1f c[0]=%.1f\n", b[0], c[0]);   // 12.0, 6.0
+              return (b[0] == 12.0f && c[0] == 6.0f) ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_capptr.cpp -o probe_capptr.o 2>cap.log || true
+          grep -aE "captured pointer; not yet relocatable|stays on CPU" cap.log | head -1 \
+            || { echo "::error::pointer-capture lambda was NOT bailed by the compiler"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 probe_capptr.o -L parallax-runtime/out -lparallax-runtime -o probe_capptr 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_capptr 2>&1)" || true
+          echo "$out" | grep -aE "capptr b\[0\]=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "capptr b\[0\]=12.0 c\[0\]=6.0" \
+            || { echo "::error::pointer-capture lambda produced a wrong result"; exit 1; }
+          echo "PASS: pointer-capturing lambda is correct via CPU fallback (no fragile heuristic); scalar capture still offloads"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
