@@ -197,6 +197,15 @@ private:
     uint32_t    reloc_dev_base_id_ = 0;
     std::unordered_set<llvm::Value*> relocatable_values_;
 
+    // Pointer-typed lambda captures (e.g. a captured container's data() pointer).
+    // In the whole-heap model such a pointer is a pool address, so rather than bind
+    // it as a separate descriptor we carry it in the captures block as a uint64 host
+    // address, mark the parameter relocatable, and dereference it through a
+    // PhysicalStorageBuffer pointer (gpu = dev_base + host - host_base) exactly like
+    // element pointer-chasing. Populated per generate_from_lambda; drives the
+    // u64 param typing in translate_function and the push-constant base emission.
+    std::unordered_set<llvm::Value*> reloc_capture_params_;
+
     // Struct element support. data_layout_ (set per generate_from_lambda) gives the
     // host member offsets/sizes so the device reads the same bytes the host wrote.
     // struct_element_ptrs_ holds pointer values that point at the whole struct element

@@ -2716,45 +2716,69 @@ jobs:
             || { echo "::error::int64 funnel zero-copy wrong result"; exit 1; }
           echo "PASS: int64 (8-byte) elements offload correctly via funnel zero-copy"
 
-      - name: "GATE (pointer capture safe): a pointer-capturing lambda is correct (CPU fallback)"
+      - name: "GATE (captured pointer reloc): a lambda capturing a pool pointer OFFLOADS"
         run: |
-          # Phase 4B robustness: a lambda that CAPTURES a pointer used to hit a fragile
-          # void**-scan heuristic that guessed buffer bindings and could return silently wrong
-          # results. Now the compiler bails such lambdas to the CPU. Assert: correct result,
-          # and it did NOT emit an offloaded kernel for that lambda (bailed). Scalar-capture
-          # transform in the same TU still offloads (regression guard).
-          cat > probe_capptr.cpp <<'EOF'
-          #include <vector>
+          # Phase 4B capability (nvc++ parity): a lambda that CAPTURES a pointer into the
+          # whole-heap pool now OFFLOADS — the captured pointer is carried in captures@2 as
+          # a uint64 host address and relocated in-kernel (gpu = dev_base + p - host_base),
+          # exactly like element pointer-chasing, instead of bailing to the CPU. Two shapes:
+          #   *bias   -> DIRECT deref of a captured pointer  (Load-relocate path)
+          #   arr[3]  -> INDEXED deref of a captured pointer (GEP-relocate -> Load path)
+          # Both targets live in the arena so one (host_base,dev_base) pair relocates them.
+          cat > probe_capreloc.cpp <<'EOF'
           #include <algorithm>
           #include <execution>
+          #include <cstddef>
           #include <cstdio>
-          const auto xf = [](auto&& pol, auto& in, auto& out, auto&& f) {
-              std::transform(pol, in.begin(), in.end(), out.begin(), f);
-          };
+          extern "C" void* parallax_arena_alloc(size_t size, size_t align);
           int main() {
-              std::vector<float> a(64, 2.0f), b(64, 0.0f), c(64, 0.0f);
-              float bias = 10.0f;
-              float* pbias = &bias;
-              // Captures a POINTER -> must bail to CPU and be CORRECT (not a heuristic mis-bind).
-              xf(std::execution::par, a, b, [pbias](float x) { return x + *pbias; });
-              // Captures a SCALAR -> offloads normally (regression guard).
-              float k = 3.0f;
-              xf(std::execution::par, a, c, [k](float x) { return x * k; });
-              std::printf("capptr b[0]=%.1f c[0]=%.1f\n", b[0], c[0]);   // 12.0, 6.0
-              return (b[0] == 12.0f && c[0] == 6.0f) ? 0 : 1;
+              const int N = 64;
+              float* a    = static_cast<float*>(parallax_arena_alloc(N * sizeof(float), 16));
+              float* a2   = static_cast<float*>(parallax_arena_alloc(N * sizeof(float), 16));
+              float* bias = static_cast<float*>(parallax_arena_alloc(sizeof(float), 16));
+              float* arr  = static_cast<float*>(parallax_arena_alloc(8 * sizeof(float), 16));
+              if (!a || !a2 || !bias || !arr) { std::printf("SKIP: no arena\n"); return 0; }
+              for (int i = 0; i < N; ++i) { a[i] = 2.0f; a2[i] = 2.0f; }
+              *bias = 10.0f;
+              for (int i = 0; i < 8; ++i) arr[i] = 0.0f;
+              arr[3] = 100.0f;
+              // Capture a pool pointer, DEREFERENCE it in-kernel (direct relocation).
+              std::for_each(std::execution::par, a, a + N, [bias](float& x){ x += *bias; });
+              // Capture a pool pointer, INDEX it in-kernel (GEP relocation).
+              std::for_each(std::execution::par, a2, a2 + N, [arr](float& x){ x += arr[3]; });
+              std::printf("capreloc a[0]=%.1f a2[0]=%.1f expected=12.0,102.0\n", a[0], a2[0]);
+              return (a[0] == 12.0f && a2[0] == 102.0f) ? 0 : 1;
           }
           EOF
-          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
-          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_capptr.cpp -o probe_capptr.o 2>cap.log || true
-          grep -aE "captured pointer; not yet relocatable|stays on CPU" cap.log | head -1 \
-            || { echo "::error::pointer-capture lambda was NOT bailed by the compiler"; exit 1; }
-          "$CLANGXX" -std=c++20 -O2 probe_capptr.o -L parallax-runtime/out -lparallax-runtime -o probe_capptr 2>&1 | tail -2
+          # Dump + validate the emitted SPIR-V; confirm the relocation opcodes are present
+          # (the captured pointer is relocated, not bound as a descriptor). The dump step
+          # also rewrites the source in place (SHADOW unset) so the run below offloads.
+          PARALLAX_DUMP_SPIRV="$PWD/capreloc.spv" "$CLANGXX" -std=c++20 \
+            -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_capreloc.cpp -o /dev/null 2> capreloc.log || true
+          if [ -f capreloc.spv ]; then
+            echo "===== spirv-val ====="; spirv-val capreloc.spv \
+              || { echo "::error::captured-pointer-reloc SPIR-V failed validation"; exit 1; }
+            echo "===== spirv-dis (capture relocation) ====="
+            spirv-dis capreloc.spv 2>/dev/null | grep -iE "OpConvertUToPtr|PhysicalStorageBuffer|OpISub|OpIAdd" | head -20 || true
+            spirv-dis capreloc.spv 2>/dev/null | grep -q "OpConvertUToPtr" \
+              || { echo "::error::no OpConvertUToPtr — captured pointer not relocated (bailed?)"; exit 1; }
+          else
+            echo "::error::no capreloc.spv produced (kernel not generated — capture bailed)"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_capreloc.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out \
+            -lparallax-runtime -o probe_capreloc 2>&1 | tail -3
           export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
-          out="$(PARALLAX_DEBUG=1 ./probe_capptr 2>&1)" || true
-          echo "$out" | grep -aE "capptr b\[0\]=|Successfully loaded kernel" | head
-          echo "$out" | grep -q "capptr b\[0\]=12.0 c\[0\]=6.0" \
-            || { echo "::error::pointer-capture lambda produced a wrong result"; exit 1; }
-          echo "PASS: pointer-capturing lambda is correct via CPU fallback (no fragile heuristic); scalar capture still offloads"
+          out="$(PARALLAX_DEBUG=1 ./probe_capreloc 2>&1)" || true
+          echo "$out" | grep -aE "capreloc a\[0\]=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "SKIP:" && { echo "skipped (no arena)"; exit 0; }
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::captured-pointer lambda was NOT offloaded"; exit 1; }
+          echo "$out" | grep -q "capreloc a\[0\]=12.0 a2\[0\]=102.0" \
+            || { echo "::error::captured-pointer relocation produced a wrong result"; exit 1; }
+          echo "PASS: a lambda capturing a pool pointer OFFLOADS with in-kernel relocation (direct + indexed)"
 
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
