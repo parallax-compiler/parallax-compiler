@@ -1882,10 +1882,11 @@ public:
         // the range to a power of two, sorts in place, and copies the prefix back. A
         // custom comparator (3rd arg) is not yet supported and falls back to the CPU.
         if (info.algorithm_name == "sort") {
-            // std::sort(par, first, last) is exactly 3 args; extractIterators' 3-arg
-            // path assumes no policy, so take first/last directly (arg1/arg2).
-            if (call->getNumArgs() != 3) {
-                llvm::errs() << "[ParallaxCollector] sort: custom comparator unsupported; CPU\n";
+            // std::sort(par, first, last[, comp]): 3 args (default '<') or 4 (custom
+            // comparator). first/last are arg1/arg2 in both; arg3 (if present) is the
+            // comparator, compiled to a SPIR-V bool(T,T) the compare-exchange calls.
+            if (call->getNumArgs() != 3 && call->getNumArgs() != 4) {
+                llvm::errs() << "[ParallaxCollector] sort: unexpected arg count; CPU\n";
                 return true;
             }
             info.first_iterator = call->getArg(1);
@@ -1913,15 +1914,46 @@ public:
             info.is_sort = true;
             info.kernel_name = generateKernelName(info);
 
+            // std::sort(par, first, last, comp): compile the comparator to a SPIR-V
+            // bool(T,T) the compare-exchange calls. Without it, the kernel bakes '<'.
+            // op_module must outlive the codegen. Non-capturing lambda comparators only
+            // (like the reduce keystone); anything else stays on the CPU.
+            llvm::Function* comp_func = nullptr;
+            std::unique_ptr<llvm::Module> comp_module;
+            if (call->getNumArgs() == 4) {
+                clang::LambdaExpr* comp_lambda = extractLambda(call);
+                if (!comp_lambda) {
+                    llvm::errs() << "[ParallaxCollector] sort: non-lambda comparator unsupported; CPU\n";
+                    return true;
+                }
+                comp_module = ir_generator_.generateIR(comp_lambda, context_);
+                if (comp_module) {
+                    for (auto& f : *comp_module) {
+                        if (!f.isDeclaration()) { comp_func = &f; break; }
+                    }
+                }
+                if (!comp_func) {
+                    llvm::errs() << "[ParallaxCollector] sort: failed to compile comparator; CPU\n";
+                    return true;
+                }
+                // A capturing comparator lowers to more than two params; not supported yet.
+                if (comp_func->arg_size() != 2) {
+                    llvm::errs() << "[ParallaxCollector] sort: capturing comparator unsupported ("
+                                 << comp_func->arg_size() << " args); CPU\n";
+                    return true;
+                }
+            }
+
             SPIRVGenerator sgen;
             sgen.set_target_vulkan_version(1, 2);
-            info.spirv = sgen.generate_sort_kernel(ek);
+            info.spirv = sgen.generate_sort_kernel(ek, comp_func);
             if (info.spirv.empty()) {
                 llvm::errs() << "[ParallaxCollector] sort: SPIR-V generation failed\n";
                 return true;
             }
             llvm::errs() << "[ParallaxCollector] sort: generated bitonic(" << info.spirv.size()
-                         << ") for " << info.elem_type_str << "\n";
+                         << ") for " << info.elem_type_str
+                         << (comp_func ? " with a user comparator" : "") << "\n";
             rewriter_.addTransform(info);
             return true;
         }

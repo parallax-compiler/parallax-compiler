@@ -1427,6 +1427,58 @@ jobs:
             || { echo "::error::sort result not ascending / not a permutation"; exit 1; }
           echo "PASS: std::sort(par) offloaded a GPU bitonic sort (padded, ascending)"
 
+      - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
+        run: |
+          # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into
+          # the bitonic compare-exchange (OpFunctionCall comp(b,a) replaces a>b), so the
+          # sort orders by comp. A descending lambda comparator must produce a fully
+          # DESCENDING permutation. N=1024 (pow2) so the runtime does not pad — padding
+          # placement depends on sort direction and is a separate follow-up. Non-
+          # capturing lambda comparators only (matches the reduce+op keystone).
+          cat > probe_sortcmp.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <numeric>
+          #include <functional>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 1024;               // power of two -> no padding
+              std::vector<float> v(N);
+              long want = 0;
+              for (int i = 0; i < N; ++i) { v[i] = static_cast<float>((i * 7 + 3) % N); want += (long)v[i]; }
+              std::sort(std::execution::par, v.begin(), v.end(), [](float a, float b){ return a > b; });
+              bool desc = std::is_sorted(v.begin(), v.end(), std::greater<float>{});
+              long got = 0; for (float x : v) got += (long)x;
+              std::printf("sortcmp desc=%d v[0]=%.1f v[%d]=%.1f sum=%ld want=%ld\n",
+                          desc ? 1 : 0, v[0], N - 1, v[N - 1], got, want);
+              return (desc && got == want) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/sortcmp.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_sortcmp.cpp -o /dev/null 2> sortcmp.log || true
+          grep -E "sort: generated bitonic.*user comparator" sortcmp.log | head -1 \
+            || { echo "::error::comparator was not compiled into the sort kernel"; exit 1; }
+          if [ -f sortcmp.spv ]; then
+            spirv-val sortcmp.spv || { echo "::error::sort+comp SPIR-V failed validation"; exit 1; }
+            spirv-dis sortcmp.spv 2>/dev/null | grep -q "OpFunctionCall" \
+              || { echo "::error::no OpFunctionCall — comparator not inlined into compare-exchange"; exit 1; }
+          else
+            echo "::error::no sort+comp SPIR-V produced"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_sortcmp.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_sortcmp 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_sortcmp 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::sort+comp kernel was not offloaded"; exit 1; }
+          echo "$out" | grep -q "sortcmp desc=1" \
+            || { echo "::error::sort+comp not descending / not a permutation (comparator misapplied)"; exit 1; }
+          echo "PASS: std::sort(par) with a user comparator offloaded a descending GPU bitonic sort"
+
       - name: "GATE (copy_if): stream compaction on the GPU"
         run: |
           # Phase 5: the plugin detects std::copy_if, compiles the predicate into a

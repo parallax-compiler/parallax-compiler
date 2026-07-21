@@ -2267,14 +2267,20 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
 // Phase 5: one global bitonic compare-exchange stage (ascending). Each invocation i
 // pairs with i^j; only the lower index swaps. Direction is ascending when the k-bit
 // of i is 0. No shared memory or barriers — the runtime sequences the stages.
-std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem) {
+std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem,
+                                                           llvm::Function* user_op) {
     const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
     const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
     const uint32_t stride = is_wide ? 8 : 4;
 
+    // The user comparator is translated via the shared translate_instruction path,
+    // which uses these member caches/state — start clean (and not pointer-chasing).
     type_cache_.clear();
     constant_cache_.clear();
     pointer_type_cache_.clear();
+    active_element_type_ = nullptr;
+    element_is_pointer_ = false;
+    relocatable_values_.clear();
 
     SPIRVBuilder B;
     B.set_section(SPIRVBuilder::Section::Header);
@@ -2353,6 +2359,42 @@ std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem) 
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17, 256, 1, 1});
 
+    // ---- Optional user comparator as a callable SPIR-V function bool(T,T) ----
+    // Emitted like the reduce keystone's binary op, but returns bool: comp(x,y) is
+    // true when x should be ordered before y. Types are primed so the op's element
+    // type reuses elem_t and its i1 return reuses bool_t (no duplicate types). Non-
+    // capturing comparators only (the op function takes exactly the two elements).
+    uint32_t cmp_fn_id = 0;
+    if (user_op) {
+        llvm::LLVMContext& ctx = user_op->getContext();
+        type_cache_[llvm::Type::getInt32Ty(ctx)] = uint_t;
+        type_cache_[llvm::Type::getInt1Ty(ctx)]  = bool_t;   // comparator result
+        // Prime the element (parameter) type LAST so it wins over the i32->uint map:
+        // an i32 element must map to elem_t (signed int), not uint_t.
+        if (user_op->arg_size() > 0)
+            type_cache_[user_op->getArg(0)->getType()] = elem_t;
+
+        B.set_section(SPIRVBuilder::Section::Types);
+        uint32_t cmp_fntype = B.get_next_id();
+        B.emit_op(SPIRVOp::OpTypeFunction, {cmp_fntype, bool_t, elem_t, elem_t});
+
+        B.set_section(SPIRVBuilder::Section::Code);
+        cmp_fn_id = B.get_next_id();
+        B.emit_op(SPIRVOp::OpFunction, {bool_t, cmp_fn_id, 0, cmp_fntype});
+        std::unordered_map<llvm::Value*, uint32_t> op_vmap;
+        for (auto& arg : user_op->args()) {
+            uint32_t pid = B.get_next_id();
+            B.emit_op(SPIRVOp::OpFunctionParameter, {elem_t, pid});
+            op_vmap[&arg] = pid;
+        }
+        for (auto& bb : *user_op) op_vmap[&bb] = B.get_next_id();
+        for (auto& bb : *user_op) {
+            B.emit_op(SPIRVOp::OpLabel, {op_vmap[&bb]});
+            for (auto& inst : bb) translate_instruction(B, &inst, op_vmap);
+        }
+        B.emit_op(SPIRVOp::OpFunctionEnd, {});
+    }
+
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
     B.emit_op(SPIRVOp::OpLabel, {B.get_next_id()});
@@ -2408,9 +2450,14 @@ std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem) 
         uint32_t b = B.get_next_id();
         B.emit_op(SPIRVOp::OpLoad, {elem_t, b, p_l});
 
-        // swap = (a > b) == ascending  -> branchless via select
+        // swap = (a > b) == ascending  -> branchless via select. With a user
+        // comparator, "a should come after b" == comp(b, a) (b before a), so the
+        // call replaces the a>b test; default '<' uses the baked greater-than.
         uint32_t gt = B.get_next_id();
-        B.emit_op(is_float ? SPIRVOp::OpFOrdGreaterThan : SPIRVOp::OpSGreaterThan, {bool_t, gt, a, b});
+        if (cmp_fn_id)
+            B.emit_op(SPIRVOp::OpFunctionCall, {bool_t, gt, cmp_fn_id, b, a});
+        else
+            B.emit_op(is_float ? SPIRVOp::OpFOrdGreaterThan : SPIRVOp::OpSGreaterThan, {bool_t, gt, a, b});
         uint32_t swap = B.get_next_id();
         B.emit_op(SPIRVOp::OpLogicalEqual, {bool_t, swap, gt, asc});
         uint32_t vi = B.get_next_id();

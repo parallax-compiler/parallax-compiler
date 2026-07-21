@@ -70,8 +70,12 @@ public:
 
     // Phase 5: one global bitonic compare-exchange stage (ascending). data@0, push
     // { uint count, uint k, uint j }. The runtime (launch_sort) dispatches it over
-    // the O(log^2 n) (k,j) schedule. No shared memory or barriers. Default '<' only.
-    std::vector<uint32_t> generate_sort_kernel(ReduceElemType elem);
+    // the O(log^2 n) (k,j) schedule. No shared memory or barriers. When user_op is a
+    // strict-weak comparator (bool(T,T)), it is emitted as a SPIR-V function and called
+    // at the compare-exchange (comp(b,a) replaces a>b), so the sort orders by comp;
+    // null = baked-in '<'. Non-capturing comparators only (like the reduce keystone).
+    std::vector<uint32_t> generate_sort_kernel(ReduceElemType elem,
+                                               llvm::Function* user_op = nullptr);
 
     // Phase 5: compaction scatter. input@0, output@1, positions@3 (the inclusive scan
     // of the 1/0 flags), push { uint count }. Each kept element (positions[i] differs
