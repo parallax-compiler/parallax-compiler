@@ -58,8 +58,13 @@ public:
     // blocksums@1; generate_scan_add_kernel adds each block's exclusive offset back
     // (data@0, offsets@1). Logical GLSL450, baked-in '+'. Bindings/push match
     // dispatch_reduce_level so the runtime treats them like the reduce kernel.
-    std::vector<uint32_t> generate_scan_kernel(ReduceElemType elem);
-    std::vector<uint32_t> generate_scan_add_kernel(ReduceElemType elem);
+    // user_op (a binary op T(T,T)) inclusive-scans by that op instead of '+': it is
+    // emitted as a SPIR-V function and called left-associatively (op(earlier, later))
+    // in both the per-block Hillis-Steele step and the block-offset add. The
+    // no-neighbour lane is guarded (keeps its own partial), so no op identity is
+    // needed; null = baked-in '+'. Non-capturing binary ops only.
+    std::vector<uint32_t> generate_scan_kernel(ReduceElemType elem, llvm::Function* user_op = nullptr);
+    std::vector<uint32_t> generate_scan_add_kernel(ReduceElemType elem, llvm::Function* user_op = nullptr);
 
     // Phase 5: exclusive-scan finalize/shift. in@0 holds an INCLUSIVE scan; out@1 receives
     // the exclusive scan: out[i] = init + (i>0 ? in[i-1] : 0), so out[0]=init and
@@ -136,6 +141,13 @@ private:
     bool     is_elided_struct_field(llvm::Value* ptr, llvm::Type* scalar_ty);
     uint32_t emit_member0_ptr(SPIRVBuilder& builder, uint32_t base,
                               llvm::Type* scalar_ty, llvm::LLVMContext& ctx);
+    // Emit a user op (T(T,T) binary op, or bool(T,T) comparator) as a callable SPIR-V
+    // function, priming types so the op reuses the kernel's elem_t/uint_t/bool_t (no
+    // duplicate types). ret_t is elem_t for a binary op, bool_t for a comparator.
+    // Returns the function id (0 when user_op is null). Used by the reduce/sort/scan
+    // custom-op paths; the op body goes through the shared translate_instruction path.
+    uint32_t emit_inlined_op(SPIRVBuilder& builder, llvm::Function* user_op,
+                             uint32_t elem_t, uint32_t uint_t, uint32_t bool_t, uint32_t ret_t);
     uint32_t get_type_id(SPIRVBuilder& builder, llvm::Type* type);
     uint32_t get_pointer_type_id(SPIRVBuilder& builder, uint32_t element_type_id, uint32_t storage_class);
     uint32_t get_value_id(SPIRVBuilder& builder, llvm::Value* val, std::unordered_map<llvm::Value*, uint32_t>& value_map);

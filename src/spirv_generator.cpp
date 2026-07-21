@@ -1437,6 +1437,41 @@ std::vector<uint32_t> SPIRVGenerator::generate_from_lambda(
     return spirv;
 }
 
+uint32_t SPIRVGenerator::emit_inlined_op(SPIRVBuilder& B, llvm::Function* user_op,
+                                         uint32_t elem_t, uint32_t uint_t,
+                                         uint32_t bool_t, uint32_t ret_t) {
+    if (!user_op) return 0;
+    llvm::LLVMContext& ctx = user_op->getContext();
+    type_cache_[llvm::Type::getInt32Ty(ctx)] = uint_t;
+    type_cache_[llvm::Type::getInt1Ty(ctx)]  = bool_t;
+    // Prime the element (parameter) type LAST so it wins over the i32->uint map: an
+    // i32 element must map to elem_t (signed int), not uint_t.
+    if (user_op->arg_size() > 0)
+        type_cache_[user_op->getArg(0)->getType()] = elem_t;
+
+    B.set_section(SPIRVBuilder::Section::Types);
+    uint32_t op_fntype = B.get_next_id();
+    B.emit_op(SPIRVOp::OpTypeFunction, {op_fntype, ret_t, elem_t, elem_t});
+
+    B.set_section(SPIRVBuilder::Section::Code);
+    uint32_t op_fn_id = B.get_next_id();
+    B.emit_op(SPIRVOp::OpFunction, {ret_t, op_fn_id, 0, op_fntype});
+    std::unordered_map<llvm::Value*, uint32_t> op_vmap;
+    for (auto& arg : user_op->args()) {
+        uint32_t pid = B.get_next_id();
+        B.emit_op(SPIRVOp::OpFunctionParameter, {elem_t, pid});
+        op_vmap[&arg] = pid;
+    }
+    // Pre-assign block labels so forward branches resolve.
+    for (auto& bb : *user_op) op_vmap[&bb] = B.get_next_id();
+    for (auto& bb : *user_op) {
+        B.emit_op(SPIRVOp::OpLabel, {op_vmap[&bb]});
+        for (auto& inst : bb) translate_instruction(B, &inst, op_vmap);
+    }
+    B.emit_op(SPIRVOp::OpFunctionEnd, {});
+    return op_fn_id;
+}
+
 std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem,
                                                              llvm::Function* user_op) {
     // Element kind specifics.
@@ -1717,7 +1752,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
 // total is written to BlockSums @binding 1 by the last lane. The runtime then scans
 // the block sums and adds the exclusive block offsets back (the scan_add kernel).
 // Bindings/push layout match dispatch_reduce_level (src@0, dst@1, push {count,...}).
-std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem) {
+std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem,
+                                                           llvm::Function* user_op) {
     const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
     const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
     const uint32_t stride = is_wide ? 8 : 4;
@@ -1831,6 +1867,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem) 
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17 /*LocalSize*/, 256, 1, 1});
 
+    // Optional user binary op T(T,T) called at each combine step (else baked '+').
+    uint32_t op_fn_id = emit_inlined_op(B, user_op, elem_t, uint_t, bool_t, elem_t);
+
     // ---- Function body ----
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
@@ -1885,15 +1924,28 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem) 
         B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_elem, p_src, sdata_var, idx});
         uint32_t loaded = B.get_next_id();
         B.emit_op(SPIRVOp::OpLoad, {elem_t, loaded, p_src});
-        uint32_t v = B.get_next_id();
-        B.emit_op(SPIRVOp::OpSelect, {elem_t, v, ge, loaded, zero_elem});
+        // Default '+': v = (ge ? temp[tid-offset] : 0); temp[tid] += v. For a user op,
+        // combine left-associatively op(earlier, later) and GUARD the no-neighbour lane
+        // (ge==false keeps temp[tid] unchanged) so no op identity is needed.
+        uint32_t v = 0;
+        if (!op_fn_id) {
+            v = B.get_next_id();
+            B.emit_op(SPIRVOp::OpSelect, {elem_t, v, ge, loaded, zero_elem});
+        }
         B.emit_op(SPIRVOp::OpControlBarrier, {scope_wg, scope_wg, sem});
         uint32_t p_self = B.get_next_id();
         B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_elem, p_self, sdata_var, tid});
         uint32_t cur = B.get_next_id();
         B.emit_op(SPIRVOp::OpLoad, {elem_t, cur, p_self});
         uint32_t nv = B.get_next_id();
-        B.emit_op(add_op, {elem_t, nv, cur, v});
+        if (op_fn_id) {
+            // op(earlier=loaded, later=cur); when no left neighbour keep cur.
+            uint32_t combined = B.get_next_id();
+            B.emit_op(SPIRVOp::OpFunctionCall, {elem_t, combined, op_fn_id, loaded, cur});
+            B.emit_op(SPIRVOp::OpSelect, {elem_t, nv, ge, combined, cur});
+        } else {
+            B.emit_op(add_op, {elem_t, nv, cur, v});
+        }
         B.emit_op(SPIRVOp::OpStore, {p_self, nv});
         B.emit_op(SPIRVOp::OpControlBarrier, {scope_wg, scope_wg, sem});
     }
@@ -1953,7 +2005,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem) 
 // Phase 5: the second scan pass — add each block's exclusive prefix offset back.
 // `offsets` @binding 1 is the inclusive scan of the block sums, so offsets[wgid-1]
 // is the sum of all prior blocks. Block 0 needs no offset. No shared memory.
-std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType elem) {
+std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType elem,
+                                                               llvm::Function* user_op) {
     const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
     const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
     const uint32_t stride = is_wide ? 8 : 4;
@@ -2041,6 +2094,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17, 256, 1, 1});
 
+    // Optional user binary op T(T,T) for the block-offset combine (else baked '+').
+    uint32_t op_fn_id = emit_inlined_op(B, user_op, elem_t, uint_t, bool_t, elem_t);
+
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
     B.emit_op(SPIRVOp::OpLabel, {B.get_next_id()});
@@ -2084,7 +2140,13 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
         uint32_t dv = B.get_next_id();
         B.emit_op(SPIRVOp::OpLoad, {elem_t, dv, p_d});
         uint32_t nv = B.get_next_id();
-        B.emit_op(is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd, {elem_t, nv, dv, ofs});
+        // out[gid] = op(offset, local_prefix). The block offset covers EARLIER elements,
+        // so it is the left operand (left-associative inclusive scan); '+' commutes so
+        // the default path is unaffected.
+        if (op_fn_id)
+            B.emit_op(SPIRVOp::OpFunctionCall, {elem_t, nv, op_fn_id, ofs, dv});
+        else
+            B.emit_op(is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd, {elem_t, nv, dv, ofs});
         B.emit_op(SPIRVOp::OpStore, {p_d, nv});
         B.emit_op(SPIRVOp::OpBranch, {mb});
     }

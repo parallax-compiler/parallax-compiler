@@ -1971,12 +1971,6 @@ public:
                 llvm::errs() << "[ParallaxCollector] inclusive_scan: missing iterators; CPU\n";
                 return true;
             }
-            // A custom binary op (5th arg) is not supported yet — bake-in '+' only.
-            if (call->getNumArgs() >= 5) {
-                llvm::errs() << "[ParallaxCollector] inclusive_scan: custom op unsupported; CPU\n";
-                return true;
-            }
-
             clang::QualType elemQT;
             if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
                 elemQT = getContainerElementType(c->getType().getNonReferenceType());
@@ -2003,17 +1997,47 @@ public:
             info.is_scan = true;
             info.kernel_name = generateKernelName(info);
 
+            // std::inclusive_scan(par, first, last, d_first, binary_op): compile the op to
+            // a SPIR-V T(T,T) both scan kernels call at each combine step (left-assoc); the
+            // 4-arg form bakes '+'. op_module must outlive the codegen. Non-capturing lambda
+            // ops only (like the reduce keystone); anything else stays on the CPU.
+            llvm::Function* op_func = nullptr;
+            std::unique_ptr<llvm::Module> op_module;
+            if (call->getNumArgs() >= 5) {
+                clang::LambdaExpr* op_lambda = extractLambda(call);
+                if (!op_lambda) {
+                    llvm::errs() << "[ParallaxCollector] inclusive_scan: non-lambda op unsupported; CPU\n";
+                    return true;
+                }
+                op_module = ir_generator_.generateIR(op_lambda, context_);
+                if (op_module) {
+                    for (auto& f : *op_module) {
+                        if (!f.isDeclaration()) { op_func = &f; break; }
+                    }
+                }
+                if (!op_func) {
+                    llvm::errs() << "[ParallaxCollector] inclusive_scan: failed to compile op; CPU\n";
+                    return true;
+                }
+                if (op_func->arg_size() != 2) {
+                    llvm::errs() << "[ParallaxCollector] inclusive_scan: capturing op unsupported ("
+                                 << op_func->arg_size() << " args); CPU\n";
+                    return true;
+                }
+            }
+
             SPIRVGenerator sgen;
             sgen.set_target_vulkan_version(1, 2);
-            info.spirv = sgen.generate_scan_kernel(ek);             // per-block scan
-            info.spirv_transform = sgen.generate_scan_add_kernel(ek); // add offsets
+            info.spirv = sgen.generate_scan_kernel(ek, op_func);             // per-block scan
+            info.spirv_transform = sgen.generate_scan_add_kernel(ek, op_func); // add offsets
             if (info.spirv.empty() || info.spirv_transform.empty()) {
                 llvm::errs() << "[ParallaxCollector] inclusive_scan: SPIR-V generation failed\n";
                 return true;
             }
             llvm::errs() << "[ParallaxCollector] inclusive_scan: generated scan("
                          << info.spirv.size() << ") + add(" << info.spirv_transform.size()
-                         << ") for " << info.elem_type_str << "\n";
+                         << ") for " << info.elem_type_str
+                         << (op_func ? " with a user op" : "") << "\n";
             rewriter_.addTransform(info);
             return true;
         }

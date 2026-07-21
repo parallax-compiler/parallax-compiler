@@ -1331,6 +1331,61 @@ jobs:
             || { echo "::error::scan wrong result (block-offset add failed)"; exit 1; }
           echo "PASS: std::inclusive_scan(par) offloaded a multi-block GPU prefix scan"
 
+      - name: "GATE (scan+op): std::inclusive_scan(par) with a user binary op (product)"
+        run: |
+          # Phase 5: std::inclusive_scan(par, first, last, d_first, binary_op) inlines the
+          # user op into BOTH scan kernels (per-block Hillis-Steele + block-offset add) and
+          # calls it left-associatively (op(earlier, later)); the no-neighbour lane is
+          # guarded so no op identity is needed. N=1000 (4 blocks, last partial) exercises
+          # the block-offset combine AND the partial-block path. A product scan (mostly
+          # 1.0, a 2.0 every 128th element) stays exact in float; differential vs a serial
+          # reference computed with the SAME op. Non-capturing lambda ops only.
+          cat > probe_scanop.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<float> v(N, 1.0f);
+              for (int i = 0; i < N; i += 128) v[i] = 2.0f;   // 8 twos -> max prefix 2^8=256, exact
+              auto op = [](float a, float b){ return a * b; };
+              std::vector<float> ref(N);
+              std::inclusive_scan(v.begin(), v.end(), ref.begin(), op);   // serial oracle (no policy)
+              std::inclusive_scan(std::execution::par, v.begin(), v.end(), v.begin(), op);  // GPU
+              int bad = 0; for (int i = 0; i < N; ++i) if (v[i] != ref[i]) ++bad;
+              std::printf("scanop bad=%d v[0]=%.1f v[128]=%.1f v[999]=%.1f\n", bad, v[0], v[128], v[999]);
+              return bad == 0 ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/scanop.spv" PARALLAX_DUMP_SPIRV_ADD="$PWD/scanop_add.spv" \
+            "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_scanop.cpp -o /dev/null 2> scanop.log || true
+          grep -E "inclusive_scan: generated.*user op" scanop.log | head -1 \
+            || { echo "::error::user op was not compiled into the scan kernels"; exit 1; }
+          if [ -f scanop.spv ] && [ -f scanop_add.spv ]; then
+            spirv-val scanop.spv || { echo "::error::scan+op SPIR-V failed validation"; exit 1; }
+            spirv-val scanop_add.spv || { echo "::error::scan+op add SPIR-V failed validation"; exit 1; }
+            spirv-dis scanop.spv 2>/dev/null | grep -q "OpFunctionCall" \
+              || { echo "::error::no OpFunctionCall in scan kernel — user op not inlined"; exit 1; }
+            spirv-dis scanop_add.spv 2>/dev/null | grep -q "OpFunctionCall" \
+              || { echo "::error::no OpFunctionCall in scan-add kernel — user op not inlined"; exit 1; }
+          else
+            echo "::error::no scan+op SPIR-V produced"; exit 1
+          fi
+          "$CLANGXX" -std=c++20 -O2 probe_scanop.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_scanop 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_scanop 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::scan+op kernels were not offloaded"; exit 1; }
+          echo "$out" | grep -q "scanop bad=0" \
+            || { echo "::error::scan+op differs from the serial oracle (op misapplied / order bug)"; exit 1; }
+          echo "PASS: std::inclusive_scan(par) with a user op offloaded a GPU product scan (matches serial)"
+
       - name: "GATE (exclusive_scan): fully-on-GPU exclusive prefix scan (inclusive + shift)"
         run: |
           # exclusive_scan(par,first,last,d_first,init) offloads via the device_exclusive_scan
