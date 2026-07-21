@@ -1362,7 +1362,9 @@ jobs:
             "$CLANGXX" -std=c++20 -I parallax-runtime/include \
             -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
             -c probe_scanop.cpp -o /dev/null 2> scanop.log || true
-          grep -E "inclusive_scan: generated.*user op" scanop.log | head -1 \
+          echo "===== plugin decisions (inclusive_scan) ====="
+          grep -aE "inclusive_scan|Found parallel algorithm|generated scan" scanop.log | head -20 || true
+          grep -aq "inclusive_scan: generated.*user op" scanop.log \
             || { echo "::error::user op was not compiled into the scan kernels"; exit 1; }
           if [ -f scanop.spv ] && [ -f scanop_add.spv ]; then
             spirv-val scanop.spv || { echo "::error::scan+op SPIR-V failed validation"; exit 1; }
