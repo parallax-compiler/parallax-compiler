@@ -114,6 +114,32 @@ jobs:
               bool bda = bdaq.bufferDeviceAddress == VK_TRUE;
               printf("BDA_FEATURE=%s\n", bda ? "yes" : "no");
 
+              // Phase 7 element-type breadth: does lavapipe support 8/16-bit int + fp16?
+              // shaderInt16 is a base feature; shaderInt8/shaderFloat16 live in the
+              // VK_KHR_shader_float16_int8 struct; narrow storage-buffer access needs
+              // VK_KHR_8bit_storage / VK_KHR_16bit_storage.
+              bool ext_8bit = false, ext_16bit = false, ext_f16i8 = false;
+              for (auto& e : exts) {
+                  if (!strcmp(e.extensionName, "VK_KHR_8bit_storage")) ext_8bit = true;
+                  if (!strcmp(e.extensionName, "VK_KHR_16bit_storage")) ext_16bit = true;
+                  if (!strcmp(e.extensionName, "VK_KHR_shader_float16_int8")) ext_f16i8 = true;
+              }
+              VkPhysicalDeviceShaderFloat16Int8Features f16i8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+              VkPhysicalDevice8BitStorageFeatures s8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
+              VkPhysicalDevice16BitStorageFeatures s16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+              f16i8.pNext = &s8; s8.pNext = &s16;
+              VkPhysicalDeviceFeatures2 tf2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+              tf2.pNext = &f16i8;
+              vkGetPhysicalDeviceFeatures2(pd, &tf2);
+              printf("SHADER_INT16=%s SHADER_INT8=%s SHADER_FLOAT16=%s\n",
+                     tf2.features.shaderInt16 ? "yes" : "no",
+                     f16i8.shaderInt8 ? "yes" : "no",
+                     f16i8.shaderFloat16 ? "yes" : "no");
+              printf("EXT_8BIT_STORAGE=%s(sb=%s) EXT_16BIT_STORAGE=%s(sb=%s) EXT_F16I8=%s\n",
+                     ext_8bit ? "yes" : "no", s8.storageBuffer8BitAccess ? "yes" : "no",
+                     ext_16bit ? "yes" : "no", s16.storageBuffer16BitAccess ? "yes" : "no",
+                     ext_f16i8 ? "yes" : "no");
+
               uint32_t qfc = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfc, nullptr);
               std::vector<VkQueueFamilyProperties> qf(qfc);
               vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfc, qf.data());
