@@ -1388,6 +1388,53 @@ jobs:
             || { echo "::error::scan+op differs from the serial oracle (op misapplied / order bug)"; exit 1; }
           echo "PASS: std::inclusive_scan(par) with a user op offloaded a GPU product scan (matches serial)"
 
+      - name: "GATE (scan large): multi-level scan past the 65536 single-level cap"
+        run: |
+          # Phase 6: the runtime now RECURSES the block-sums scan, so std::inclusive_scan
+          # works past the old 256*256 = 65536-element limit. n = 1<<20 (pow2, 3 levels:
+          # 4096 -> 16 -> 1) and a non-pow2 n = 1000000 (partial last block at every level).
+          # int + all 1s -> out[i] = i+1 (exact), so any dropped block offset beyond block 0
+          # shows immediately (e.g. out[65536] must be 65537, not 1). Differential vs a serial
+          # oracle over the whole array.
+          cat > probe_scanbig.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          static bool run(int n) {
+              std::vector<int> v(n, 1), ref(n);
+              std::inclusive_scan(v.begin(), v.end(), ref.begin());               // serial oracle
+              std::inclusive_scan(std::execution::par, v.begin(), v.end(), v.begin()); // GPU (in place)
+              int bad = 0; for (int i = 0; i < n; ++i) if (v[i] != ref[i]) ++bad;
+              std::printf("scanbig n=%d bad=%d last=%d exp=%d cross=%d exp=%d\n",
+                          n, bad, v[n-1], n, v[65536], 65537);
+              return bad == 0;
+          }
+          int main() {
+              bool ok = run(1 << 20) & run(1000000);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/scanbig.spv" PARALLAX_DUMP_SPIRV_ADD="$PWD/scanbig_add.spv" \
+            "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_scanbig.cpp -o /dev/null 2> scanbig.log || true
+          [ -f scanbig.spv ] && { spirv-val scanbig.spv || { echo "::error::scanbig SPIR-V invalid"; exit 1; }; } \
+            || { echo "::error::no scanbig SPIR-V (inclusive_scan not detected)"; exit 1; }
+          "$CLANGXX" -std=c++20 -O2 probe_scanbig.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_scanbig 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_scanbig 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::large scan was not offloaded"; exit 1; }
+          echo "$out" | grep -q "scanbig n=1048576 bad=0 last=1048576 exp=1048576 cross=65537" \
+            || { echo "::error::1<<20 scan wrong (multi-level block-offset propagation bug)"; exit 1; }
+          echo "$out" | grep -q "scanbig n=1000000 bad=0 last=1000000" \
+            || { echo "::error::non-pow2 large scan wrong"; exit 1; }
+          echo "PASS: multi-level inclusive_scan correct at n=1<<20 and n=1000000 (cap lifted)"
+
       - name: "GATE (exclusive_scan): fully-on-GPU exclusive prefix scan (inclusive + shift)"
         run: |
           # exclusive_scan(par,first,last,d_first,init) offloads via the device_exclusive_scan
