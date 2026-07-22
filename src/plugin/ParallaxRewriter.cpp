@@ -2352,6 +2352,7 @@ private:
     bool isParallelAlgorithm(clang::CallExpr* call);
     std::string extractAlgorithmName(clang::CallExpr* call);
     clang::LambdaExpr* extractLambda(clang::CallExpr* call);
+    clang::LambdaExpr* unwrapLambda(clang::Expr* e);
     void extractIterators(clang::CallExpr* call, clang::Expr*& first, clang::Expr*& last);
     std::string generateKernelName(const TransformInfo& info);
 
@@ -2414,24 +2415,36 @@ std::string ParallaxCollectorVisitor::extractAlgorithmName(clang::CallExpr* call
 }
 
 clang::LambdaExpr* ParallaxCollectorVisitor::extractLambda(clang::CallExpr* call) {
-    // Lambda is typically the last argument
+    // Lambda is typically the last argument (the functor / comparator / binary op).
     if (call->getNumArgs() < 3) return nullptr;
+    return unwrapLambda(call->getArg(call->getNumArgs() - 1));
+}
 
-    clang::Expr* last_arg = call->getArg(call->getNumArgs() - 1)->IgnoreImplicit();
-
-    // Check if it's a lambda expression directly
-    if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(last_arg)) {
-        return lambda;
-    }
-
-    // Check if it's wrapped in casts
-    if (auto* mat_temp = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(last_arg)) {
-        if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(
-                mat_temp->getSubExpr()->IgnoreImplicit())) {
-            return lambda;
+// Reach the LambdaExpr under the by-value-functor wrappers a standard-library call
+// puts around a lambda argument. IgnoreImplicit alone is not enough: libstdc++
+// forwards e.g. inclusive_scan(par,...,op) through transform_inclusive_scan, so the op
+// arrives wrapped in ExprWithCleanups / CXXBindTemporaryExpr / CXXConstructExpr (copy)
+// that IgnoreImplicit does not strip — which is why the old (MaterializeTemporaryExpr-
+// only) unwrap worked for reduce/sort but not scan on libstdc++. IgnoreUnlessSpelledIn-
+// Source peels exactly the synthesized nodes down to the source-level expression (the
+// LambdaExpr for an inline lambda; a DeclRefExpr for a named functor -> not a lambda).
+// Belt-and-braces: a manual peel afterwards in case a wrapper survives.
+clang::LambdaExpr* ParallaxCollectorVisitor::unwrapLambda(clang::Expr* e) {
+    if (!e) return nullptr;
+    e = e->IgnoreUnlessSpelledInSource();
+    if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(e)) return lambda;
+    for (int guard = 0; e && guard < 16; ++guard) {
+        e = e->IgnoreImplicit();
+        if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(e)) return lambda;
+        if (auto* ec = llvm::dyn_cast<clang::ExprWithCleanups>(e)) { e = ec->getSubExpr(); continue; }
+        if (auto* mt = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e)) { e = mt->getSubExpr(); continue; }
+        if (auto* bt = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e)) { e = bt->getSubExpr(); continue; }
+        if (auto* fc = llvm::dyn_cast<clang::CXXFunctionalCastExpr>(e)) { e = fc->getSubExpr(); continue; }
+        if (auto* cc = llvm::dyn_cast<clang::CXXConstructExpr>(e)) {
+            if (cc->getNumArgs() >= 1) { e = cc->getArg(0); continue; }
         }
+        break;
     }
-
     return nullptr;
 }
 
