@@ -457,6 +457,66 @@ jobs:
             || { echo "::error::double produced wrong result"; exit 1; }
           echo "PASS: double for_each executed correctly end-to-end on the GPU"
 
+      - name: "GATE (narrow types): for_each + reduce over int16/uint8/_Float16"
+        run: |
+          # Phase 7: 8/16-bit int and fp16 elements. The compiler emits the narrow SPIR-V
+          # type + Int8/Int16/Float16 + StorageBuffer{8,16}BitAccess capabilities; the
+          # runtime enables the matching device features when lavapipe advertises them
+          # (the "[parallax caps]" line reports what it found). for_each uses the general
+          # path; reduce uses the fixed workgroup kernel. Small data so int accumulators
+          # don't overflow. Correctness is asserted strictly; offload is proven by at
+          # least one narrow kernel loading (types the device lacks fall back to CPU, still
+          # correct).
+          cat > probe_narrow.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <numeric>
+          #include <execution>
+          #include <cstdint>
+          #include <cstdio>
+          int main() {
+              int fails = 0;
+              { std::vector<int16_t> v(64); for (int i = 0; i < 64; ++i) v[i] = (int16_t)i;
+                std::for_each(std::execution::par, v.begin(), v.end(),
+                              [](int16_t& x){ x = (int16_t)(x + 3); });
+                for (int i = 0; i < 64; ++i) if (v[i] != (int16_t)(i + 3)) ++fails;
+                std::printf("fe_i16 v0=%d v63=%d exp 3/66\n", v[0], v[63]); }
+              { std::vector<uint8_t> v(64); for (int i = 0; i < 64; ++i) v[i] = (uint8_t)i;
+                std::for_each(std::execution::par, v.begin(), v.end(),
+                              [](uint8_t& x){ x = (uint8_t)(x + 1); });
+                for (int i = 0; i < 64; ++i) if (v[i] != (uint8_t)(i + 1)) ++fails;
+                std::printf("fe_u8 v0=%d v63=%d exp 1/64\n", v[0], v[63]); }
+              { std::vector<_Float16> v(64); for (int i = 0; i < 64; ++i) v[i] = (_Float16)i;
+                std::for_each(std::execution::par, v.begin(), v.end(),
+                              [](_Float16& x){ x = (_Float16)(x * (_Float16)2); });
+                for (int i = 0; i < 64; ++i) if ((float)v[i] != (float)(i * 2)) ++fails;
+                std::printf("fe_f16 v0=%.1f v63=%.1f exp 0/126\n", (float)v[0], (float)v[63]); }
+              { std::vector<int16_t> v(64, 100);
+                int16_t s = std::reduce(std::execution::par, v.begin(), v.end(), (int16_t)0);
+                if (s != 6400) ++fails;
+                std::printf("rd_i16 s=%d exp 6400\n", (int)s); }
+              std::printf("narrow fails=%d\n", fails);
+              return fails ? 1 : 0;
+          }
+          EOF
+          # Dump one narrow kernel + validate it (the codegen check; the i16 for_each path).
+          PARALLAX_DUMP_SPIRV="$PWD/narrow.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_narrow.cpp -o /dev/null 2> narrow.log || true
+          [ -f narrow.spv ] && { spirv-val --target-env vulkan1.2 narrow.spv \
+            || { echo "::error::narrow-type SPIR-V failed validation"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_narrow.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_narrow 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_narrow 2>&1)" || true
+          echo "$out" | grep -aE "\[parallax caps\]|fe_i16|fe_u8|fe_f16|rd_i16|narrow fails=" | head
+          echo "$out" | grep -q "narrow fails=0" \
+            || { echo "::error::narrow-type result mismatch (element-size/stride or arithmetic bug)"; exit 1; }
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::no narrow-type kernel offloaded (device lacks all of int8/int16/fp16?)"; exit 1; }
+          echo "PASS: narrow-type (int16/uint8/_Float16) for_each + reduce correct, at least one offloaded"
+
       - name: "GATE (zero-copy): arena-backed for_each binds without a copy"
         run: |
           cat > probe_zc.cpp <<'EOF'

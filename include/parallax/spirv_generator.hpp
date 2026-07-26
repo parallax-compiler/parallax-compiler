@@ -41,7 +41,7 @@ public:
     // Phase 3: the kernel's scalar element kind for fixed-skeleton primitives
     // (reduce/scan/…). SPIR-V types are emitted directly, so no LLVM type/context
     // is needed — just the element's width and float/int-ness.
-    enum class ReduceElemType { F32, F64, I32, I64 };
+    enum class ReduceElemType { F32, F64, I32, I64, I8, I16, F16 };
 
     // Emit a workgroup tree-reduction kernel for the given element type. Shared
     // memory + barriers, one partial per workgroup, fully unrolled, guarded (no

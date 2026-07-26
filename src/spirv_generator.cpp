@@ -252,6 +252,44 @@ void SPIRVGenerator::require_capability(SPIRVBuilder& builder, uint32_t capabili
     builder.set_section(prev);
 }
 
+// Element-kind properties for the fixed-skeleton kernels (reduce/scan/sort/...): whether
+// it is a float type, its bit width, and its byte size (= ArrayStride). Phase 7 adds the
+// narrow types I8/I16/F16 alongside the original F32/F64/I32/I64.
+namespace {
+struct ElemInfo { bool is_float; uint32_t bits; uint32_t bytes; };
+ElemInfo elem_info(SPIRVGenerator::ReduceElemType e) {
+    using RT = SPIRVGenerator::ReduceElemType;
+    switch (e) {
+        case RT::I8:  return {false, 8,  1};
+        case RT::I16: return {false, 16, 2};
+        case RT::F16: return {true,  16, 2};
+        case RT::I32: return {false, 32, 4};
+        case RT::F32: return {true,  32, 4};
+        case RT::I64: return {false, 64, 8};
+        case RT::F64: return {true,  64, 8};
+    }
+    return {true, 32, 4};
+}
+
+// Emit the OpCapability lines an element kind needs, INTO the current (Capabilities)
+// section. F32/I32 need only Shader (emitted by the caller). SPIR-V 1.5 folds the
+// 8/16-bit storage extensions in, so no OpExtension is required — only the capability.
+void emit_elem_capabilities(SPIRVBuilder& B, SPIRVGenerator::ReduceElemType e) {
+    using RT = SPIRVGenerator::ReduceElemType;
+    switch (e) {
+        case RT::F64: B.emit_op(SPIRVOp::OpCapability, {10}); break;                 // Float64
+        case RT::I64: B.emit_op(SPIRVOp::OpCapability, {11}); break;                 // Int64
+        case RT::I16: B.emit_op(SPIRVOp::OpCapability, {22});                        // Int16
+                      B.emit_op(SPIRVOp::OpCapability, {4433}); break;               // StorageBuffer16BitAccess
+        case RT::F16: B.emit_op(SPIRVOp::OpCapability, {9});                         // Float16
+                      B.emit_op(SPIRVOp::OpCapability, {4433}); break;               // StorageBuffer16BitAccess
+        case RT::I8:  B.emit_op(SPIRVOp::OpCapability, {39});                        // Int8
+                      B.emit_op(SPIRVOp::OpCapability, {4448}); break;               // StorageBuffer8BitAccess
+        default: break;                                                             // F32/I32: Shader only
+    }
+}
+}  // namespace
+
 std::vector<uint32_t> SPIRVGenerator::generate(llvm::Module* module) {
     std::cerr << "[SPIRVGenerator] generate(Module) called" << std::endl;
     
@@ -1083,6 +1121,16 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         builder.emit_op(SPIRVOp::OpTypeVoid, {type_id});
     } else if (type->isIntegerTy(1)) {
         builder.emit_op(SPIRVOp::OpTypeBool, {type_id});
+    } else if (type->isIntegerTy(8)) {
+        // Phase 7: 8-bit element. Reading it from a StorageBuffer needs the Int8 +
+        // StorageBuffer8BitAccess capabilities (device feature verified at kernel load).
+        require_capability(builder, 39 /* Int8 */);
+        require_capability(builder, 4448 /* StorageBuffer8BitAccess */);
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 8, 0});
+    } else if (type->isIntegerTy(16)) {
+        require_capability(builder, 22 /* Int16 */);
+        require_capability(builder, 4433 /* StorageBuffer16BitAccess */);
+        builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 16, 0});
     } else if (type->isIntegerTy(32)) {
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 32, 0});
     } else if (type->isIntegerTy(64)) {
@@ -1091,6 +1139,11 @@ uint32_t SPIRVGenerator::get_type_id(SPIRVBuilder& builder, llvm::Type* type) {
         // support is verified by the runtime at kernel load instead.
         require_capability(builder, 11 /* Int64 */);
         builder.emit_op(SPIRVOp::OpTypeInt, {type_id, 64, 0});
+    } else if (type->isHalfTy()) {
+        // Phase 7: _Float16 element. Needs Float16 + StorageBuffer16BitAccess.
+        require_capability(builder, 9 /* Float16 */);
+        require_capability(builder, 4433 /* StorageBuffer16BitAccess */);
+        builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 16});
     } else if (type->isFloatTy()) {
         builder.emit_op(SPIRVOp::OpTypeFloat, {type_id, 32});
     } else if (type->isDoubleTy()) {
@@ -1475,9 +1528,10 @@ uint32_t SPIRVGenerator::emit_inlined_op(SPIRVBuilder& B, llvm::Function* user_o
 std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem,
                                                              llvm::Function* user_op) {
     // Element kind specifics.
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     // The user-op body is translated via the shared translate_instruction path,
     // which uses these member caches/state — start clean (and not pointer-chasing).
@@ -1495,8 +1549,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     // Capabilities.
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10}); // Float64
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11}); // Int64
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     // Logical addressing (this primitive needs no physical pointers).
     B.set_section(SPIRVBuilder::Section::Preamble);
@@ -1510,8 +1563,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1 /*Input*/, v3uint});
@@ -1754,9 +1807,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_reduce_kernel(ReduceElemType elem
 // Bindings/push layout match dispatch_reduce_level (src@0, dst@1, push {count,...}).
 std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem,
                                                            llvm::Function* user_op) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -1771,8 +1825,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem,
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10}); // Float64
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11}); // Int64
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
@@ -1785,8 +1838,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem,
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1 /*Input*/, v3uint});
@@ -2007,9 +2060,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_kernel(ReduceElemType elem,
 // is the sum of all prior blocks. Block 0 needs no offset. No shared memory.
 std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType elem,
                                                                llvm::Function* user_op) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -2021,8 +2075,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
@@ -2034,8 +2087,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -2170,9 +2223,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
 // previous index and addend are picked with OpSelect, so out[0]=init and
 // out[i]=init+in[i-1]. push { uint count@0, elem init@8 }.
 std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElemType elem) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -2184,8 +2238,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
@@ -2197,8 +2250,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -2331,9 +2384,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
 // of i is 0. No shared memory or barriers — the runtime sequences the stages.
 std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem,
                                                            llvm::Function* user_op) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     // The user comparator is translated via the shared translate_instruction path,
     // which uses these member caches/state — start clean (and not pointer-chasing).
@@ -2350,8 +2404,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem,
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
@@ -2363,8 +2416,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem,
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -2549,9 +2602,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_sort_kernel(ReduceElemType elem,
 // so element i was kept iff positions[i] != positions[i-1], and its destination is
 // positions[i]-1. Writes input@0 to output@1. Logical GLSL450; no shared memory.
 std::vector<uint32_t> SPIRVGenerator::generate_scatter_kernel(ReduceElemType elem) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -2563,8 +2617,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_scatter_kernel(ReduceElemType ele
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});            // Shader
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});        // Logical GLSL450
@@ -2576,8 +2629,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_scatter_kernel(ReduceElemType ele
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -2752,9 +2805,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_scatter_kernel(ReduceElemType ele
 // Phase 5: unique flags. flag[i] = (i==0 || in[i] != in[i-1]) ? 1 : 0, marking the
 // first element of each run of equal adjacent values. input@0, flags@1, push {count}.
 std::vector<uint32_t> SPIRVGenerator::generate_unique_flags_kernel(ReduceElemType elem) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -2766,8 +2820,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_unique_flags_kernel(ReduceElemTyp
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});
@@ -2779,8 +2832,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_unique_flags_kernel(ReduceElemTyp
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -2927,9 +2980,10 @@ std::vector<uint32_t> SPIRVGenerator::generate_unique_flags_kernel(ReduceElemTyp
 // (positions[i]!=positions[i-1]) to rank positions[i]-1 at the front, not-kept to
 // num_true + (i - positions[i]) at the back. push { uint count, uint num_true }.
 std::vector<uint32_t> SPIRVGenerator::generate_partition_scatter_kernel(ReduceElemType elem) {
-    const bool is_float = (elem == ReduceElemType::F32 || elem == ReduceElemType::F64);
-    const bool is_wide  = (elem == ReduceElemType::F64 || elem == ReduceElemType::I64);
-    const uint32_t stride = is_wide ? 8 : 4;
+    const ElemInfo ei = elem_info(elem);
+    const bool is_float = ei.is_float;
+    const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
+    const uint32_t stride = ei.bytes;
 
     type_cache_.clear();
     constant_cache_.clear();
@@ -2941,8 +2995,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_partition_scatter_kernel(ReduceEl
 
     B.set_section(SPIRVBuilder::Section::Capabilities);
     B.emit_op(SPIRVOp::OpCapability, {1});
-    if (elem == ReduceElemType::F64) B.emit_op(SPIRVOp::OpCapability, {10});
-    if (elem == ReduceElemType::I64) B.emit_op(SPIRVOp::OpCapability, {11});
+    emit_elem_capabilities(B, elem);  // Float64/Int64/Int16/Int8/Float16 + narrow-storage caps
 
     B.set_section(SPIRVBuilder::Section::Preamble);
     B.emit_op(SPIRVOp::OpMemoryModel, {0, 1});
@@ -2954,8 +3007,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_partition_scatter_kernel(ReduceEl
     uint32_t bool_t = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeBool, {bool_t});
 
     uint32_t elem_t = B.get_next_id();
-    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, is_wide ? 64u : 32u});
-    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, is_wide ? 64u : 32u, 1});
+    if (is_float) B.emit_op(SPIRVOp::OpTypeFloat, {elem_t, ei.bits});
+    else          B.emit_op(SPIRVOp::OpTypeInt,   {elem_t, ei.bits, 1});
 
     uint32_t v3uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeVector, {v3uint, uint_t, 3});
     uint32_t ptr_in_v3 = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_in_v3, 1, v3uint});
@@ -3262,7 +3315,9 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         } else {
             data_elem_stride = static_cast<uint32_t>(data_elem_ty->getPrimitiveSizeInBits() / 8);
         }
-        if (data_elem_stride < 4) data_elem_stride = 4;
+        // Narrow elements (int8=1, int16/_Float16=2) must keep their true byte size so the
+        // device array spacing matches the host vector exactly; only guard a 0 (unknown).
+        if (data_elem_stride == 0) data_elem_stride = 4;
     }
 
     // RuntimeArray { element }
@@ -3304,7 +3359,7 @@ void SPIRVGenerator::generate_kernel_wrapper(SPIRVBuilder& builder, uint32_t ent
         if (oe != data_elem_id) {
             out_elem_id = oe;
             uint32_t out_stride = static_cast<uint32_t>(out_ty->getPrimitiveSizeInBits() / 8);
-            if (out_stride < 4) out_stride = 4;
+            if (out_stride == 0) out_stride = 4;  // keep narrow output sizes exact (int8=1, int16=2)
             builder.set_section(SPIRVBuilder::Section::Types);
             uint32_t o_rarray = builder.get_next_id();
             builder.emit_op(SPIRVOp::OpTypeRuntimeArray, {o_rarray, out_elem_id});

@@ -1083,6 +1083,24 @@ std::string ParallaxRewriter::getFunctorVariableName(clang::CallExpr* call_expr)
 /**
  * Collector visitor - Phase 1: Collect transformations
  */
+// Map a scalar element QualType to the SPIR-V fixed-kernel element kind by its bit width.
+// Phase 7: 8/16-bit ints and _Float16 get their own kinds instead of being widened to
+// I32/F32 (which silently mis-sized the device buffer). Returns false for non-scalars.
+static bool elem_kind_by_width(clang::ASTContext& ctx, clang::QualType qt,
+                               SPIRVGenerator::ReduceElemType& out) {
+    using RT = SPIRVGenerator::ReduceElemType;
+    const uint64_t sz = ctx.getTypeSize(qt);  // in bits
+    if (qt->isRealFloatingType()) {
+        out = (sz <= 16) ? RT::F16 : (sz <= 32) ? RT::F32 : RT::F64;
+        return true;
+    }
+    if (qt->isIntegerType()) {
+        out = (sz <= 8) ? RT::I8 : (sz <= 16) ? RT::I16 : (sz <= 32) ? RT::I32 : RT::I64;
+        return true;
+    }
+    return false;
+}
+
 class ParallaxCollectorVisitor : public clang::RecursiveASTVisitor<ParallaxCollectorVisitor> {
 public:
     ParallaxCollectorVisitor(clang::ASTContext& context,
@@ -1189,13 +1207,9 @@ public:
             return;
         clang::QualType elemT = targs->get(0).getAsType();
         SPIRVGenerator::ReduceElemType ek;
-        if (elemT->isRealFloatingType())
-            ek = context_.getTypeSize(elemT) >= 64 ? SPIRVGenerator::ReduceElemType::F64
-                                                   : SPIRVGenerator::ReduceElemType::F32;
-        else if (elemT->isIntegerType())
-            ek = context_.getTypeSize(elemT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
-                                                   : SPIRVGenerator::ReduceElemType::I32;
-        else { llvm::errs() << "[ParallaxFunnel] fixed-kernel: unsupported element type; host fallback\n"; return; }
+        if (!elem_kind_by_width(context_, elemT, ek)) {
+            llvm::errs() << "[ParallaxFunnel] fixed-kernel: unsupported element type; host fallback\n"; return;
+        }
 
         std::string key = clang::PredefinedExpr::ComputeName(
             clang::PredefinedIdentKind::PrettyFunction, FD);
@@ -1557,17 +1571,7 @@ public:
         };
         // Map a scalar element QualType to the SPIR-V reduce element kind.
         auto elem_kind = [&](clang::QualType qt, SPIRVGenerator::ReduceElemType& out) -> bool {
-            if (qt->isRealFloatingType()) {
-                out = context_.getTypeSize(qt) >= 64 ? SPIRVGenerator::ReduceElemType::F64
-                                                     : SPIRVGenerator::ReduceElemType::F32;
-                return true;
-            }
-            if (qt->isIntegerType()) {
-                out = context_.getTypeSize(qt) >= 64 ? SPIRVGenerator::ReduceElemType::I64
-                                                     : SPIRVGenerator::ReduceElemType::I32;
-                return true;
-            }
-            return false;
+            return elem_kind_by_width(context_, qt, out);
         };
 
         // Phase 3: transform_reduce(par, first, last, init, reduce_op, transform_op)
@@ -2071,13 +2075,7 @@ public:
             info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
 
             SPIRVGenerator::ReduceElemType ek;
-            if (elemQT->isRealFloatingType()) {
-                ek = context_.getTypeSize(elemQT) >= 64 ? SPIRVGenerator::ReduceElemType::F64
-                                                        : SPIRVGenerator::ReduceElemType::F32;
-            } else if (elemQT->isIntegerType()) {
-                ek = context_.getTypeSize(elemQT) >= 64 ? SPIRVGenerator::ReduceElemType::I64
-                                                        : SPIRVGenerator::ReduceElemType::I32;
-            } else {
+            if (!elem_kind_by_width(context_, elemQT, ek)) {
                 llvm::errs() << "[ParallaxCollector] reduce: unsupported element type "
                              << info.elem_type_str << "; leaving on CPU\n";
                 return true;
