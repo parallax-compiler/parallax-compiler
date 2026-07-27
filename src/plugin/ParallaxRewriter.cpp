@@ -73,6 +73,13 @@ struct TransformInfo {
     // transform, spirv = scan, spirv_scan = add-offsets, spirv_scan_add = finalize/shift.
     bool is_transform_exscan = false;
 
+    // Phase 8: min_element / max_element. spirv = the block-level argmax kernel; the
+    // replacement calls parallax_argminmax (host-combines the per-block winners) and
+    // returns std::next(first, index). argmm_is_float selects the host value comparison.
+    bool is_argminmax = false;
+    bool argmm_want_max = false;
+    bool argmm_is_float = false;
+
     // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
     bool is_sort = false;
@@ -685,6 +692,33 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
            << "__plx_scratch.data(), (void*)&(*__plx_dfirst), __plx_n, sizeof(" << acc
            << "), &__plx_init);\n";
         rs << "  std::next(__plx_dfirst, __plx_n);\n";  // returns the output end iterator
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 8: std::min_element / std::max_element -> run the block-level argmax kernel and
+    // parallax_argminmax (host-combines the per-block winners), then return the iterator
+    // std::next(first, index). Empty range -> index 0 -> first (== last).
+    if (transform.is_argminmax) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU " << (transform.argmm_want_max ? "max_element" : "min_element")
+           << " (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_m", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_m = nullptr;\n";
+        rs << "  if (!" << k << "_m) " << k << "_m = parallax_kernel_load(" << k
+           << "_m_spirv, sizeof(" << k << "_m_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_idx = (__plx_n == 0) ? 0 : parallax_argminmax(" << k << "_m, "
+           << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), "
+           << (transform.argmm_is_float ? 1 : 0) << ", " << (transform.argmm_want_max ? 1 : 0) << ");\n";
+        rs << "  std::next(__plx_first, __plx_idx);\n";  // the (first) extremum, or last if empty
         rs << "});";
         return rs.str();
     }
@@ -2323,6 +2357,52 @@ public:
             return true;
         }
 
+        // Phase 8: std::min_element / std::max_element(par, first, last) -> the block-level
+        // argmax kernel + a host combine (parallax_argminmax), yielding the iterator to the
+        // first extremum. The 4-arg custom-comparator form is deferred (falls to CPU).
+        if (info.algorithm_name == "min_element" || info.algorithm_name == "max_element") {
+            if (call->getNumArgs() != 3) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
+                             << ": custom comparator unsupported; CPU\n";
+                return true;
+            }
+            info.first_iterator = call->getArg(1);
+            info.last_iterator = call->getArg(2);
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
+                             << ": element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
+                             << ": unsupported element type; CPU\n";
+                return true;
+            }
+            info.is_argminmax = true;
+            info.argmm_want_max = (info.algorithm_name == "max_element");
+            info.argmm_is_float = elemQT->isRealFloatingType();
+            info.kernel_name = generateKernelName(info);
+            SPIRVGenerator g; g.set_target_vulkan_version(1, 2);
+            info.spirv = g.generate_argmax_kernel(ek);
+            if (info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
+                             << ": SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": generated argmax("
+                         << info.spirv.size() << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -2658,6 +2738,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::inclusive_scan" && name != "std::sort" &&
         name != "std::transform_inclusive_scan" &&
         name != "std::transform_exclusive_scan" &&
+        name != "std::min_element" && name != "std::max_element" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::partition" &&
         name != "std::fill" && name != "std::copy") {

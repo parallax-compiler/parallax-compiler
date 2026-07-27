@@ -1704,6 +1704,61 @@ jobs:
             || { echo "::error::sort result not ascending / not a permutation"; exit 1; }
           echo "PASS: std::sort(par) offloaded a GPU bitonic sort (padded, ascending)"
 
+      - name: "GATE (min/max_element): argmax keystone (index-carrying reduce)"
+        run: |
+          # Phase 8 skeleton: std::min_element / std::max_element run the block-level argmax
+          # kernel (each workgroup reduces to its (value,index) extremum, ties -> smaller
+          # index) then host-combine the per-block winners via parallax_argminmax, returning
+          # the iterator. N=5000 (20 blocks) with a unique min and max planted at known
+          # positions. Differential vs the serial std:: oracle on BOTH index and value, for
+          # int and float.
+          cat > probe_mm.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdint>
+          #include <cstdio>
+          template <class V>
+          static int check(const char* tag) {
+              const int N = 5000;
+              V v(N);
+              uint32_t st = 2463534242u;
+              auto rng = [&]{ st ^= st<<13; st ^= st>>17; st ^= st<<5; return st % 90000u + 1000u; };
+              for (int i = 0; i < N; ++i) v[i] = static_cast<typename V::value_type>(rng());
+              v[1234] = static_cast<typename V::value_type>(1);       // unique min
+              v[4321] = static_cast<typename V::value_type>(200000);  // unique max
+              auto rmin = std::min_element(v.begin(), v.end());               // serial oracle
+              auto rmax = std::max_element(v.begin(), v.end());
+              auto gmin = std::min_element(std::execution::par, v.begin(), v.end());  // GPU
+              auto gmax = std::max_element(std::execution::par, v.begin(), v.end());
+              long dmin = std::distance(v.begin(), gmin), emin = std::distance(v.begin(), rmin);
+              long dmax = std::distance(v.begin(), gmax), emax = std::distance(v.begin(), rmax);
+              int ok = (dmin == emin) && (dmax == emax) && (*gmin == *rmin) && (*gmax == *rmax);
+              std::printf("%s minidx g=%ld r=%ld maxidx g=%ld r=%ld ok=%d\n", tag, dmin, emin, dmax, emax, ok);
+              return ok ? 0 : 1;
+          }
+          int main() { return check<std::vector<int>>("mm_int") | check<std::vector<float>>("mm_flt"); }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/mm.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_mm.cpp -o /dev/null 2> mm.log || true
+          grep -E "min_element: generated argmax" mm.log | head -1 \
+            || { echo "::error::min_element not routed to argmax (routing?)"; exit 1; }
+          [ -f mm.spv ] && { spirv-val mm.spv || { echo "::error::argmax SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_mm.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_mm 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_mm 2>&1)" || true
+          echo "$out" | grep -aE "mm_int|mm_flt|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::argmax kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "mm_int .*ok=1" \
+            || { echo "::error::min/max_element (int) wrong index or value"; exit 1; }
+          echo "$out" | grep -q "mm_flt .*ok=1" \
+            || { echo "::error::min/max_element (float) wrong index or value"; exit 1; }
+          echo "PASS: std::min_element / std::max_element(par) offloaded (argmax + host combine, int + float)"
+
       - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
         run: |
           # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into

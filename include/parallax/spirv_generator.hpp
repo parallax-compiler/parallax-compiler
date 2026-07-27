@@ -52,6 +52,15 @@ public:
     std::vector<uint32_t> generate_reduce_kernel(ReduceElemType elem,
                                                  llvm::Function* user_op = nullptr);
 
+    // Phase 8: block-level arg-min / arg-max (the keystone for min/max/minmax_element and
+    // the find family). Each workgroup argmin/argmaxes its 256 elements in shared memory
+    // (out-of-range lanes lose by INDEX, so no sentinel value is needed) and writes the
+    // block winner's value -> vals@1 and original index -> idxs@2 (uint) at idxs[wgid].
+    // push { uint count@0, uint want_max@4 } (one kernel does both; ties -> smaller index,
+    // so min_element/max_element return the FIRST extremum). The host combines the few
+    // per-block winners. data@0.
+    std::vector<uint32_t> generate_argmax_kernel(ReduceElemType elem);
+
     // Phase 5: inclusive prefix scan. Two fixed kernels the runtime dispatches in 3
     // passes (see launch_scan): generate_scan_kernel does a per-workgroup Hillis-
     // Steele inclusive scan in place (data@0) and writes each chunk total to
