@@ -68,6 +68,11 @@ struct TransformInfo {
     // transform, spirv = per-block scan, spirv_scan = add-offsets. acc_type_str = U.
     bool is_transform_scan = false;
 
+    // Phase 8: transform_exclusive_scan = transform(unary_op, T->U) into a scratch, then
+    // exclusive_scan(binary_op, init) into d_first. Four kernels: spirv_transform =
+    // transform, spirv = scan, spirv_scan = add-offsets, spirv_scan_add = finalize/shift.
+    bool is_transform_exscan = false;
+
     // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
     bool is_sort = false;
@@ -631,6 +636,54 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         // 2) inclusive-scan the transformed values in place with binary_op.
         rs << "  parallax_scan(" << k << "_s, " << k << "_a, (void*)&(*__plx_dfirst), "
            << "__plx_n, sizeof(" << acc << "));\n";
+        rs << "  std::next(__plx_dfirst, __plx_n);\n";  // returns the output end iterator
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 8: std::transform_exclusive_scan -> transform(unary_op) T->U into a scratch,
+    // then exclusive_scan(binary_op, init) into d_first. Uses parallax_exclusive_scan
+    // (scan+add+shift); the scratch is the scan's in-place working buffer (destroyed),
+    // d_first receives the shifted exclusive result — so they must be distinct.
+    if (transform.is_transform_exscan) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        std::string out_it   = getSourceText(transform.output_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;                          // T
+        std::string acc = transform.acc_type_str.empty() ? et : transform.acc_type_str;  // U
+        std::string init = transform.init_expr
+            ? getSourceText(transform.init_expr->getSourceRange()) : (acc + "()");
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU transform_exclusive_scan (" << et << " -> " << acc << ") */\n";
+        rs << generateSPIRVArray(k + "_t", transform.spirv_transform);  // transform (unary)
+        rs << generateSPIRVArray(k + "_s", transform.spirv);            // per-block scan
+        rs << generateSPIRVArray(k + "_a", transform.spirv_scan);       // add-offsets
+        rs << generateSPIRVArray(k + "_f", transform.spirv_scan_add);   // finalize/shift
+        rs << "  static parallax_kernel_t " << k << "_t = nullptr, " << k << "_s = nullptr, "
+           << k << "_a = nullptr, " << k << "_f = nullptr;\n";
+        rs << "  if (!" << k << "_t) " << k << "_t = parallax_kernel_load(" << k
+           << "_t_spirv, sizeof(" << k << "_t_spirv)/sizeof(uint32_t));\n";
+        rs << "  if (!" << k << "_s) " << k << "_s = parallax_kernel_load(" << k
+           << "_s_spirv, sizeof(" << k << "_s_spirv)/sizeof(uint32_t));\n";
+        rs << "  if (!" << k << "_a) " << k << "_a = parallax_kernel_load(" << k
+           << "_a_spirv, sizeof(" << k << "_a_spirv)/sizeof(uint32_t));\n";
+        rs << "  if (!" << k << "_f) " << k << "_f = parallax_kernel_load(" << k
+           << "_f_spirv, sizeof(" << k << "_f_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  auto __plx_dfirst = (" << out_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  std::vector<" << acc << "> __plx_scratch(__plx_n);\n";
+        // 1) transform each input T through unary_op into the scratch (U elements).
+        rs << "  parallax_kernel_launch_transform2(" << k << "_t, (void*)&(*__plx_first), "
+           << "__plx_scratch.data(), __plx_n, sizeof(" << et << "), sizeof(" << acc << "));\n";
+        // 2) exclusive-scan the scratch (destroyed) into d_first with binary_op + init.
+        rs << "  " << acc << " __plx_init = (" << init << ");\n";
+        rs << "  parallax_exclusive_scan(" << k << "_s, " << k << "_a, " << k << "_f, "
+           << "__plx_scratch.data(), (void*)&(*__plx_dfirst), __plx_n, sizeof(" << acc
+           << "), &__plx_init);\n";
         rs << "  std::next(__plx_dfirst, __plx_n);\n";  // returns the output end iterator
         rs << "});";
         return rs.str();
@@ -2180,6 +2233,96 @@ public:
             return true;
         }
 
+        // Phase 8: std::transform_exclusive_scan(par, first, last, d_first, init, binary_op,
+        // unary_op) = transform(unary_op: T->U) into a scratch, then exclusive_scan(binary_op,
+        // init) into d_first. FOUR kernels: spirv_transform=transform, spirv=scan,
+        // spirv_scan=add-offsets, spirv_scan_add=shift (the shift takes the binary op too, so
+        // non-'+' ops are correct). Both ops must be non-capturing lambdas.
+        if (info.algorithm_name == "transform_exclusive_scan") {
+            if (call->getNumArgs() != 7) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: expected 7 args; CPU\n";
+                return true;
+            }
+            extractIterators(call, info.first_iterator, info.last_iterator);
+            info.output_iterator = call->getArg(3);
+            info.init_expr        = call->getArg(4);
+            clang::Expr* binary_op_expr = call->getArg(5);
+            clang::Expr* unary_op_expr  = call->getArg(6);
+            if (!info.first_iterator || !info.last_iterator || !info.output_iterator) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: missing iterators; CPU\n";
+                return true;
+            }
+
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (const clang::VarDecl* oc = traceIteratorToContainer(info.output_iterator)) {
+                if (!hasParallaxAllocator(oc->getType())) rewriter_.markContainerForAllocation(oc);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+
+            clang::LambdaExpr* uop = as_lambda(unary_op_expr);
+            if (!uop) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: non-lambda unary op; CPU\n";
+                return true;
+            }
+            clang::QualType accQT = uop->getCallOperator()->getReturnType();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(accQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: unsupported accumulator type; CPU\n";
+                return true;
+            }
+            info.acc_type_str = accQT.getUnqualifiedType().getAsString();
+            auto uop_module = ir_generator_.generateIR(uop, context_);
+            llvm::Function* uop_func = nullptr;
+            if (uop_module)
+                for (auto& f : *uop_module) if (!f.isDeclaration()) { uop_func = &f; break; }
+            if (!uop_func) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: failed to compile unary op; CPU\n";
+                return true;
+            }
+            SPIRVGenerator tgen; tgen.set_target_vulkan_version(1, 2);
+            info.spirv_transform = tgen.generate_from_lambda(uop_func, {info.elem_type_str, info.acc_type_str + "&"});
+
+            clang::LambdaExpr* bop = as_lambda(binary_op_expr);
+            if (!bop) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: non-lambda binary op; CPU\n";
+                return true;
+            }
+            auto bop_module = ir_generator_.generateIR(bop, context_);
+            llvm::Function* bop_func = nullptr;
+            if (bop_module)
+                for (auto& f : *bop_module) if (!f.isDeclaration()) { bop_func = &f; break; }
+            if (!bop_func || bop_func->arg_size() != 2) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: bad/ capturing binary op; CPU\n";
+                return true;
+            }
+            SPIRVGenerator sgen; sgen.set_target_vulkan_version(1, 2);
+            info.spirv          = sgen.generate_scan_kernel(ek, bop_func);          // per-block scan
+            info.spirv_scan     = sgen.generate_scan_add_kernel(ek, bop_func);      // add-offsets
+            info.spirv_scan_add = sgen.generate_exclusive_shift_kernel(ek, bop_func); // finalize/shift
+            if (info.spirv.empty() || info.spirv_scan.empty() ||
+                info.spirv_scan_add.empty() || info.spirv_transform.empty()) {
+                llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: SPIR-V generation failed\n";
+                return true;
+            }
+
+            info.is_transform_exscan = true;
+            info.kernel_name = generateKernelName(info);
+            llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: generated transform("
+                         << info.spirv_transform.size() << ") + scan/add/shift for "
+                         << info.elem_type_str << " -> " << info.acc_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -2514,6 +2657,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
         name != "std::inclusive_scan" && name != "std::sort" &&
         name != "std::transform_inclusive_scan" &&
+        name != "std::transform_exclusive_scan" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::partition" &&
         name != "std::fill" && name != "std::copy") {

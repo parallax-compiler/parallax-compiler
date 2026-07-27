@@ -71,7 +71,11 @@ public:
     // out[i]=init+sum(src[0..i-1]). push { uint count@0, elem init@8 } (16 bytes). Pairs
     // with the two inclusive-scan kernels (run over a scratch copy of the input) to give a
     // fully-on-GPU std::exclusive_scan (default '+').
-    std::vector<uint32_t> generate_exclusive_shift_kernel(ReduceElemType elem);
+    // user_op (binary T(T,T)) makes the finalize compute out[i] = op(init, incl[i-1])
+    // for i>0 and out[0]=init, instead of the baked '+'. Pair with the op-taking scan
+    // kernels for a fully-custom-op exclusive scan. Non-capturing binary ops only.
+    std::vector<uint32_t> generate_exclusive_shift_kernel(ReduceElemType elem,
+                                                          llvm::Function* user_op = nullptr);
 
     // Phase 5: one global bitonic compare-exchange stage (ascending). data@0, push
     // { uint count, uint k, uint j }. The runtime (launch_sort) dispatches it over

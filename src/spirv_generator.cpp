@@ -2222,7 +2222,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_scan_add_kernel(ReduceElemType el
 // out[gid] = init + (gid>0 ? in[gid-1] : 0). Branchless (no shared mem/barriers): the
 // previous index and addend are picked with OpSelect, so out[0]=init and
 // out[i]=init+in[i-1]. push { uint count@0, elem init@8 }.
-std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElemType elem) {
+std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElemType elem,
+                                                                      llvm::Function* user_op) {
     const ElemInfo ei = elem_info(elem);
     const bool is_float = ei.is_float;
     const bool is_wide  = (ei.bits == 64);   // 64-bit -> two-word literal constants
@@ -2231,6 +2232,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
     type_cache_.clear();
     constant_cache_.clear();
     pointer_type_cache_.clear();
+    active_element_type_ = nullptr;
+    element_is_pointer_ = false;
+    relocatable_values_.clear();
 
     SPIRVBuilder B;
     B.set_section(SPIRVBuilder::Section::Header);
@@ -2315,6 +2319,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17, 256, 1, 1});
 
+    // Optional user binary op T(T,T): out[i>0] = op(init, incl[i-1]) (else baked '+').
+    uint32_t op_fn_id = emit_inlined_op(B, user_op, elem_t, uint_t, bool_t, elem_t);
+
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
     B.emit_op(SPIRVOp::OpLabel, {B.get_next_id()});
@@ -2344,11 +2351,19 @@ std::vector<uint32_t> SPIRVGenerator::generate_exclusive_shift_kernel(ReduceElem
     B.emit_op(SPIRVOp::OpAccessChain, {ptr_sb_elem, p_prev, in_var, U(0), prev_idx});
     uint32_t prevv = B.get_next_id();
     B.emit_op(SPIRVOp::OpLoad, {elem_t, prevv, p_prev});
-    // addend = is_first ? 0 : in[gid-1]; val = init + addend.
-    uint32_t addend = B.get_next_id();
-    B.emit_op(SPIRVOp::OpSelect, {elem_t, addend, is_first, elem_zero, prevv});
+    // out[0] = init; out[i>0] = op(init, in[i-1]). Default '+' uses the branchless
+    // addend=0 trick; a user op computes op(init, prevv) and selects init for gid==0
+    // (op(init, 0) != init for a non-'+' op, so the identity trick can't be reused).
     uint32_t val = B.get_next_id();
-    B.emit_op(is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd, {elem_t, val, init, addend});
+    if (op_fn_id) {
+        uint32_t combined = B.get_next_id();
+        B.emit_op(SPIRVOp::OpFunctionCall, {elem_t, combined, op_fn_id, init, prevv});
+        B.emit_op(SPIRVOp::OpSelect, {elem_t, val, is_first, init, combined});
+    } else {
+        uint32_t addend = B.get_next_id();
+        B.emit_op(SPIRVOp::OpSelect, {elem_t, addend, is_first, elem_zero, prevv});
+        B.emit_op(is_float ? SPIRVOp::OpFAdd : SPIRVOp::OpIAdd, {elem_t, val, init, addend});
+    }
 
     // if (gid < count) out[gid] = val;
     uint32_t in_range = B.get_next_id();

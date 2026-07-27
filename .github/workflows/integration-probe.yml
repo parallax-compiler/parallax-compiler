@@ -1610,6 +1610,49 @@ jobs:
             || { echo "::error::transform_inclusive_scan differs from serial oracle"; exit 1; }
           echo "PASS: std::transform_inclusive_scan(par) offloaded (transform+scan compose, matches serial)"
 
+      - name: "GATE (transform_exclusive_scan): transform(uop) then exclusive_scan(bop,init)"
+        run: |
+          # Phase 8 skeleton: std::transform_exclusive_scan(par,f,l,d,init,bop,uop) composes
+          # transform + exclusive_scan (FOUR kernels: transform + scan + add + finalize/shift).
+          # The shift kernel now takes the binary op too (out[i>0]=op(init,incl[i-1]), out[0]=
+          # init) so a non-'+' op is correct; here bop=+ with init=5 -> o[i]=5+2*(v[0..i-1]).
+          # Differential vs the serial std:: oracle.
+          cat > probe_tes.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<int> v(N), ref(N), o(N);
+              for (int i = 0; i < N; ++i) v[i] = (i % 4) + 1;
+              auto bop = [](int a, int b){ return a + b; };
+              auto uop = [](int x){ return x * 2; };
+              std::transform_exclusive_scan(v.begin(), v.end(), ref.begin(), 5, bop, uop);          // serial oracle
+              std::transform_exclusive_scan(std::execution::par, v.begin(), v.end(), o.begin(), 5, bop, uop); // GPU
+              int bad = 0; for (int i = 0; i < N; ++i) if (o[i] != ref[i]) ++bad;
+              std::printf("tes bad=%d o0=%d o1=%d o999=%d ref999=%d\n", bad, o[0], o[1], o[999], ref[999]);
+              return bad ? 1 : 0;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/tes.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_tes.cpp -o /dev/null 2> tes.log || true
+          grep -E "transform_exclusive_scan: generated transform" tes.log | head -1 \
+            || { echo "::error::transform_exclusive_scan not composed (routing?)"; exit 1; }
+          [ -f tes.spv ] && { spirv-val tes.spv || { echo "::error::transform_exclusive_scan SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_tes.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_tes 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_tes 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::transform_exclusive_scan not offloaded"; exit 1; }
+          echo "$out" | grep -q "tes bad=0" \
+            || { echo "::error::transform_exclusive_scan differs from serial oracle (shift-op bug?)"; exit 1; }
+          echo "PASS: std::transform_exclusive_scan(par) offloaded (transform+exclusive_scan, custom-op shift, matches serial)"
+
       - name: "GATE (sort): std::sort(par) offloads a bitonic sort"
         run: |
           # Phase 5: the plugin detects std::sort, emits a bitonic compare-exchange
