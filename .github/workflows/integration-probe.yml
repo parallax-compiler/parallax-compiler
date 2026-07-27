@@ -1566,6 +1566,50 @@ jobs:
             || { echo "::error::exclusive_scan produced a wrong result"; exit 1; }
           echo "PASS: std::exclusive_scan(par) offloaded fully on the GPU (inclusive + shift)"
 
+      - name: "GATE (transform_inclusive_scan): transform(uop) then inclusive_scan(bop)"
+        run: |
+          # Phase 8 skeleton: std::transform_inclusive_scan(par,first,last,d_first,bop,uop)
+          # composes the existing transform + scan kernels — the plugin emits THREE blobs
+          # (transform + per-block scan + add-offsets) and a replacement that runs
+          # transform2 into d_first then parallax_scan over it in place. uop doubles each
+          # element, bop sums; over 1..4 repeating that is a prefix sum of 2*v[i].
+          # Differential vs the serial std:: oracle (non-policy, the CPU reference).
+          cat > probe_tis.cpp <<'EOF'
+          #include <vector>
+          #include <numeric>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 1000;
+              std::vector<int> v(N), ref(N), o(N);
+              for (int i = 0; i < N; ++i) v[i] = (i % 4) + 1;
+              auto bop = [](int a, int b){ return a + b; };
+              auto uop = [](int x){ return x * 2; };
+              std::transform_inclusive_scan(v.begin(), v.end(), ref.begin(), bop, uop);          // serial oracle
+              std::transform_inclusive_scan(std::execution::par, v.begin(), v.end(), o.begin(), bop, uop); // GPU
+              int bad = 0; for (int i = 0; i < N; ++i) if (o[i] != ref[i]) ++bad;
+              std::printf("tis bad=%d o0=%d o999=%d ref999=%d\n", bad, o[0], o[999], ref[999]);
+              return bad ? 1 : 0;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/tis.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_tis.cpp -o /dev/null 2> tis.log || true
+          grep -E "transform_inclusive_scan: generated transform" tis.log | head -1 \
+            || { echo "::error::transform_inclusive_scan not composed (routing?)"; exit 1; }
+          [ -f tis.spv ] && { spirv-val tis.spv || { echo "::error::transform_inclusive_scan SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_tis.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_tis 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_tis 2>&1)" || true
+          echo "$out" | grep -v "^\[" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::transform_inclusive_scan not offloaded"; exit 1; }
+          echo "$out" | grep -q "tis bad=0" \
+            || { echo "::error::transform_inclusive_scan differs from serial oracle"; exit 1; }
+          echo "PASS: std::transform_inclusive_scan(par) offloaded (transform+scan compose, matches serial)"
+
       - name: "GATE (sort): std::sort(par) offloads a bitonic sort"
         run: |
           # Phase 5: the plugin detects std::sort, emits a bitonic compare-exchange
