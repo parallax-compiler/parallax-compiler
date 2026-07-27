@@ -2182,6 +2182,10 @@ public:
         // over d_first in place. Composes the transform + scan kernels (three blobs). Both
         // ops must be non-capturing lambdas (like the reduce/scan keystones).
         if (info.algorithm_name == "transform_inclusive_scan") {
+            // libstdc++ implements inclusive_scan(par,...,op) by forwarding to an INTERNAL
+            // transform_inclusive_scan (in a system header). Only route the user's own call,
+            // never the library-internal one, or we double-process and break inclusive_scan.
+            if (context_.getSourceManager().isInSystemHeader(call->getBeginLoc())) return true;
             if (call->getNumArgs() != 6) {
                 llvm::errs() << "[ParallaxCollector] transform_inclusive_scan: expected 6 args; CPU\n";
                 return true;
@@ -2273,6 +2277,8 @@ public:
         // spirv_scan=add-offsets, spirv_scan_add=shift (the shift takes the binary op too, so
         // non-'+' ops are correct). Both ops must be non-capturing lambdas.
         if (info.algorithm_name == "transform_exclusive_scan") {
+            // As above: never route a library-internal transform_exclusive_scan (system header).
+            if (context_.getSourceManager().isInSystemHeader(call->getBeginLoc())) return true;
             if (call->getNumArgs() != 7) {
                 llvm::errs() << "[ParallaxCollector] transform_exclusive_scan: expected 7 args; CPU\n";
                 return true;
