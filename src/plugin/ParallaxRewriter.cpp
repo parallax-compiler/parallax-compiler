@@ -1750,6 +1750,18 @@ public:
             return true;
         }
 
+        // Only ever route the USER's own algorithm calls. Standard-library implementations
+        // forward between the parallel algorithms internally (e.g. libstdc++ inclusive_scan
+        // -> transform_inclusive_scan -> inclusive_scan, all in system headers); routing those
+        // library-internal instantiations double-processes calls and, via AST-traversal-order-
+        // dependent side effects, could make the user's own call bail to CPU. Skipping system
+        // headers here fixes that class of conflict once, for every current and future
+        // whitelist entry. User code (incl. generic-wrapper lambda bodies) is never in a
+        // system header, so this is transparent to real programs.
+        if (context_.getSourceManager().isInSystemHeader(call->getBeginLoc())) {
+            return true;
+        }
+
         llvm::errs() << "[ParallaxCollector] Found parallel algorithm call\n";
 
         // Extract transformation info
