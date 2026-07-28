@@ -1759,6 +1759,53 @@ jobs:
             || { echo "::error::min/max_element (float) wrong index or value"; exit 1; }
           echo "PASS: std::min_element / std::max_element(par) offloaded (argmax + host combine, int + float)"
 
+      - name: "GATE (minmax_element): first-min / last-max via two argmax dispatches"
+        run: |
+          # Phase 8 skeleton: std::minmax_element returns {first smallest, LAST largest}. Two
+          # dispatches of the argmax kernel (min want_last=0, max want_last=1) via
+          # parallax_argminmax, returned as a std::pair. DUPLICATE min and max are planted so
+          # the tie-break is exercised: min must be the FIRST, max the LAST. Differential vs
+          # the serial std:: oracle.
+          cat > probe_mmx.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdint>
+          #include <cstdio>
+          int main() {
+              const int N = 5000;
+              std::vector<int> v(N);
+              uint32_t st = 2463534242u;
+              auto rng = [&]{ st ^= st<<13; st ^= st>>17; st ^= st<<5; return st % 50000u + 100u; };
+              for (auto& x : v) x = rng();
+              v[100] = 1;       v[3000] = 1;        // min 1 at 100 & 3000  -> min_element = 100 (first)
+              v[500] = 100000;  v[4500] = 100000;   // max at 500 & 4500    -> minmax max = 4500 (last)
+              auto rp = std::minmax_element(v.begin(), v.end());                       // serial oracle
+              auto gp = std::minmax_element(std::execution::par, v.begin(), v.end());  // GPU
+              long rmn = std::distance(v.begin(), rp.first),  rmx = std::distance(v.begin(), rp.second);
+              long gmn = std::distance(v.begin(), gp.first),  gmx = std::distance(v.begin(), gp.second);
+              std::printf("minmax gmn=%ld rmn=%ld gmx=%ld rmx=%ld\n", gmn, rmn, gmx, rmx);
+              return (gmn == rmn && gmx == rmx) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/mmx.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_mmx.cpp -o /dev/null 2> mmx.log || true
+          grep -E "minmax_element: generated argmax" mmx.log | head -1 \
+            || { echo "::error::minmax_element not routed"; exit 1; }
+          [ -f mmx.spv ] && { spirv-val mmx.spv || { echo "::error::minmax argmax SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_mmx.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_mmx 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_mmx 2>&1)" || true
+          echo "$out" | grep -aE "minmax gmn|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::minmax argmax kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "minmax gmn=100 rmn=100 gmx=4500 rmx=4500" \
+            || { echo "::error::minmax_element wrong (first-min/last-max tie-break bug)"; exit 1; }
+          echo "PASS: std::minmax_element(par) offloaded (first-min / last-max, two argmax dispatches)"
+
       - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
         run: |
           # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into

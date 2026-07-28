@@ -1859,7 +1859,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_argmax_kernel(ReduceElemType elem
     uint32_t ptr_wg_uarr = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_wg_uarr, 4, uarr});
     uint32_t ptr_wg_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_wg_uint, 4, uint_t});
 
-    uint32_t pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {pc_struct, uint_t, uint_t});
+    uint32_t pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {pc_struct, uint_t, uint_t, uint_t});
     uint32_t ptr_pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_struct, 9, pc_struct});
     uint32_t ptr_pc_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_uint, 9, uint_t});
 
@@ -1887,6 +1887,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_argmax_kernel(ReduceElemType elem
     B.emit_op(SPIRVOp::OpDecorate, {idxs_var, 34, 0}); B.emit_op(SPIRVOp::OpDecorate, {idxs_var, 33, 3});
     B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 0, 35, 0});
     B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 1, 35, 4});
+    B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 2, 35, 8});  // want_last (minmax's max = last)
     B.emit_op(SPIRVOp::OpDecorate, {pc_struct, 2});
     B.emit_op(SPIRVOp::OpDecorate, {gid_var, 11, 28});
     B.emit_op(SPIRVOp::OpDecorate, {lid_var, 11, 27});
@@ -1914,6 +1915,9 @@ std::vector<uint32_t> SPIRVGenerator::generate_argmax_kernel(ReduceElemType elem
     uint32_t pcw = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_pc_uint, pcw, pc_var, U(1)});
     uint32_t wantmax = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {uint_t, wantmax, pcw});
     uint32_t is_max = B.get_next_id(); B.emit_op(SPIRVOp::OpINotEqual, {bool_t, is_max, wantmax, U(0)});
+    uint32_t pcl = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_pc_uint, pcl, pc_var, U(2)});
+    uint32_t wantlast = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {uint_t, wantlast, pcl});
+    uint32_t is_last = B.get_next_id(); B.emit_op(SPIRVOp::OpINotEqual, {bool_t, is_last, wantlast, U(0)});
 
     // Load data[safe_gid] into shared; mark validity by index (sidx = gid; gid>=count loses).
     uint32_t inb = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, inb, gid, count});
@@ -1948,8 +1952,12 @@ std::vector<uint32_t> SPIRVGenerator::generate_argmax_kernel(ReduceElemType elem
         uint32_t bbetter = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {bool_t, bbetter, is_max, bgt, blt});
         uint32_t veq = B.get_next_id();
         B.emit_op(is_float ? SPIRVOp::OpFOrdEqual : SPIRVOp::OpIEqual, {bool_t, veq, b_v, a_v});
+        // Tie-break: normally the SMALLER index wins (first extremum); minmax's max wants
+        // the LARGER index (last), selected by is_last.
         uint32_t ismaller = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, ismaller, b_i, a_i});
-        uint32_t tie = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, tie, veq, ismaller});
+        uint32_t ilarger = B.get_next_id(); B.emit_op(SPIRVOp::OpUGreaterThan, {bool_t, ilarger, b_i, a_i});
+        uint32_t idx_pref = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {bool_t, idx_pref, is_last, ilarger, ismaller});
+        uint32_t tie = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, tie, veq, idx_pref});
         uint32_t a_valid = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, a_valid, a_i, count});
         uint32_t b_valid = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, b_valid, b_i, count});
         uint32_t a_inv = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalNot, {bool_t, a_inv, a_valid});

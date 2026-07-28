@@ -79,6 +79,9 @@ struct TransformInfo {
     bool is_argminmax = false;
     bool argmm_want_max = false;
     bool argmm_is_float = false;
+    // Phase 8: minmax_element -> both a min (first) and a max (LAST largest) argmax. A
+    // minmax kernel runs two dispatches; argmm_want_last flips the max's tie-break.
+    bool is_minmax = false;
 
     // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
@@ -717,8 +720,37 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
         rs << "  size_t __plx_idx = (__plx_n == 0) ? 0 : parallax_argminmax(" << k << "_m, "
            << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), "
-           << (transform.argmm_is_float ? 1 : 0) << ", " << (transform.argmm_want_max ? 1 : 0) << ");\n";
+           << (transform.argmm_is_float ? 1 : 0) << ", " << (transform.argmm_want_max ? 1 : 0)
+           << ", 0);\n";  // min/max_element return the FIRST extremum (want_last=0)
         rs << "  std::next(__plx_first, __plx_idx);\n";  // the (first) extremum, or last if empty
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 8: std::minmax_element -> two argmax dispatches on the same kernel (the min is
+    // the FIRST smallest, the max the LAST largest per the standard), returned as a
+    // std::pair of iterators.
+    if (transform.is_minmax) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+        int isf = transform.argmm_is_float ? 1 : 0;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU minmax_element (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_m", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_m = nullptr;\n";
+        rs << "  if (!" << k << "_m) " << k << "_m = parallax_kernel_load(" << k
+           << "_m_spirv, sizeof(" << k << "_m_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_mn = (__plx_n == 0) ? 0 : parallax_argminmax(" << k << "_m, "
+           << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), " << isf << ", 0, 0);\n";
+        rs << "  size_t __plx_mx = (__plx_n == 0) ? 0 : parallax_argminmax(" << k << "_m, "
+           << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), " << isf << ", 1, 1);\n";
+        rs << "  std::make_pair(std::next(__plx_first, __plx_mn), std::next(__plx_first, __plx_mx));\n";
         rs << "});";
         return rs.str();
     }
@@ -2366,7 +2398,8 @@ public:
         // Phase 8: std::min_element / std::max_element(par, first, last) -> the block-level
         // argmax kernel + a host combine (parallax_argminmax), yielding the iterator to the
         // first extremum. The 4-arg custom-comparator form is deferred (falls to CPU).
-        if (info.algorithm_name == "min_element" || info.algorithm_name == "max_element") {
+        if (info.algorithm_name == "min_element" || info.algorithm_name == "max_element" ||
+            info.algorithm_name == "minmax_element") {
             if (call->getNumArgs() != 3) {
                 llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
                              << ": custom comparator unsupported; CPU\n";
@@ -2392,7 +2425,8 @@ public:
                              << ": unsupported element type; CPU\n";
                 return true;
             }
-            info.is_argminmax = true;
+            info.is_minmax = (info.algorithm_name == "minmax_element");
+            info.is_argminmax = !info.is_minmax;  // minmax uses its own pair-returning path
             info.argmm_want_max = (info.algorithm_name == "max_element");
             info.argmm_is_float = elemQT->isRealFloatingType();
             info.kernel_name = generateKernelName(info);
@@ -2745,6 +2779,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform_inclusive_scan" &&
         name != "std::transform_exclusive_scan" &&
         name != "std::min_element" && name != "std::max_element" &&
+        name != "std::minmax_element" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::partition" &&
         name != "std::fill" && name != "std::copy") {
