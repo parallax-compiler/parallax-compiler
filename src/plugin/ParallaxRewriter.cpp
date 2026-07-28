@@ -83,6 +83,11 @@ struct TransformInfo {
     // minmax kernel runs two dispatches; argmm_want_last flips the max's tie-break.
     bool is_minmax = false;
 
+    // Phase 8: find_if / find_if_not. spirv = the predicate-find kernel; the replacement
+    // calls parallax_find and returns std::next(first, index) (== last if not found).
+    bool is_find = false;
+    bool find_negate = false;  // find_if_not
+
     // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
     bool is_sort = false;
@@ -751,6 +756,34 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
         rs << "  size_t __plx_mx = (__plx_n == 0) ? 0 : parallax_argminmax(" << k << "_m, "
            << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), " << isf << ", 1, 1);\n";
         rs << "  std::make_pair(std::next(__plx_first, __plx_mn), std::next(__plx_first, __plx_mx));\n";
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 8: std::find_if / std::find_if_not -> the predicate-find kernel + parallax_find
+    // (host-min of per-block first-matches), returning std::next(first, index) (== last if
+    // no match). find_if_not passes negate=1.
+    if (transform.is_find) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU " << (transform.find_negate ? "find_if_not" : "find_if")
+           << " (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_f", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_f = nullptr;\n";
+        rs << "  if (!" << k << "_f) " << k << "_f = parallax_kernel_load(" << k
+           << "_f_spirv, sizeof(" << k << "_f_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_idx = (__plx_n == 0) ? 0 : parallax_find(" << k << "_f, "
+           << "(void*)&(*__plx_first), __plx_n, sizeof(" << et << "), "
+           << (transform.find_negate ? 1 : 0) << ");\n";
+        // parallax_find returns count (== n) when no match, so std::next lands on `last`.
+        rs << "  std::next(__plx_first, __plx_idx);\n";
         rs << "});";
         return rs.str();
     }
@@ -2443,6 +2476,64 @@ public:
             return true;
         }
 
+        // Phase 8: std::find_if / std::find_if_not(par, first, last, pred) -> the predicate-
+        // find kernel + parallax_find, yielding the iterator to the first match (or last).
+        // Non-capturing predicate lambdas only.
+        if (info.algorithm_name == "find_if" || info.algorithm_name == "find_if_not") {
+            // Only route the user's own call, never a library-internal one (some std::
+            // algorithms forward through find_if in system headers).
+            if (context_.getSourceManager().isInSystemHeader(call->getBeginLoc())) return true;
+            if (call->getNumArgs() != 4) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": expected 4 args; CPU\n";
+                return true;
+            }
+            info.first_iterator = call->getArg(1);
+            info.last_iterator = call->getArg(2);
+            clang::Expr* pred_expr = call->getArg(3);
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": unsupported element type; CPU\n";
+                return true;
+            }
+            clang::LambdaExpr* pred = as_lambda(pred_expr);
+            if (!pred) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": non-lambda predicate; CPU\n";
+                return true;
+            }
+            auto pred_module = ir_generator_.generateIR(pred, context_);
+            llvm::Function* pred_func = nullptr;
+            if (pred_module)
+                for (auto& f : *pred_module) if (!f.isDeclaration()) { pred_func = &f; break; }
+            if (!pred_func || pred_func->arg_size() != 1) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": bad/ capturing predicate; CPU\n";
+                return true;
+            }
+            info.is_find = true;
+            info.find_negate = (info.algorithm_name == "find_if_not");
+            info.kernel_name = generateKernelName(info);
+            SPIRVGenerator g; g.set_target_vulkan_version(1, 2);
+            info.spirv = g.generate_find_kernel(ek, pred_func);
+            if (info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": generated find("
+                         << info.spirv.size() << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -2780,6 +2871,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform_exclusive_scan" &&
         name != "std::min_element" && name != "std::max_element" &&
         name != "std::minmax_element" &&
+        name != "std::find_if" && name != "std::find_if_not" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::partition" &&
         name != "std::fill" && name != "std::copy") {

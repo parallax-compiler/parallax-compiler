@@ -1806,6 +1806,54 @@ jobs:
             || { echo "::error::minmax_element wrong (first-min/last-max tie-break bug)"; exit 1; }
           echo "PASS: std::minmax_element(par) offloaded (first-min / last-max, two argmax dispatches)"
 
+      - name: "GATE (find_if): first predicate match (predicate-find kernel)"
+        run: |
+          # Phase 8 skeleton: std::find_if / std::find_if_not run the predicate-find kernel
+          # (each block reduces to its first matching index; host takes the overall min) and
+          # return the iterator to the FIRST match, or `last` if none. Differential vs the
+          # serial std:: oracle: a planted first-match, a find_if_not case, and a not-found
+          # case (must return end()).
+          cat > probe_find.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 5000;
+              std::vector<int> v(N, 0);
+              v[1777] = 99;                                   // first (only) match for x > 50
+              std::vector<int> w(N, 5);
+              w[2500] = -1;                                   // first NOT (x >= 0) is index 2500
+              auto rif  = std::find_if(v.begin(), v.end(), [](int x){ return x > 50; });
+              auto gif  = std::find_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 50; });
+              auto rnf  = std::find_if_not(w.begin(), w.end(), [](int x){ return x >= 0; });
+              auto gnf  = std::find_if_not(std::execution::par, w.begin(), w.end(), [](int x){ return x >= 0; });
+              auto gnff = std::find_if(std::execution::par, v.begin(), v.end(), [](int x){ return x > 1000000; });
+              long dif  = std::distance(v.begin(), gif),  eif = std::distance(v.begin(), rif);
+              long dnf  = std::distance(w.begin(), gnf),  enf = std::distance(w.begin(), rnf);
+              long dnff = std::distance(v.begin(), gnff);
+              std::printf("find if=%ld/%ld ifnot=%ld/%ld notfound=%ld/%d\n", dif, eif, dnf, enf, dnff, N);
+              return (dif == eif && dnf == enf && dnff == N) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/find.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_find.cpp -o /dev/null 2> find.log || true
+          grep -E "find_if: generated find" find.log | head -1 \
+            || { echo "::error::find_if not routed"; exit 1; }
+          [ -f find.spv ] && { spirv-val find.spv || { echo "::error::find SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_find.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_find 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_find 2>&1)" || true
+          echo "$out" | grep -aE "find if=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::find kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "find if=1777/1777 ifnot=2500/2500 notfound=5000/5000" \
+            || { echo "::error::find_if wrong (first-match/negate/not-found)"; exit 1; }
+          echo "PASS: std::find_if / std::find_if_not(par) offloaded (predicate-find, first match + not-found)"
+
       - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
         run: |
           # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into

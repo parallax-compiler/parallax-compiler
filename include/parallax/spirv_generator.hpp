@@ -61,6 +61,13 @@ public:
     // per-block winners. data@0.
     std::vector<uint32_t> generate_argmax_kernel(ReduceElemType elem);
 
+    // Phase 8: find_if / find_if_not. Inlines the user predicate (T->bool); each lane's
+    // candidate index is gid when the predicate holds (negated by push.negate), else `count`
+    // (a sentinel that loses the block-min). Each workgroup writes its min matching index to
+    // out@1[wgid]; the host takes the overall min -> the FIRST match (or count if none).
+    // push { uint count@0, uint negate@4 }. data@0. Non-capturing predicate lambdas only.
+    std::vector<uint32_t> generate_find_kernel(ReduceElemType elem, llvm::Function* pred);
+
     // Phase 5: inclusive prefix scan. Two fixed kernels the runtime dispatches in 3
     // passes (see launch_scan): generate_scan_kernel does a per-workgroup Hillis-
     // Steele inclusive scan in place (data@0) and writes each chunk total to
