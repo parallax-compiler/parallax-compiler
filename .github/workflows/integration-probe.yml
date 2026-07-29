@@ -1854,6 +1854,57 @@ jobs:
             || { echo "::error::find_if wrong (first-match/negate/not-found)"; exit 1; }
           echo "PASS: std::find_if / std::find_if_not(par) offloaded (predicate-find, first match + not-found)"
 
+      - name: "GATE (find / adjacent_find): value-equality + adjacent-equality find"
+        run: |
+          # Phase 8 skeleton: std::find(par,f,l,value) [value in push, x==value] and
+          # std::adjacent_find(par,f,l) [x==data[gid+1]] reuse the find kernel (FindMode
+          # Value / Adjacent). stable_partition also lands here (it aliases the already-
+          # order-preserving GPU compaction). Differential vs the serial std:: oracle.
+          cat > probe_find2.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 5000;
+              std::vector<int> v(N); for (int i = 0; i < N; ++i) v[i] = i;   // 0..N-1 distinct
+              auto rf = std::find(v.begin(), v.end(), 42);                              // serial: idx 42
+              auto gf = std::find(std::execution::par, v.begin(), v.end(), 42);         // GPU
+              std::vector<int> w(N); for (int i = 0; i < N; ++i) w[i] = i;
+              w[2000] = 2001;                                                            // w[2000]==w[2001]
+              auto ra = std::adjacent_find(w.begin(), w.end());                         // serial: idx 2000
+              auto ga = std::adjacent_find(std::execution::par, w.begin(), w.end());    // GPU
+              // stable_partition: even goes first, order preserved within each group.
+              std::vector<int> p(20); for (int i = 0; i < 20; ++i) p[i] = i;
+              std::vector<int> pref(p);
+              auto pmid = std::stable_partition(p.begin(), p.end(), [](int x){ return x % 2 == 0; });      // serial? no policy -> host
+              auto grmid= std::stable_partition(std::execution::par, pref.begin(), pref.end(), [](int x){ return x % 2 == 0; });
+              bool peq = std::equal(p.begin(), p.end(), pref.begin());
+              long df=std::distance(v.begin(),gf), ef=std::distance(v.begin(),rf);
+              long da=std::distance(w.begin(),ga), ea=std::distance(w.begin(),ra);
+              std::printf("find val=%ld/%ld adj=%ld/%ld stablepart_eq=%d\n", df, ef, da, ea, peq?1:0);
+              (void)pmid;(void)grmid;
+              return (df==ef && da==ea && peq) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/find2.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_find2.cpp -o /dev/null 2> find2.log || true
+          grep -E "find: generated find|adjacent_find: generated find" find2.log | head -2 \
+            || { echo "::error::find/adjacent_find not routed"; exit 1; }
+          [ -f find2.spv ] && { spirv-val find2.spv || { echo "::error::find2 SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_find2.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_find2 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_find2 2>&1)" || true
+          echo "$out" | grep -aE "find val=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::find/adjacent_find/stable_partition not offloaded"; exit 1; }
+          echo "$out" | grep -q "find val=42/42 adj=2000/2000 stablepart_eq=1" \
+            || { echo "::error::find(value)/adjacent_find/stable_partition wrong result"; exit 1; }
+          echo "PASS: std::find(value) / std::adjacent_find / std::stable_partition(par) offloaded"
+
       - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
         run: |
           # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into

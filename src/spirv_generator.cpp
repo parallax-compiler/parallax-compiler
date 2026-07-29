@@ -2011,7 +2011,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_argmax_kernel(ReduceElemType elem
 // matching indices (non-matching / out-of-range lanes contribute `count`, which loses) and
 // writes its min to out@1[wgid]. The host takes the overall min -> the FIRST match, or count
 // if none. push { uint count@0, uint negate@4 }.
-std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, llvm::Function* pred) {
+std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, llvm::Function* pred,
+                                                           FindMode mode) {
     const ElemInfo ei = elem_info(elem);
     const bool is_float = ei.is_float;
     const uint32_t stride = ei.bytes;
@@ -2061,9 +2062,11 @@ std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, 
     uint32_t ptr_wg_uarr = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_wg_uarr, 4, uarr});
     uint32_t ptr_wg_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_wg_uint, 4, uint_t});
 
-    uint32_t pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {pc_struct, uint_t, uint_t});
+    // push { uint count@0, uint negate@4, elem value@8 } — value used only by Value mode.
+    uint32_t pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypeStruct, {pc_struct, uint_t, uint_t, elem_t});
     uint32_t ptr_pc_struct = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_struct, 9, pc_struct});
     uint32_t ptr_pc_uint = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_uint, 9, uint_t});
+    uint32_t ptr_pc_elem = B.get_next_id(); B.emit_op(SPIRVOp::OpTypePointer, {ptr_pc_elem, 9, elem_t});
 
     uint32_t gid_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_in_v3, gid_var, 1});
     uint32_t lid_var  = B.get_next_id(); B.emit_op(SPIRVOp::OpVariable, {ptr_in_v3, lid_var, 1});
@@ -2084,6 +2087,7 @@ std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, 
     B.emit_op(SPIRVOp::OpDecorate, {out_var, 34, 0}); B.emit_op(SPIRVOp::OpDecorate, {out_var, 33, 1});
     B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 0, 35, 0});
     B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 1, 35, 4});
+    B.emit_op(SPIRVOp::OpMemberDecorate, {pc_struct, 2, 35, 8});  // value (Value mode)
     B.emit_op(SPIRVOp::OpDecorate, {pc_struct, 2});
     B.emit_op(SPIRVOp::OpDecorate, {gid_var, 11, 28});
     B.emit_op(SPIRVOp::OpDecorate, {lid_var, 11, 27});
@@ -2097,7 +2101,8 @@ std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, 
     for (uint32_t id : iface) B.emit_word(id);
     B.emit_op(SPIRVOp::OpExecutionMode, {main_id, 17, 256, 1, 1});
 
-    uint32_t pred_fn = emit_inlined_op(B, pred, elem_t, uint_t, bool_t, bool_t);
+    uint32_t pred_fn = (mode == FindMode::Predicate)
+        ? emit_inlined_op(B, pred, elem_t, uint_t, bool_t, bool_t) : 0;
 
     B.set_section(SPIRVBuilder::Section::Code);
     B.emit_op(SPIRVOp::OpFunction, {void_t, main_id, 0, fn_t});
@@ -2114,15 +2119,35 @@ std::vector<uint32_t> SPIRVGenerator::generate_find_kernel(ReduceElemType elem, 
     uint32_t negraw = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {uint_t, negraw, pcn});
     uint32_t negate = B.get_next_id(); B.emit_op(SPIRVOp::OpINotEqual, {bool_t, negate, negraw, U(0)});
 
-    // match = pred(data[safe_gid]) (^ negate) && gid < count; cand = match ? gid : count.
+    // cand = (matches && in range) ? gid : count. The "matches" test depends on FindMode.
     uint32_t inb = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, inb, gid, count});
     uint32_t safe_gid = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {uint_t, safe_gid, inb, gid, U(0)});
     uint32_t p_din = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_e_elem, p_din, data_var, U(0), safe_gid});
     uint32_t dval = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {elem_t, dval, p_din});
-    uint32_t praw = B.get_next_id(); B.emit_op(SPIRVOp::OpFunctionCall, {bool_t, praw, pred_fn, dval});
-    uint32_t pneg = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalNot, {bool_t, pneg, praw});
-    uint32_t pv = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {bool_t, pv, negate, pneg, praw});
-    uint32_t match = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, match, pv, inb});
+    uint32_t match;
+    if (mode == FindMode::Predicate) {
+        uint32_t praw = B.get_next_id(); B.emit_op(SPIRVOp::OpFunctionCall, {bool_t, praw, pred_fn, dval});
+        uint32_t pneg = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalNot, {bool_t, pneg, praw});
+        uint32_t pv = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {bool_t, pv, negate, pneg, praw});
+        match = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, match, pv, inb});
+    } else if (mode == FindMode::Value) {
+        uint32_t pval = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_pc_elem, pval, pc_var, U(2)});
+        uint32_t val = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {elem_t, val, pval});
+        uint32_t eq = B.get_next_id();
+        B.emit_op(is_float ? SPIRVOp::OpFOrdEqual : SPIRVOp::OpIEqual, {bool_t, eq, dval, val});
+        match = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, match, eq, inb});
+    } else {  // Adjacent: data[gid] == data[gid+1], with gid+1 in range.
+        uint32_t g1 = B.get_next_id(); B.emit_op(SPIRVOp::OpIAdd, {uint_t, g1, gid, U(1)});
+        uint32_t has_next = B.get_next_id(); B.emit_op(SPIRVOp::OpULessThan, {bool_t, has_next, g1, count});
+        uint32_t safe_g1 = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {uint_t, safe_g1, has_next, g1, U(0)});
+        uint32_t p_nxt = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_e_elem, p_nxt, data_var, U(0), safe_g1});
+        uint32_t nxt = B.get_next_id(); B.emit_op(SPIRVOp::OpLoad, {elem_t, nxt, p_nxt});
+        uint32_t eq = B.get_next_id();
+        B.emit_op(is_float ? SPIRVOp::OpFOrdEqual : SPIRVOp::OpIEqual, {bool_t, eq, dval, nxt});
+        uint32_t eqn = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, eqn, eq, has_next});
+        match = B.get_next_id(); B.emit_op(SPIRVOp::OpLogicalAnd, {bool_t, match, eqn, inb});
+    }
+    (void)negate;
     uint32_t cand = B.get_next_id(); B.emit_op(SPIRVOp::OpSelect, {uint_t, cand, match, gid, count});
     uint32_t p_si = B.get_next_id(); B.emit_op(SPIRVOp::OpAccessChain, {ptr_wg_uint, p_si, si_var, tid});
     B.emit_op(SPIRVOp::OpStore, {p_si, cand});

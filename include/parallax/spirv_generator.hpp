@@ -43,6 +43,10 @@ public:
     // is needed — just the element's width and float/int-ness.
     enum class ReduceElemType { F32, F64, I32, I64, I8, I16, F16 };
 
+    // Phase 8 find family: how each lane decides it "matches". Predicate = user pred(x)
+    // (find_if); Value = x == push.value (find); Adjacent = x == data[gid+1] (adjacent_find).
+    enum class FindMode { Predicate, Value, Adjacent };
+
     // Emit a workgroup tree-reduction kernel for the given element type. Shared
     // memory + barriers, one partial per workgroup, fully unrolled, guarded (no
     // identity element). Logical GLSL450; the runtime dispatches it iteratively
@@ -66,7 +70,8 @@ public:
     // (a sentinel that loses the block-min). Each workgroup writes its min matching index to
     // out@1[wgid]; the host takes the overall min -> the FIRST match (or count if none).
     // push { uint count@0, uint negate@4 }. data@0. Non-capturing predicate lambdas only.
-    std::vector<uint32_t> generate_find_kernel(ReduceElemType elem, llvm::Function* pred);
+    std::vector<uint32_t> generate_find_kernel(ReduceElemType elem, llvm::Function* pred,
+                                               FindMode mode = FindMode::Predicate);
 
     // Phase 5: inclusive prefix scan. Two fixed kernels the runtime dispatches in 3
     // passes (see launch_scan): generate_scan_kernel does a per-workgroup Hillis-
