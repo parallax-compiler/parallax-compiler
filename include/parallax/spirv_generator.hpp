@@ -73,6 +73,11 @@ public:
     std::vector<uint32_t> generate_find_kernel(ReduceElemType elem, llvm::Function* pred,
                                                FindMode mode = FindMode::Predicate);
 
+    // Phase 8: mismatch / equal. Two input ranges a@0, b@3; each lane's candidate is gid
+    // when a[gid] != b[gid], else count. Block-min -> out@1; the host min = the FIRST
+    // mismatch index (or count = ranges equal up to count). push { uint count@0 }.
+    std::vector<uint32_t> generate_mismatch_kernel(ReduceElemType elem);
+
     // Phase 5: inclusive prefix scan. Two fixed kernels the runtime dispatches in 3
     // passes (see launch_scan): generate_scan_kernel does a per-workgroup Hillis-
     // Steele inclusive scan in place (data@0) and writes each chunk total to

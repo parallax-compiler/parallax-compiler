@@ -91,6 +91,11 @@ struct TransformInfo {
     int  find_mode = 0;
     clang::Expr* find_value = nullptr;
 
+    // Phase 8: mismatch / equal. spirv = the two-range mismatch kernel; output_iterator is
+    // the second range (f2). mismatch yields a pair of iterators; equal yields a bool.
+    bool is_mismatch = false;
+    bool is_equal = false;
+
     // Phase 5: sort. spirv holds the bitonic compare-exchange kernel; the replacement
     // pads the range to a power of two, sorts in place, and copies back. '<' only.
     bool is_sort = false;
@@ -793,6 +798,37 @@ std::string ParallaxRewriter::generateReplacementCode(TransformInfo& transform) 
            << (transform.find_mode == 1 ? "&__plx_val" : "nullptr") << ");\n";
         // parallax_find returns count (== n) when no match, so std::next lands on `last`.
         rs << "  std::next(__plx_first, __plx_idx);\n";
+        rs << "});";
+        return rs.str();
+    }
+
+    // Phase 8: std::mismatch / std::equal -> the two-range mismatch kernel + parallax_mismatch
+    // (host-min of per-block first mismatches). mismatch yields the pair of iterators at the
+    // first differing position; equal yields (first mismatch == n).
+    if (transform.is_mismatch || transform.is_equal) {
+        std::string first_it = getSourceText(transform.first_iterator->getSourceRange());
+        std::string last_it  = getSourceText(transform.last_iterator->getSourceRange());
+        std::string second_it = getSourceText(transform.output_iterator->getSourceRange());
+        const std::string& et = transform.elem_type_str;
+        const std::string& k = transform.kernel_name;
+
+        std::ostringstream rs;
+        rs << "({\n";
+        rs << "  /* Parallax GPU " << (transform.is_equal ? "equal" : "mismatch") << " (" << et << ") */\n";
+        rs << generateSPIRVArray(k + "_m", transform.spirv);
+        rs << "  static parallax_kernel_t " << k << "_m = nullptr;\n";
+        rs << "  if (!" << k << "_m) " << k << "_m = parallax_kernel_load(" << k
+           << "_m_spirv, sizeof(" << k << "_m_spirv)/sizeof(uint32_t));\n";
+        rs << "  auto __plx_first = (" << first_it << ");\n";
+        rs << "  auto __plx_second = (" << second_it << ");\n";
+        rs << "  size_t __plx_n = (size_t)std::distance(__plx_first, (" << last_it << "));\n";
+        rs << "  size_t __plx_idx = (__plx_n == 0) ? 0 : parallax_mismatch(" << k << "_m, "
+           << "(void*)&(*__plx_first), (void*)&(*__plx_second), __plx_n, sizeof(" << et << "));\n";
+        if (transform.is_equal) {
+            rs << "  (__plx_idx == __plx_n);\n";  // equal iff no mismatch within [0,n)
+        } else {
+            rs << "  std::make_pair(std::next(__plx_first, __plx_idx), std::next(__plx_second, __plx_idx));\n";
+        }
         rs << "});";
         return rs.str();
     }
@@ -2568,6 +2604,53 @@ public:
             return true;
         }
 
+        // Phase 8: std::mismatch / std::equal(par, first1, last1, first2) -> the two-range
+        // mismatch kernel + parallax_mismatch. mismatch yields the pair of iterators at the
+        // first difference; equal yields whether the ranges match (default == only, 4-arg).
+        if (info.algorithm_name == "mismatch" || info.algorithm_name == "equal") {
+            if (context_.getSourceManager().isInSystemHeader(call->getBeginLoc())) return true;
+            if (call->getNumArgs() != 4) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name
+                             << ": only the 4-arg (default ==) form; CPU\n";
+                return true;
+            }
+            info.first_iterator = call->getArg(1);
+            info.last_iterator = call->getArg(2);
+            info.output_iterator = call->getArg(3);  // second range (first2)
+            clang::QualType elemQT;
+            if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
+                elemQT = getContainerElementType(c->getType().getNonReferenceType());
+                if (!hasParallaxAllocator(c->getType())) rewriter_.markContainerForAllocation(c);
+            }
+            if (const clang::VarDecl* c2 = traceIteratorToContainer(info.output_iterator)) {
+                if (!hasParallaxAllocator(c2->getType())) rewriter_.markContainerForAllocation(c2);
+            }
+            if (elemQT.isNull()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": element type undetermined; CPU\n";
+                return true;
+            }
+            info.element_type = elemQT;
+            info.elem_type_str = elemQT.getUnqualifiedType().getAsString();
+            SPIRVGenerator::ReduceElemType ek;
+            if (!elem_kind(elemQT, ek)) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": unsupported element type; CPU\n";
+                return true;
+            }
+            info.is_mismatch = (info.algorithm_name == "mismatch");
+            info.is_equal = (info.algorithm_name == "equal");
+            info.kernel_name = generateKernelName(info);
+            SPIRVGenerator g; g.set_target_vulkan_version(1, 2);
+            info.spirv = g.generate_mismatch_kernel(ek);
+            if (info.spirv.empty()) {
+                llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": SPIR-V generation failed\n";
+                return true;
+            }
+            llvm::errs() << "[ParallaxCollector] " << info.algorithm_name << ": generated mismatch("
+                         << info.spirv.size() << ") for " << info.elem_type_str << "\n";
+            rewriter_.addTransform(info);
+            return true;
+        }
+
         // Phase 3: std::reduce has no lambda (default '+') and yields a value, so
         // it takes a dedicated path: generate the fixed reduction kernel and a
         // value-producing replacement.
@@ -2907,6 +2990,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::minmax_element" &&
         name != "std::find_if" && name != "std::find_if_not" &&
         name != "std::find" && name != "std::adjacent_find" &&
+        name != "std::mismatch" && name != "std::equal" &&
         name != "std::copy_if" && name != "std::remove_if" && name != "std::unique" &&
         name != "std::partition" && name != "std::stable_partition" &&
         name != "std::fill" && name != "std::copy") {

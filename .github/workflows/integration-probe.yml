@@ -1905,6 +1905,49 @@ jobs:
             || { echo "::error::find(value)/adjacent_find/stable_partition wrong result"; exit 1; }
           echo "PASS: std::find(value) / std::adjacent_find / std::stable_partition(par) offloaded"
 
+      - name: "GATE (mismatch / equal): two-range first-difference"
+        run: |
+          # Phase 8 skeleton: std::mismatch / std::equal (4-arg, default ==) run the two-range
+          # mismatch kernel (a@0, b@3; block-min of indices where a[i]!=b[i]) via
+          # parallax_mismatch. mismatch yields the pair at the first difference; equal yields
+          # (first mismatch == n). Differential vs the serial std:: oracle.
+          cat > probe_mm.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 5000;
+              std::vector<int> a(N), b(N);
+              for (int i = 0; i < N; ++i) { a[i] = i; b[i] = i; }
+              b[3141] = -1;                                         // first difference at 3141
+              auto rm = std::mismatch(a.begin(), a.end(), b.begin());                        // serial
+              auto gm = std::mismatch(std::execution::par, a.begin(), a.end(), b.begin());   // GPU
+              long dm = std::distance(a.begin(), gm.first), em = std::distance(a.begin(), rm.first);
+              bool ge_diff = std::equal(std::execution::par, a.begin(), a.end(), b.begin());  // false
+              bool ge_same = std::equal(std::execution::par, a.begin(), a.end(), a.begin());  // true
+              std::printf("mismatch g=%ld r=%ld equal_diff=%d equal_same=%d\n", dm, em, ge_diff?1:0, ge_same?1:0);
+              return (dm == em && !ge_diff && ge_same) ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/mmk.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_mm.cpp -o /dev/null 2> mmk.log || true
+          grep -E "(mismatch|equal): generated mismatch" mmk.log | head -1 \
+            || { echo "::error::mismatch/equal not routed"; exit 1; }
+          [ -f mmk.spv ] && { spirv-val mmk.spv || { echo "::error::mismatch SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_mm.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_mm 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_mm 2>&1)" || true
+          echo "$out" | grep -aE "mismatch g=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::mismatch/equal kernel not offloaded"; exit 1; }
+          echo "$out" | grep -q "mismatch g=3141 r=3141 equal_diff=0 equal_same=1" \
+            || { echo "::error::mismatch/equal wrong result"; exit 1; }
+          echo "PASS: std::mismatch / std::equal(par) offloaded (two-range first-difference)"
+
       - name: "GATE (sort+comp): std::sort(par) with a user comparator (descending)"
         run: |
           # Phase 5: std::sort(par, first, last, comp) inlines the user comparator into
