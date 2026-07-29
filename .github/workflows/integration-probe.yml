@@ -3393,6 +3393,61 @@ jobs:
             || { echo "::error::captured-pointer relocation produced a wrong result"; exit 1; }
           echo "PASS: a lambda capturing a pool pointer OFFLOADS with in-kernel relocation (direct + indexed)"
 
+      - name: "GATE (non-contiguous safety): deque/list fall back to CPU, contiguous offloads"
+        run: |
+          # Phase 9: the device funnels read each range through &*first as one contiguous
+          # buffer, which is UB for non-contiguous iterators (std::deque is chunked, std::list
+          # is node-scattered). offload_ok_v<Policy, Its...> now ANDs std::contiguous_iterator
+          # over every deref'd range, so par over a deque/list compile-time-selects the serial
+          # std:: fallback while a std::vector still offloads. The correctness signal is strong:
+          # 1000 ints span many deque chunks / scattered list nodes, so had the buggy path
+          # offloaded, &*begin + a contiguous 1000-int read would return heap garbage and the
+          # sums would not equal 2000 — correct sums PROVE the CPU fallback was taken.
+          cat > probe_noncontig.cpp <<'EOF'
+          #include <vector>
+          #include <deque>
+          #include <list>
+          #include <algorithm>
+          #include <execution>
+          #include <numeric>
+          #include <cstdio>
+          const auto for_each_std = [](auto&& pol, auto b, auto e, auto&& f) { std::for_each(pol, b, e, f); };
+          const auto reduce_std   = [](auto&& pol, auto b, auto e, auto init) { return std::reduce(pol, b, e, init); };
+          int main() {
+              std::vector<int> v(1000, 1);                 // contiguous -> offloads
+              for_each_std(std::execution::par, v.begin(), v.end(), [](int& x){ x += 1; });
+              int vs = reduce_std(std::execution::par, v.begin(), v.end(), 0);
+              std::printf("vec first=%d sum=%d\n", v[0], vs);           // 2, 2000
+              std::deque<int> d(1000, 1);                  // non-contiguous -> CPU fallback
+              for_each_std(std::execution::par, d.begin(), d.end(), [](int& x){ x += 1; });
+              int ds = reduce_std(std::execution::par, d.begin(), d.end(), 0);
+              std::printf("deq first=%d sum=%d\n", d[0], ds);           // 2, 2000
+              std::list<int> l(1000, 1);                   // non-contiguous -> CPU fallback
+              for_each_std(std::execution::par, l.begin(), l.end(), [](int& x){ x += 1; });
+              int ls = reduce_std(std::execution::par, l.begin(), l.end(), 0);
+              std::printf("lst first=%d sum=%d\n", *l.begin(), ls);     // 2, 2000
+              bool ok = v[0]==2 && vs==2000 && d[0]==2 && ds==2000 && *l.begin()==2 && ls==2000;
+              return ok ? 0 : 1;
+          }
+          EOF
+          export CLANGXX PARALLAX_PLUGIN="$PLUGIN" PARALLAX_RT_INCLUDE="$PWD/parallax-runtime/include"
+          parallax-compiler/scripts/parallax-cxx -std=c++20 -O2 -c probe_noncontig.cpp -o probe_noncontig.o 2>/dev/null
+          "$CLANGXX" -std=c++20 -O2 probe_noncontig.o \
+            -L parallax-runtime/out -lparallax-heap -lparallax-runtime -o probe_noncontig 2>&1 | tail -2
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(PARALLAX_DEBUG=1 ./probe_noncontig 2>&1)" || true
+          echo "$out" | grep -aE "vec first=|deq first=|lst first=|Successfully loaded kernel" | head
+          rc=0; PARALLAX_DEBUG=1 ./probe_noncontig >/dev/null 2>&1 || rc=$?
+          # 1) Every result correct — deque/list must have run the serial fallback (else garbage).
+          echo "$out" | grep -q "vec first=2 sum=2000" || { echo "::error::contiguous vector offload wrong"; exit 1; }
+          echo "$out" | grep -q "deq first=2 sum=2000" || { echo "::error::deque did NOT fall back correctly (mis-read as contiguous?)"; exit 1; }
+          echo "$out" | grep -q "lst first=2 sum=2000" || { echo "::error::list did NOT fall back correctly (mis-read as contiguous?)"; exit 1; }
+          [ "$rc" = "0" ] || { echo "::error::probe returned nonzero ($rc)"; exit 1; }
+          # 2) The contiguous vector still offloads — no regression (at least one kernel loaded).
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::contiguous vector no longer offloads (guard over-broad)"; exit 1; }
+          echo "PASS: std::deque/std::list par algorithms fall back to a correct serial path; std::vector still offloads"
+
       - name: "GATE (conformance): differential seq-vs-par over random data"
         run: |
           # CPU-oracle conformance: for each algorithm, compute a reference with the

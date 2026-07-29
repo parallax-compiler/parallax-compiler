@@ -369,6 +369,16 @@ private:
     std::string generateReplacementCode(TransformInfo& transform);
 
     /**
+     * Phase 9: wrap a generated device replacement in a compile-time contiguity guard.
+     * The device code reads the range through &*first (contiguous storage); for
+     * non-contiguous iterators (std::deque/std::list) it must fall back to the serial
+     * std:: call. Handles both replacement shapes (value-yielding ({...}) statement-
+     * expressions and the void {...} for_each block); returns `replacement` unchanged
+     * when no guard is needed (CPU passthrough, counting_iterator, no first iterator).
+     */
+    std::string guardContiguity(const std::string& replacement, TransformInfo& transform);
+
+    /**
      * Get source text for an AST node
      */
     std::string getSourceText(clang::SourceRange range);
@@ -410,12 +420,80 @@ private:
     std::string getFunctorVariableName(clang::CallExpr* call_expr);
 };
 
+std::string ParallaxRewriter::guardContiguity(const std::string& replacement,
+                                              TransformInfo& transform) {
+    // Nothing to gate: no input range to test, or the class-reference-capture path already
+    // returns the original CPU call.
+    if (!transform.first_iterator) return replacement;
+    if (transform.has_class_reference_captures()) return replacement;
+
+    std::string first_src = getSourceText(transform.first_iterator->getSourceRange());
+    // counting_iterator is a synthetic index iterator with no backing storage — never
+    // "contiguous" by the concept, but it is safe and must keep offloading, so skip it.
+    if (first_src.find("counting_iterator") != std::string::npos) return replacement;
+
+    // The condition ANDs contiguity of every range the device path touches. The input
+    // (first) range is always present; transform/copy_if/scan carry an output range and
+    // mismatch/equal a second input range, both in output_iterator.
+    std::string cond =
+        "parallax::is_contiguous_iterator_v<decltype((" + first_src + "))>";
+    if (transform.output_iterator) {
+        std::string out_src = getSourceText(transform.output_iterator->getSourceRange());
+        if (out_src.find("counting_iterator") == std::string::npos)
+            cond += " && parallax::is_contiguous_iterator_v<decltype((" + out_src + "))>";
+    }
+
+    std::string original = getSourceText(transform.call_expr->getSourceRange());
+
+    // Classify the replacement shape by its first non-space characters.
+    std::string body = replacement;
+    while (!body.empty() &&
+           (body.back() == '\n' || body.back() == ' ' || body.back() == '\t'))
+        body.pop_back();
+    size_t s = body.find_first_not_of(" \t\n");
+    if (s == std::string::npos) return replacement;
+
+    std::ostringstream out;
+    if (body.compare(s, 2, "({") == 0) {
+        // Value-yielding statement-expression `({ ... });`. Select device vs. serial in a
+        // decltype(auto) lambda so the yielded value flows out of the chosen branch (the
+        // discarded if-constexpr branch's return does not participate in deduction).
+        std::string dev = body;
+        if (!dev.empty() && dev.back() == ';') dev.pop_back();  // strip trailing ';'
+        out << "({\n";
+        out << "  [&]() -> decltype(auto) {\n";
+        out << "    if constexpr (" << cond << ") {\n";
+        out << "      return " << dev << ";\n";
+        out << "    } else {\n";
+        out << "      return (" << original << ");\n";
+        out << "    }\n";
+        out << "  }();\n";
+        out << "});";
+        return out.str();
+    }
+    if (body[s] == '{') {
+        // Void for_each/transform block `{ ... }`.
+        out << "{\n";
+        out << "  if constexpr (" << cond << ") " << body << "\n";
+        out << "  else { " << original << "; }\n";
+        out << "}";
+        return out.str();
+    }
+    // Unrecognized shape (e.g. a bare CPU passthrough) — leave untouched.
+    return replacement;
+}
+
 void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
     llvm::errs() << "[ParallaxRewriter] Transforming call at "
                  << transform.call_expr->getBeginLoc().printToString(SM_) << "\n";
 
     // Generate replacement code
     std::string replacement = generateReplacementCode(transform);
+
+    // Phase 9: gate the device path on compile-time iterator contiguity. The device code
+    // reads the range through &*first as a raw pointer; for std::deque/std::list that is a
+    // silent misread, so non-contiguous iterators fall back to the serial std:: call.
+    replacement = guardContiguity(replacement, transform);
 
     // Replace the original call
     clang::SourceRange call_range = transform.call_expr->getSourceRange();
