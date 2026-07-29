@@ -2141,16 +2141,27 @@ public:
         // bitonic compare-exchange kernel for the element type; the replacement pads
         // the range to a power of two, sorts in place, and copies the prefix back. A
         // custom comparator (3rd arg) is not yet supported and falls back to the CPU.
-        if (info.algorithm_name == "sort") {
+        if (info.algorithm_name == "sort" || info.algorithm_name == "partial_sort") {
             // std::sort(par, first, last[, comp]): 3 args (default '<') or 4 (custom
-            // comparator). first/last are arg1/arg2 in both; arg3 (if present) is the
-            // comparator, compiled to a SPIR-V bool(T,T) the compare-exchange calls.
-            if (call->getNumArgs() != 3 && call->getNumArgs() != 4) {
-                llvm::errs() << "[ParallaxCollector] sort: unexpected arg count; CPU\n";
-                return true;
+            // comparator). std::partial_sort(par, first, middle, last): a FULL sort satisfies
+            // it (the smallest are sorted at the front), so route to the same bitonic sort
+            // with first=arg1, last=arg3 (middle ignored); no comparator in the 4-arg form.
+            const bool is_partial = (info.algorithm_name == "partial_sort");
+            if (is_partial) {
+                if (call->getNumArgs() != 4) {
+                    llvm::errs() << "[ParallaxCollector] partial_sort: only the 4-arg (default '<') form; CPU\n";
+                    return true;
+                }
+                info.first_iterator = call->getArg(1);
+                info.last_iterator = call->getArg(3);  // skip middle (arg2)
+            } else {
+                if (call->getNumArgs() != 3 && call->getNumArgs() != 4) {
+                    llvm::errs() << "[ParallaxCollector] sort: unexpected arg count; CPU\n";
+                    return true;
+                }
+                info.first_iterator = call->getArg(1);
+                info.last_iterator = call->getArg(2);
             }
-            info.first_iterator = call->getArg(1);
-            info.last_iterator = call->getArg(2);
 
             clang::QualType elemQT;
             if (const clang::VarDecl* c = traceIteratorToContainer(info.first_iterator)) {
@@ -2180,7 +2191,7 @@ public:
             // (like the reduce keystone); anything else stays on the CPU.
             llvm::Function* comp_func = nullptr;
             std::unique_ptr<llvm::Module> comp_module;
-            if (call->getNumArgs() == 4) {
+            if (!is_partial && call->getNumArgs() == 4) {  // partial_sort's arg3 is `last`, not a comparator
                 clang::LambdaExpr* comp_lambda = extractLambda(call);
                 if (!comp_lambda) {
                     llvm::errs() << "[ParallaxCollector] sort: non-lambda comparator unsupported; CPU\n";
@@ -2983,7 +2994,7 @@ bool ParallaxCollectorVisitor::isParallelAlgorithm(clang::CallExpr* call) {
         name != "std::transform" && name != "std::reduce" &&
         name != "std::transform_reduce" && name != "std::count_if" &&
         name != "std::any_of" && name != "std::all_of" && name != "std::none_of" &&
-        name != "std::inclusive_scan" && name != "std::sort" &&
+        name != "std::inclusive_scan" && name != "std::sort" && name != "std::partial_sort" &&
         name != "std::transform_inclusive_scan" &&
         name != "std::transform_exclusive_scan" &&
         name != "std::min_element" && name != "std::max_element" &&

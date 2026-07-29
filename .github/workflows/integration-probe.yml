@@ -2000,6 +2000,46 @@ jobs:
             || { echo "::error::sort+comp not descending / not a permutation (comparator misapplied)"; exit 1; }
           echo "PASS: std::sort(par) with a user comparator offloaded a descending GPU bitonic sort"
 
+      - name: "GATE (partial_sort): full bitonic sort satisfies partial_sort"
+        run: |
+          # Phase 8 skeleton: std::partial_sort(par, first, middle, last) is satisfied by a
+          # FULL sort (the smallest are then sorted at the front), so it routes to the same
+          # bitonic sort (middle ignored). N=1024 (pow2) permutation of 0..1023 -> after the
+          # sort [0,10) must be exactly 0..9 in order.
+          cat > probe_ps.cpp <<'EOF'
+          #include <vector>
+          #include <algorithm>
+          #include <execution>
+          #include <cstdio>
+          int main() {
+              const int N = 1024;
+              std::vector<float> v(N);
+              for (int i = 0; i < N; ++i) v[i] = static_cast<float>((i * 7 + 3) % N);  // permutation of 0..N-1
+              std::partial_sort(std::execution::par, v.begin(), v.begin() + 10, v.end());
+              bool ok = std::is_sorted(v.begin(), v.begin() + 10);
+              for (int i = 0; i < 10; ++i) if (v[i] != static_cast<float>(i)) ok = false;
+              std::printf("partialsort ok=%d v0=%.0f v9=%.0f\n", ok ? 1 : 0, v[0], v[9]);
+              return ok ? 0 : 1;
+          }
+          EOF
+          PARALLAX_DUMP_SPIRV="$PWD/ps.spv" "$CLANGXX" -std=c++20 -I parallax-runtime/include \
+            -Xclang -load -Xclang "$PLUGIN" -Xclang -plugin -Xclang parallax \
+            -c probe_ps.cpp -o /dev/null 2> ps.log || true
+          grep -E "sort: generated bitonic" ps.log | head -1 \
+            || { echo "::error::partial_sort not routed to the sort kernel"; exit 1; }
+          [ -f ps.spv ] && { spirv-val ps.spv || { echo "::error::partial_sort SPIR-V invalid"; exit 1; }; }
+          "$CLANGXX" -std=c++20 -O2 probe_ps.cpp \
+            -I parallax-runtime/include -L parallax-runtime/out -lparallax-runtime \
+            -o probe_ps 2>&1 | tail -3
+          export LD_LIBRARY_PATH="$PWD/parallax-runtime/out:$LD_LIBRARY_PATH"
+          out="$(./probe_ps 2>&1)" || true
+          echo "$out" | grep -aE "partialsort ok=|Successfully loaded kernel" | head
+          echo "$out" | grep -q "Successfully loaded kernel" \
+            || { echo "::error::partial_sort not offloaded"; exit 1; }
+          echo "$out" | grep -q "partialsort ok=1 v0=0 v9=9" \
+            || { echo "::error::partial_sort wrong (front not the sorted smallest)"; exit 1; }
+          echo "PASS: std::partial_sort(par) offloaded (full bitonic sort satisfies it)"
+
       - name: "GATE (copy_if): stream compaction on the GPU"
         run: |
           # Phase 5: the plugin detects std::copy_if, compiles the predicate into a
