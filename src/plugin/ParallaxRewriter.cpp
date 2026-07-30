@@ -3137,6 +3137,19 @@ clang::LambdaExpr* ParallaxCollectorVisitor::unwrapLambda(clang::Expr* e) {
     if (!e) return nullptr;
     e = e->IgnoreUnlessSpelledInSource();
     if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(e)) return lambda;
+    // A NAMED lambda variable — `auto op = [](...){...}; std::algo(par, ..., op)`, the common
+    // nvc++ style — arrives as a DeclRefExpr to the VarDecl; follow it to the lambda in its
+    // initializer. A lambda has a unique unassignable type, so the init is the only value the
+    // variable ever holds. This is the shape libstdc++ leaves once the internal forwarding
+    // instantiations (which carried an inline lambda temporary) are skipped as system headers;
+    // without it a named op falls back to the CPU while an inline op offloads.
+    if (auto* dre = llvm::dyn_cast<clang::DeclRefExpr>(e)) {
+        if (auto* vd = llvm::dyn_cast<clang::VarDecl>(dre->getDecl())) {
+            if (clang::Expr* init = const_cast<clang::Expr*>(vd->getInit())) {
+                if (auto* l = unwrapLambda(init)) return l;
+            }
+        }
+    }
     for (int guard = 0; e && guard < 16; ++guard) {
         e = e->IgnoreImplicit();
         if (auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(e)) return lambda;
