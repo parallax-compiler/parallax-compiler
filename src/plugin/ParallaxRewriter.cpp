@@ -34,11 +34,16 @@ struct LambdaCaptureInfo {
  * Transformation information for a single parallel algorithm call
  */
 struct TransformInfo {
-    clang::CallExpr* call_expr;
-    clang::LambdaExpr* lambda;
-    clang::Expr* first_iterator;
-    clang::Expr* last_iterator;
-    clang::Expr* output_iterator;  // For transform
+    // Default-null so kinds that don't populate a given iterator leave it null rather
+    // than an uninitialized garbage pointer. guardContiguity reads output_iterator
+    // generically (it is set only by transform/copy_if/scan/mismatch); a garbage value
+    // there dereferences wild memory (crashed under libstdc++, where the padding wasn't
+    // conveniently zero).
+    clang::CallExpr* call_expr = nullptr;
+    clang::LambdaExpr* lambda = nullptr;
+    clang::Expr* first_iterator = nullptr;
+    clang::Expr* last_iterator = nullptr;
+    clang::Expr* output_iterator = nullptr;  // For transform
     std::string algorithm_name;
     clang::QualType element_type;
 
