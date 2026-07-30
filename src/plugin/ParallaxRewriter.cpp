@@ -1897,13 +1897,13 @@ public:
         info.call_expr = call;
         info.algorithm_name = extractAlgorithmName(call);
 
-        // Small helper: unwrap an argument expression to a LambdaExpr if it is one.
-        auto as_lambda = [](clang::Expr* e) -> clang::LambdaExpr* {
-            e = e->IgnoreImplicit();
-            if (auto* l = llvm::dyn_cast<clang::LambdaExpr>(e)) return l;
-            if (auto* m = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
-                return llvm::dyn_cast<clang::LambdaExpr>(m->getSubExpr()->IgnoreImplicit());
-            return nullptr;
+        // Small helper: unwrap an argument expression to a LambdaExpr if it is one. Delegates
+        // to unwrapLambda so op arguments in ANY position (transform_{in,ex}clusive_scan's
+        // unary/binary ops) get the same treatment as the last-argument op — including a
+        // NAMED lambda variable (auto uop = [...]; algo(par, ..., uop)), which the old
+        // IgnoreImplicit-only peel missed (it bailed 'non-lambda unary op; CPU').
+        auto as_lambda = [this](clang::Expr* e) -> clang::LambdaExpr* {
+            return unwrapLambda(e);
         };
         // Map a scalar element QualType to the SPIR-V reduce element kind.
         auto elem_kind = [&](clang::QualType qt, SPIRVGenerator::ReduceElemType& out) -> bool {
