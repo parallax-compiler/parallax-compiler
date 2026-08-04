@@ -34,11 +34,10 @@ struct LambdaCaptureInfo {
  * Transformation information for a single parallel algorithm call
  */
 struct TransformInfo {
-    // Default-null so kinds that don't populate a given iterator leave it null rather
-    // than an uninitialized garbage pointer. guardContiguity reads output_iterator
-    // generically (it is set only by transform/copy_if/scan/mismatch); a garbage value
-    // there dereferences wild memory (crashed under libstdc++, where the padding wasn't
-    // conveniently zero).
+    // Default-null so kinds that don't populate a given iterator leave it null rather than
+    // an uninitialized garbage pointer: any code reading output_iterator generically (it is
+    // set only by transform/copy_if/scan/mismatch) would otherwise dereference wild memory
+    // under libstdc++, where the struct padding is not conveniently zero.
     clang::CallExpr* call_expr = nullptr;
     clang::LambdaExpr* lambda = nullptr;
     clang::Expr* first_iterator = nullptr;
@@ -374,16 +373,6 @@ private:
     std::string generateReplacementCode(TransformInfo& transform);
 
     /**
-     * Phase 9: wrap a generated device replacement in a compile-time contiguity guard.
-     * The device code reads the range through &*first (contiguous storage); for
-     * non-contiguous iterators (std::deque/std::list) it must fall back to the serial
-     * std:: call. Handles both replacement shapes (value-yielding ({...}) statement-
-     * expressions and the void {...} for_each block); returns `replacement` unchanged
-     * when no guard is needed (CPU passthrough, counting_iterator, no first iterator).
-     */
-    std::string guardContiguity(const std::string& replacement, TransformInfo& transform);
-
-    /**
      * Get source text for an AST node
      */
     std::string getSourceText(clang::SourceRange range);
@@ -425,80 +414,12 @@ private:
     std::string getFunctorVariableName(clang::CallExpr* call_expr);
 };
 
-std::string ParallaxRewriter::guardContiguity(const std::string& replacement,
-                                              TransformInfo& transform) {
-    // Nothing to gate: no input range to test, or the class-reference-capture path already
-    // returns the original CPU call.
-    if (!transform.first_iterator) return replacement;
-    if (transform.has_class_reference_captures()) return replacement;
-
-    std::string first_src = getSourceText(transform.first_iterator->getSourceRange());
-    // counting_iterator is a synthetic index iterator with no backing storage — never
-    // "contiguous" by the concept, but it is safe and must keep offloading, so skip it.
-    if (first_src.find("counting_iterator") != std::string::npos) return replacement;
-
-    // The condition ANDs contiguity of every range the device path touches. The input
-    // (first) range is always present; transform/copy_if/scan carry an output range and
-    // mismatch/equal a second input range, both in output_iterator.
-    std::string cond =
-        "parallax::is_contiguous_iterator_v<decltype((" + first_src + "))>";
-    if (transform.output_iterator) {
-        std::string out_src = getSourceText(transform.output_iterator->getSourceRange());
-        if (out_src.find("counting_iterator") == std::string::npos)
-            cond += " && parallax::is_contiguous_iterator_v<decltype((" + out_src + "))>";
-    }
-
-    std::string original = getSourceText(transform.call_expr->getSourceRange());
-
-    // Classify the replacement shape by its first non-space characters.
-    std::string body = replacement;
-    while (!body.empty() &&
-           (body.back() == '\n' || body.back() == ' ' || body.back() == '\t'))
-        body.pop_back();
-    size_t s = body.find_first_not_of(" \t\n");
-    if (s == std::string::npos) return replacement;
-
-    std::ostringstream out;
-    if (body.compare(s, 2, "({") == 0) {
-        // Value-yielding statement-expression `({ ... });`. Select device vs. serial in a
-        // decltype(auto) lambda so the yielded value flows out of the chosen branch (the
-        // discarded if-constexpr branch's return does not participate in deduction).
-        std::string dev = body;
-        if (!dev.empty() && dev.back() == ';') dev.pop_back();  // strip trailing ';'
-        out << "({\n";
-        out << "  [&]() -> decltype(auto) {\n";
-        out << "    if constexpr (" << cond << ") {\n";
-        out << "      return " << dev << ";\n";
-        out << "    } else {\n";
-        out << "      return (" << original << ");\n";
-        out << "    }\n";
-        out << "  }();\n";
-        out << "});";
-        return out.str();
-    }
-    if (body[s] == '{') {
-        // Void for_each/transform block `{ ... }`.
-        out << "{\n";
-        out << "  if constexpr (" << cond << ") " << body << "\n";
-        out << "  else { " << original << "; }\n";
-        out << "}";
-        return out.str();
-    }
-    // Unrecognized shape (e.g. a bare CPU passthrough) — leave untouched.
-    return replacement;
-}
-
 void ParallaxRewriter::applyTransformation(TransformInfo& transform) {
     llvm::errs() << "[ParallaxRewriter] Transforming call at "
                  << transform.call_expr->getBeginLoc().printToString(SM_) << "\n";
 
     // Generate replacement code
     std::string replacement = generateReplacementCode(transform);
-
-    // Phase 9: gate the device path on compile-time iterator contiguity. The device code
-    // reads the range through &*first as a raw pointer; for std::deque/std::list that is a
-    // silent misread, so non-contiguous iterators fall back to the serial std:: call.
-    replacement = guardContiguity(replacement, transform);
 
     // Replace the original call
     clang::SourceRange call_range = transform.call_expr->getSourceRange();
@@ -1890,6 +1811,20 @@ public:
             return true;
         }
 
+        // Phase 9: the generated device replacements read each range through &*first as one
+        // contiguous buffer, which is undefined for a non-contiguous container (std::deque is
+        // chunked, std::list/std::set node-scattered). Decide this at plugin time from the
+        // concrete container the iterator traces to — cleaner and safer than wrapping the
+        // emitted code in a runtime guard. If ANY argument traces to a known non-contiguous
+        // container, leave the call as the serial std:: call (CPU). Iterators that don't trace
+        // to a container (raw pointers = contiguous, or dependent/template types, which bail on
+        // element-type determination anyway) are unaffected; the funnel path guards the generic
+        // case via detail::offload_ok_v. Non-contiguous safety without touching the fast path.
+        if (touchesNonContiguousContainer(call)) {
+            llvm::errs() << "[ParallaxCollector] non-contiguous container (deque/list/…); CPU\n";
+            return true;
+        }
+
         llvm::errs() << "[ParallaxCollector] Found parallel algorithm call\n";
 
         // Extract transformation info
@@ -3047,6 +2982,10 @@ private:
     std::unordered_set<std::string> seen_funnel_keys_;  // Layer A: dedup device_invoke instantiations
 
     bool isParallelAlgorithm(clang::CallExpr* call);
+    // Phase 9: true if any argument traces to a known non-contiguous std container, so the
+    // call must not take the contiguous-buffer device path (it stays a serial std:: call).
+    bool touchesNonContiguousContainer(clang::CallExpr* call);
+    static bool isNonContiguousContainerType(clang::QualType qt);
     std::string extractAlgorithmName(clang::CallExpr* call);
     clang::LambdaExpr* extractLambda(clang::CallExpr* call);
     clang::LambdaExpr* unwrapLambda(clang::Expr* e);
@@ -3249,6 +3188,35 @@ std::string ParallaxCollectorVisitor::generateKernelName(const TransformInfo& in
     }
 
     return "__parallax_kernel_" + info.algorithm_name + "_" + line_num;
+}
+
+// Known non-contiguous standard containers: their iterators cannot be read as one flat
+// buffer, so the &*first device path is invalid for them. Matched by spelling on the
+// (possibly parallax-allocator-rewritten) type string — robust to the allocator template arg.
+bool ParallaxCollectorVisitor::isNonContiguousContainerType(clang::QualType qt) {
+    std::string t = qt.getCanonicalType().getAsString();
+    static const char* kNonContig[] = {
+        "std::deque", "std::list", "std::forward_list",
+        "std::set", "std::multiset", "std::map", "std::multimap",
+        "std::unordered_set", "std::unordered_multiset",
+        "std::unordered_map", "std::unordered_multimap",
+        "std::__cxx11::list", "std::__cxx11::forward_list",  // libstdc++ inline-namespace spellings
+    };
+    for (const char* name : kNonContig)
+        if (t.find(name) != std::string::npos) return true;
+    return false;
+}
+
+bool ParallaxCollectorVisitor::touchesNonContiguousContainer(clang::CallExpr* call) {
+    if (!call) return false;
+    for (unsigned i = 0, n = call->getNumArgs(); i < n; ++i) {
+        // traceIteratorToContainer returns null for non-iterator args (policy/lambda/init),
+        // raw pointers, and dependent/template iterators — so only concrete containers match.
+        if (const clang::VarDecl* c = traceIteratorToContainer(call->getArg(i))) {
+            if (isNonContiguousContainerType(c->getType().getNonReferenceType())) return true;
+        }
+    }
+    return false;
 }
 
 const clang::VarDecl* ParallaxCollectorVisitor::traceIteratorToContainer(clang::Expr* iterator_expr) {
